@@ -168,8 +168,13 @@ module.exports = function(grunt) {
         options: {
           urls: ['http://127.0.0.1:9998/test/index.html'],
           build: process.env.TRAVIS_JOB_ID,
-          browsers: [{ browserName: 'chrome', version: '38' }, { browserName: 'firefox', version: '34' }],
-          testname: 'libsignal-protocol tests'
+          browsers: [
+            { browserName: 'chrome', version: '41' },
+            { platform: 'linux', browserName: 'firefox', version: '34' }
+          ],
+          testname: 'libsignal-protocol tests',
+          'max-duration': 300,
+          statusCheckAttempts: 200
         }
       }
     }

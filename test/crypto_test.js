@@ -1,4 +1,6 @@
-/* vim: ts=4:sw=4 */
+/*
+ * vim: ts=4:sw=4
+ */
 
 'use strict';
 window.assert = chai.assert;
@@ -145,6 +147,7 @@ describe("Crypto", function() {
     }
 
     describe('curve25519', function() {
+        this.timeout(5000);
         testCurve25519();
     });
     describe('curve25519 in a worker', function() {
@@ -154,6 +157,7 @@ describe("Crypto", function() {
         after(function() {
             libsignal.worker.stopWorker();
         });
+        this.timeout(5000);
         testCurve25519();
     });
 });
