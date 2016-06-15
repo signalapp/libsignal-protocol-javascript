@@ -88,15 +88,51 @@ describe('SessionCipher', function() {
         });
     }
 
+    function getPaddedMessageLength(messageLength) {
+        var messageLengthWithTerminator = messageLength + 1;
+        var messagePartCount            = Math.floor(messageLengthWithTerminator / 160);
+
+        if (messageLengthWithTerminator % 160 !== 0) {
+            messagePartCount++;
+        }
+
+        return messagePartCount * 160;
+    }
+    function pad(plaintext) {
+      var paddedPlaintext = new Uint8Array(
+          getPaddedMessageLength(plaintext.byteLength + 1) - 1
+      );
+      paddedPlaintext.set(new Uint8Array(plaintext));
+      paddedPlaintext[plaintext.byteLength] = 0x80;
+
+      return paddedPlaintext.buffer;
+    }
+
+    function unpad(paddedPlaintext) {
+        paddedPlaintext = new Uint8Array(paddedPlaintext);
+        var plaintext;
+        for (var i = paddedPlaintext.length - 1; i >= 0; i--) {
+            if (paddedPlaintext[i] == 0x80) {
+                plaintext = new Uint8Array(i);
+                plaintext.set(paddedPlaintext.subarray(0, i));
+                plaintext = plaintext.buffer;
+                break;
+            } else if (paddedPlaintext[i] !== 0x00) {
+                throw new Error('Invalid padding');
+            }
+        }
+        return plaintext;
+    }
+
     function doReceiveStep(store, data, privKeyQueue, address) {
         return setupReceiveStep(store, data, privKeyQueue).then(function() {
             var sessionCipher = new libsignal.SessionCipher(store, address);
 
             if (data.type == textsecure.protobuf.IncomingPushMessageSignal.Type.CIPHERTEXT) {
-                return sessionCipher.decryptWhisperMessage(data.message);
+                return sessionCipher.decryptWhisperMessage(data.message).then(unpad);
             }
             else if (data.type == textsecure.protobuf.IncomingPushMessageSignal.Type.PREKEY_BUNDLE) {
-                return sessionCipher.decryptPreKeyWhisperMessage(data.message);
+                return sessionCipher.decryptPreKeyWhisperMessage(data.message).then(unpad);
             } else {
                 throw new Error("Unknown data type in test vector");
             }
@@ -163,7 +199,7 @@ describe('SessionCipher', function() {
             }
 
             var sessionCipher = new SessionCipher(store, address);
-            return sessionCipher.encrypt(proto.toArrayBuffer()).then(function(msg) {
+            return sessionCipher.encrypt(pad(proto.toArrayBuffer())).then(function(msg) {
                 //XXX: This should be all we do: isEqual(data.expectedCiphertext, encryptedMsg, false);
                 if (msg.type == 1) {
                     return util.isEqual(data.expectedCiphertext, msg.body);
