@@ -36219,7 +36219,7 @@ SessionCipher.prototype = {
             macInput[33*2] = (3 << 4) | 3;
             macInput.set(new Uint8Array(messageProto), 33*2 + 1);
 
-            return this.verifyMAC(macInput.buffer, keys[1], mac, 8);
+            return Internal.verifyMAC(macInput.buffer, keys[1], mac, 8);
         }.bind(this)).then(function() {
             return Internal.crypto.decrypt(keys[0], message.ciphertext.toArrayBuffer(), keys[2].slice(0, 16));
         });
@@ -36310,22 +36310,6 @@ SessionCipher.prototype = {
               };
               ratchet.rootKey = masterKey[0];
           });
-      });
-  },
-  verifyMAC: function(data, key, mac, length) {
-      return Internal.crypto.sign(key, data).then(function(calculated_mac) {
-          if (mac.byteLength != length  || calculated_mac.byteLength < length) {
-              throw new Error("Bad MAC length");
-          }
-          var a = new Uint8Array(calculated_mac);
-          var b = new Uint8Array(mac);
-          var result = 0;
-          for (var i=0; i < mac.byteLength; ++i) {
-              result = result | (a[i] ^ b[i]);
-          }
-          if (result !== 0) {
-              throw new Error("Bad MAC");
-          }
       });
   },
   getRemoteRegistrationId: function() {
