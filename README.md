@@ -70,14 +70,14 @@ types/interfaces, which are available in most modern browsers.
 
 ## Usage
 
-Include dist/libsignal-protocol.js in your webpage.
+Include `dist/libsignal-protocol.js` in your webpage.
 
 ### Install time
 
 At install time, a libsignal client needs to generate its identity keys,
 registration id, and prekeys.
 
-```
+```js
 var KeyHelper = libsignal.KeyHelper;
 
 var registrationId = KeyHelper.generateRegistrationId();
@@ -103,11 +103,11 @@ KeyHelper.generateSignedPreKey(identityKeyPair, keyId).then(function(signedPreKe
 
 A libsignal client needs to implement a storage interface that will manage
 loading and storing of identity, prekeys, signed prekeys, and session state.
-See test/InMemorySignalProtocolStore.js for an example.
+See `test/InMemorySignalProtocolStore.js` for an example.
 
 Once this is implemented, building a session is fairly straightforward:
 
-```
+```js
 var store   = new MySignalProtocolStore();
 var address = new libsignal.SignalProtocolAddress(recipientId, deviceId);
 
@@ -145,7 +145,7 @@ promise.catch(function onerror(error) {
 Once you have a session established with an address, you can encrypt messages
 using SessionCipher.
 
-```
+```js
 var plaintext = "Hello world";
 var sessionCipher = new libsignal.SessionCipher(store, address);
 sessionCipher.encrypt(plaintext).then(function(ciphertext) {
@@ -158,7 +158,7 @@ sessionCipher.encrypt(plaintext).then(function(ciphertext) {
 
 Ciphertexts come in two flavors: WhisperMessage and PreKeyWhisperMessage.
 
-```
+```js
 var address = new SignalProtocolAddress(recipientId, deviceId);
 var sessionCipher = new SessionCipher(store, address);
 
@@ -181,12 +181,13 @@ sessionCipher.decryptWhisperMessage(ciphertext).then(function(plaintext) {
 
 ## Building
 
-To compile curve25519 from C souce files in /native, install
+To compile curve25519 from C souce files in `/native`, install
 [emscripten](https://kripken.github.io/emscripten-site/docs/getting_started/downloads.html).
 
 ```
 grunt compile
 ```
+
 ## License
 
 Copyright 2015-2016 Open Whisper Systems
