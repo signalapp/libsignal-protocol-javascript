@@ -101,16 +101,6 @@ SessionCipher.prototype = {
       });
     }.bind(this));
   },
-  getPaddedMessageLength: function(messageLength) {
-    var messageLengthWithTerminator = messageLength + 1;
-    var messagePartCount            = Math.floor(messageLengthWithTerminator / 160);
-
-    if (messageLengthWithTerminator % 160 !== 0) {
-        messagePartCount++;
-    }
-
-    return messagePartCount * 160;
-  },
   decryptWhisperMessage: function(buffer, encoding) {
       buffer = dcodeIO.ByteBuffer.wrap(buffer, encoding).toArrayBuffer();
       return Internal.SessionLock.queueJobForNumber(this.remoteAddress.toString(), function() {
