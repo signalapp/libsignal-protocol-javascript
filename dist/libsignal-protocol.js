@@ -35706,8 +35706,8 @@ Internal.SessionRecord = function() {
         removeOldChains: function(session) {
             // Sending ratchets are always removed when we step because we never need them again
             // Receiving ratchets are added to the oldRatchetList, which we parse
-            // here and remove all but the last four.
-            while (session.oldRatchetList.length > 4) {
+            // here and remove all but the last five.
+            while (session.oldRatchetList.length > 5) {
                 var index = 0;
                 var oldest = session.oldRatchetList[0];
                 for (var i = 0; i < session.oldRatchetList.length; i++) {
