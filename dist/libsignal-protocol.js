@@ -35874,7 +35874,7 @@ SessionBuilder.prototype = {
             record.archiveCurrentState();
         }
         if (message.preKeyId && !preKeyPair) {
-            console.log('Invalid prekey id');
+            console.log('Invalid prekey id', message.preKeyId);
         }
         return this.initSession(false, preKeyPair, signedPreKeyPair,
             message.identityKey.toArrayBuffer(),
