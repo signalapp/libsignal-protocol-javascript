@@ -35502,6 +35502,8 @@ Internal.ChainType = {
   RECEIVING: 2
 };
 
+var ARCHIVED_STATES_MAX_LENGTH = 40;
+
 Internal.SessionRecord = function() {
     'use strict';
     var MESSAGE_LOST_THRESHOLD_MS = 1000*60*60*24*7;
@@ -35724,7 +35726,7 @@ Internal.SessionRecord = function() {
             // Retain only the last 20 sessions
             var sessions = this._sessions;
             var oldestBaseKey, oldestSession;
-            while (Object.keys(sessions).length > 20) {
+            while (Object.keys(sessions).length > ARCHIVED_STATES_MAX_LENGTH) {
                 for (var key in sessions) {
                     var session = sessions[key];
                     if (session.indexInfo.closed > -1 && // session is closed
