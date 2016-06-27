@@ -35208,7 +35208,9 @@ Curve25519Worker.prototype = {
 
 })();
 
-/* vim: ts=4:sw=4 */
+/*
+ * vim: ts=4:sw=4
+ */
 
 var Internal = Internal || {};
 
@@ -35489,7 +35491,9 @@ Internal.protobuf = function() {
     };
 }();
 
-/* vim: ts=4:sw=4 */
+/*
+ * vim: ts=4:sw=4
+ */
 
 var Internal = Internal || {};
 
