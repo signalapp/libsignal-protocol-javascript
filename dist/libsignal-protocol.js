@@ -35307,6 +35307,8 @@ var Internal = Internal || {};
                 result = result | (a[i] ^ b[i]);
             }
             if (result !== 0) {
+                console.log('Our MAC  ', dcodeIO.ByteBuffer.wrap(calculated_mac).toHex());
+                console.log('Their MAC', dcodeIO.ByteBuffer.wrap(mac).toHex());
                 throw new Error("Bad MAC");
             }
         });
@@ -35722,6 +35724,7 @@ Internal.SessionRecord = function() {
                         index = i;
                     }
                 }
+                console.log("Deleting chain closed at", oldest.added);
                 delete session[util.toString(oldest.ephemeralKey)];
                 session.oldRatchetList.splice(index, 1);
             }
@@ -36256,6 +36259,7 @@ SessionCipher.prototype = {
           return Promise.resolve();
       }
 
+      console.log('New remote ephemeral key');
       var ratchet = session.currentRatchet;
 
       return Promise.resolve().then(function() {

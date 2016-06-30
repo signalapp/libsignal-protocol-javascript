@@ -229,6 +229,7 @@ Internal.SessionRecord = function() {
                         index = i;
                     }
                 }
+                console.log("Deleting chain closed at", oldest.added);
                 delete session[util.toString(oldest.ephemeralKey)];
                 session.oldRatchetList.splice(index, 1);
             }

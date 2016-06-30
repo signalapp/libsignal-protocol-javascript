@@ -247,6 +247,7 @@ SessionCipher.prototype = {
           return Promise.resolve();
       }
 
+      console.log('New remote ephemeral key');
       var ratchet = session.currentRatchet;
 
       return Promise.resolve().then(function() {
