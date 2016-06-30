@@ -1,7 +1,7 @@
 {
   "name": "libsignal-protocol",
   "repository": "https://github.com/WhisperSystems/libsignal-protocol-javascript.git",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "license": "GPL-3.0",
   "dependencies": {
     "long": "^3.1.0",
