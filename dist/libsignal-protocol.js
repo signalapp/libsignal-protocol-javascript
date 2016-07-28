@@ -35705,9 +35705,6 @@ Internal.SessionRecord = function() {
                     };
                 }
             }
-            // Delete current root key and our ephemeral key pair to disallow ratchet stepping
-            delete session.currentRatchet.rootKey;
-            delete session.currentRatchet.ephemeralKeyPair;
             session.indexInfo.closed = Date.now();
             this.removeOldChains(session);
         },
