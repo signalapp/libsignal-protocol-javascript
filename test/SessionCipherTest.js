@@ -1,4 +1,6 @@
-/* vim: ts=4:sw=4 */
+/*
+ * vim: ts=4:sw=4
+ */
 
 'use strict';
 describe('SessionCipher', function() {
