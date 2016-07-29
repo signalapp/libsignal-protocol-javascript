@@ -184,6 +184,26 @@ Internal.SessionRecord = function() {
                 throw new Error("Had open sessions on a record that had no registrationId set");
             }
         },
+        getSessions: function() {
+            // return an array of sessions ordered by time closed,
+            // followed by the open session
+            var list = [];
+            var openSession;
+            for (var k in this._sessions) {
+                if (this._sessions[k].indexInfo.closed === -1) {
+                    openSession = this._sessions[k];
+                } else {
+                    list.push(this._sessions[k]);
+                }
+            }
+            list = list.sort(function(s1, s2) {
+                return s1.indexInfo.closed - s2.indexInfo.closed;
+            });
+            if (openSession) {
+                list.push(openSession);
+            }
+            return list;
+        },
         archiveCurrentState: function() {
             var open_session = this.getOpenSession();
             if (open_session !== undefined) {
@@ -195,6 +215,7 @@ Internal.SessionRecord = function() {
             if (session.indexInfo.closed > -1) {
                 return;
             }
+            console.log('closing session', session.indexInfo.baseKey);
 
             // After this has run, we can still receive messages on ratchet chains which
             // were already open (unless we know we dont need them),

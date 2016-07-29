@@ -101,6 +101,22 @@ SessionCipher.prototype = {
       });
     }.bind(this));
   },
+  decryptWithSessionList: function(buffer, sessionList, errors) {
+    // Iterate recursively through the list, attempting to decrypt
+    // using each one at a time. Stop and return the result if we get
+    // a valid result
+    if (sessionList.length === 0) {
+        return Promise.reject(errors[0]);
+    }
+
+    var session = sessionList.pop();
+    return this.doDecryptWhisperMessage(buffer, session).then(function(plaintext) {
+        return { plaintext: plaintext, session: session };
+    }).catch(function(e) {
+        errors.push(e);
+        return this.decryptWithSessionList(buffer, sessionList, errors);
+    }.bind(this));
+  },
   decryptWhisperMessage: function(buffer, encoding) {
       buffer = dcodeIO.ByteBuffer.wrap(buffer, encoding).toArrayBuffer();
       return Internal.SessionLock.queueJobForNumber(this.remoteAddress.toString(), function() {
@@ -109,15 +125,14 @@ SessionCipher.prototype = {
             if (!record) {
                 throw new Error("No record for device " + address);
             }
-            var messageProto = buffer.slice(1, buffer.byteLength - 8);
-            var message = Internal.protobuf.WhisperMessage.decode(messageProto);
-            var remoteEphemeralKey = message.ephemeralKey.toArrayBuffer();
-            var session = record.getSessionByRemoteEphemeralKey(remoteEphemeralKey);
-            return this.doDecryptWhisperMessage(buffer, session).then(function(plaintext) {
-                record.updateSessionState(session);
-                return this.storage.storeSession(address, record.serialize()).then(function() {
-                    return plaintext;
-                });
+            var errors = [];
+            return this.decryptWithSessionList(buffer, record.getSessions(), errors).then(function(result) {
+                return this.getRecord(address).then(function(record) {
+                    record.updateSessionState(result.session);
+                    return this.storage.storeSession(address, record.serialize()).then(function() {
+                        return result.plaintext;
+                    });
+                }.bind(this));
             }.bind(this));
         }.bind(this));
       }.bind(this));
@@ -175,7 +190,7 @@ SessionCipher.prototype = {
     var remoteEphemeralKey = message.ephemeralKey.toArrayBuffer();
 
     if (session === undefined) {
-        throw new Error("No session found to decrypt message from " + this.remoteAddress.toString());
+        return Promise.reject(new Error("No session found to decrypt message from " + this.remoteAddress.toString()));
     }
     if (session.indexInfo.closed != -1) {
         console.log('decrypting message for closed session');
