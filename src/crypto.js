@@ -35,6 +35,10 @@ var Internal = Internal || {};
             });
         },
 
+        hash: function(data) {
+            return crypto.subtle.digest({name: 'SHA-512'}, data);
+        },
+
         HKDF: function(input, salt, info) {
             // Specific implementation of RFC 5869 that only returns the first 3 32-byte chunks
             // TODO: We dont always need the third chunk, we might skip it

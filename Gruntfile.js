@@ -75,7 +75,8 @@ module.exports = function(grunt) {
           'src/SignalProtocolAddress.js',
           'src/SessionBuilder.js',
           'src/SessionCipher.js',
-          'src/SessionLock.js'
+          'src/SessionLock.js',
+          'src/NumericFingerprint.js'
         ],
         dest: 'dist/libsignal-protocol.js',
         options: {
