@@ -39,14 +39,14 @@ SessionBuilder.prototype = {
           if (serialized !== undefined) {
             record = Internal.SessionRecord.deserialize(serialized);
           } else {
-            record = new Internal.SessionRecord(device.identityKey, device.registrationId);
+            record = new Internal.SessionRecord(device.registrationId);
           }
 
           record.archiveCurrentState();
           record.updateSessionState(session, device.registrationId);
           return Promise.all([
             this.storage.storeSession(address, record.serialize()),
-            this.storage.saveIdentity(this.remoteAddress.getName(), record.identityKey)
+            this.storage.saveIdentity(this.remoteAddress.getName(), session.indexInfo.remoteIdentityKey)
           ]);
         }.bind(this));
       }.bind(this));

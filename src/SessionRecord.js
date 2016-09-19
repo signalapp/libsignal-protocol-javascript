@@ -55,13 +55,8 @@ Internal.SessionRecord = function() {
         return JSON.stringify(ensureStringed(thing)); //TODO: jquery???
     }
 
-    var SessionRecord = function(identityKey, registrationId) {
+    var SessionRecord = function(registrationId) {
         this._sessions = {};
-        identityKey = util.toString(identityKey);
-        if (typeof identityKey !== 'string') {
-            throw new Error('SessionRecord: Invalid identityKey');
-        }
-        this.identityKey = identityKey;
         this.registrationId = registrationId;
 
         if (this.registrationId === undefined || typeof this.registrationId !== 'number') {
@@ -71,12 +66,12 @@ Internal.SessionRecord = function() {
 
     SessionRecord.deserialize = function(serialized) {
         var data = JSON.parse(serialized);
-        var record = new SessionRecord(data.identityKey, data.registrationId);
+        var record = new SessionRecord(data.registrationId);
         record._sessions = data.sessions;
         if (record._sessions === undefined || record._sessions === null || typeof record._sessions !== "object" || Array.isArray(record._sessions)) {
             throw new Error("Error deserializing SessionRecord");
         }
-        if (record.identityKey === undefined || record.registrationId === undefined) {
+        if (record.registrationId === undefined) {
             throw new Error("Error deserializing SessionRecord");
         }
         return record;
@@ -86,8 +81,7 @@ Internal.SessionRecord = function() {
         serialize: function() {
             return jsonThing({
                 sessions       : this._sessions,
-                registrationId : this.registrationId,
-                identityKey    : this.identityKey
+                registrationId : this.registrationId
             });
         },
         haveOpenSession: function() {
@@ -154,15 +148,6 @@ Internal.SessionRecord = function() {
             var sessions = this._sessions;
 
             this.removeOldChains(session);
-
-            if (this.identityKey === null) {
-                this.identityKey = session.indexInfo.remoteIdentityKey;
-            }
-            if (util.toString(this.identityKey) !== util.toString(session.indexInfo.remoteIdentityKey)) {
-                var e = new Error("Identity key changed at session save time");
-                e.identityKey = session.indexInfo.remoteIdentityKey.toArrayBuffer();
-                throw e;
-            }
 
             sessions[util.toString(session.indexInfo.baseKey)] = session;
 

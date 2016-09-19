@@ -161,7 +161,6 @@ SessionCipher.prototype = {
                       throw new Error("No registrationId");
                   }
                   record = new Internal.SessionRecord(
-                      util.toString(preKeyProto.identityKey),
                       preKeyProto.registrationId
                   );
               }

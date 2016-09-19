@@ -11,7 +11,7 @@ describe('SessionCipher', function() {
         var sessionCipher = new libsignal.SessionCipher(store, address.toString());
         describe('when a record exists', function() {
             before(function(done) {
-                var record = new Internal.SessionRecord('identityKey', registrationId);
+                var record = new Internal.SessionRecord(registrationId);
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
             it('returns a valid registrationId', function(done) {
@@ -36,7 +36,7 @@ describe('SessionCipher', function() {
         var sessionCipher = new libsignal.SessionCipher(store, address.toString());
         describe('registrationId is valid', function() {
             before(function(done) {
-                var record = new Internal.SessionRecord('identityKey', 1);
+                var record = new Internal.SessionRecord( 1);
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
             it('returns true for a session with a valid registrationId', function(done) {
@@ -47,7 +47,7 @@ describe('SessionCipher', function() {
         });
         describe('registrationId is null', function() {
             before(function(done) {
-                var record = new Internal.SessionRecord('identityKey');
+                var record = new Internal.SessionRecord();
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
             it('returns false for a session with a null registrationId', function(done) {
