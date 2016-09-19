@@ -97,14 +97,14 @@ SessionCipher.prototype = {
               return {
                   type           : 3,
                   body           : result,
-                  registrationId : record.registrationId
+                  registrationId : session.registrationId
               };
 
           } else {
               return {
                   type           : 1,
                   body           : util.toString(message),
-                  registrationId : record.registrationId
+                  registrationId : session.registrationId
               };
           }
       });
@@ -329,7 +329,11 @@ SessionCipher.prototype = {
           if (record === undefined) {
               return undefined;
           }
-          return record.registrationId;
+          var openSession = record.getOpenSession();
+          if (openSession === undefined) {
+              return null;
+          }
+          return openSession.registrationId;
       });
     }.bind(this));
   },

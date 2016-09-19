@@ -4,14 +4,31 @@
 
 'use strict';
 describe('SessionCipher', function() {
+
     describe('getRemoteRegistrationId', function() {
         var store = new SignalProtocolStore();
         var registrationId = 1337;
         var address = new libsignal.SignalProtocolAddress('foo', 1);
         var sessionCipher = new libsignal.SessionCipher(store, address.toString());
-        describe('when a record exists', function() {
+        describe('when an open record exists', function() {
             before(function(done) {
                 var record = new Internal.SessionRecord(registrationId);
+                var session = {
+                    registrationId: registrationId,
+                    currentRatchet: {
+                        rootKey                : new ArrayBuffer(32),
+                        lastRemoteEphemeralKey : new ArrayBuffer(32),
+                        previousCounter        : 0
+                    },
+                    indexInfo: {
+                        baseKey           : new ArrayBuffer(32),
+                        baseKeyType       : Internal.BaseKeyType.OURS,
+                        remoteIdentityKey : new ArrayBuffer(32),
+                        closed            : -1
+                    },
+                    oldRatchetList: []
+                };
+                record.updateSessionState(session);
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
             it('returns a valid registrationId', function(done) {
@@ -34,23 +51,39 @@ describe('SessionCipher', function() {
         var store = new SignalProtocolStore();
         var address = new libsignal.SignalProtocolAddress('foo', 1);
         var sessionCipher = new libsignal.SessionCipher(store, address.toString());
-        describe('registrationId is valid', function() {
+        describe('open session exists', function() {
             before(function(done) {
-                var record = new Internal.SessionRecord( 1);
+                var record = new Internal.SessionRecord();
+                var session = {
+                    registrationId: 1337,
+                    currentRatchet: {
+                        rootKey                : new ArrayBuffer(32),
+                        lastRemoteEphemeralKey : new ArrayBuffer(32),
+                        previousCounter        : 0
+                    },
+                    indexInfo: {
+                        baseKey           : new ArrayBuffer(32),
+                        baseKeyType       : Internal.BaseKeyType.OURS,
+                        remoteIdentityKey : new ArrayBuffer(32),
+                        closed            : -1
+                    },
+                    oldRatchetList: []
+                };
+                record.updateSessionState(session);
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
-            it('returns true for a session with a valid registrationId', function(done) {
+            it('returns true', function(done) {
                 sessionCipher.hasOpenSession(address.toString()).then(function(value) {
                     assert.isTrue(value);
                 }).then(done,done);
             });
         });
-        describe('registrationId is null', function() {
+        describe('no open session exists', function() {
             before(function(done) {
                 var record = new Internal.SessionRecord();
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
-            it('returns false for a session with a null registrationId', function(done) {
+            it('returns false', function(done) {
                 sessionCipher.hasOpenSession(address.toString()).then(function(value) {
                     assert.isFalse(value);
                 }).then(done,done);

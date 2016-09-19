@@ -35554,23 +35554,15 @@ Internal.SessionRecord = function() {
         return JSON.stringify(ensureStringed(thing)); //TODO: jquery???
     }
 
-    var SessionRecord = function(registrationId) {
+    var SessionRecord = function() {
         this._sessions = {};
-        this.registrationId = registrationId;
-
-        if (this.registrationId === undefined || typeof this.registrationId !== 'number') {
-            this.registrationId = null;
-        }
     };
 
     SessionRecord.deserialize = function(serialized) {
         var data = JSON.parse(serialized);
-        var record = new SessionRecord(data.registrationId);
+        var record = new SessionRecord();
         record._sessions = data.sessions;
         if (record._sessions === undefined || record._sessions === null || typeof record._sessions !== "object" || Array.isArray(record._sessions)) {
-            throw new Error("Error deserializing SessionRecord");
-        }
-        if (record.registrationId === undefined) {
             throw new Error("Error deserializing SessionRecord");
         }
         return record;
@@ -35579,12 +35571,11 @@ Internal.SessionRecord = function() {
     SessionRecord.prototype = {
         serialize: function() {
             return jsonThing({
-                sessions       : this._sessions,
-                registrationId : this.registrationId
+                sessions       : this._sessions
             });
         },
         haveOpenSession: function() {
-            return this.registrationId !== null;
+            return this.getOpenSession() !== undefined;
         },
 
         getSessionByBaseKey: function(baseKey) {
@@ -35643,7 +35634,7 @@ Internal.SessionRecord = function() {
                 }
             }
         },
-        updateSessionState: function(session, registrationId) {
+        updateSessionState: function(session) {
             var sessions = this._sessions;
 
             this.removeOldChains(session);
@@ -35652,19 +35643,6 @@ Internal.SessionRecord = function() {
 
             this.removeOldSessions();
 
-            var openSessionRemaining = false;
-            for (var key in sessions) {
-                if (sessions[key].indexInfo.closed == -1) {
-                    openSessionRemaining = true;
-                }
-            }
-            if (!openSessionRemaining) { // Used as a flag to get new pre keys for the next session
-                this.registrationId = null;
-            } else if (this.registrationId === null && registrationId !== undefined) {
-                this.registrationId = registrationId;
-            } else if (this.registrationId === null) {
-                throw new Error("Had open sessions on a record that had no registrationId set");
-            }
         },
         getSessions: function() {
             // return an array of sessions ordered by time closed,
@@ -35818,7 +35796,7 @@ SessionBuilder.prototype = {
       }).then(function(baseKey) {
         var devicePreKey = (device.preKey.publicKey);
         return this.initSession(true, baseKey, undefined, device.identityKey,
-          devicePreKey, device.signedPreKey.publicKey
+          devicePreKey, device.signedPreKey.publicKey, device.registrationId
         ).then(function(session) {
             session.pendingPreKey = {
                 preKeyId    : device.preKey.keyId,
@@ -35834,7 +35812,7 @@ SessionBuilder.prototype = {
           if (serialized !== undefined) {
             record = Internal.SessionRecord.deserialize(serialized);
           } else {
-            record = new Internal.SessionRecord(device.registrationId);
+            record = new Internal.SessionRecord();
           }
 
           record.archiveCurrentState();
@@ -35892,7 +35870,7 @@ SessionBuilder.prototype = {
         }
         return this.initSession(false, preKeyPair, signedPreKeyPair,
             message.identityKey.toArrayBuffer(),
-            message.baseKey.toArrayBuffer(), undefined
+            message.baseKey.toArrayBuffer(), undefined, message.registrationId
         ).then(function(new_session) {
             // Note that the session is not actually saved until the very
             // end of decryptWhisperMessage ... to ensure that the sender
@@ -35906,7 +35884,7 @@ SessionBuilder.prototype = {
   },
   initSession: function(isInitiator, ourEphemeralKey, ourSignedKey,
                    theirIdentityPubKey, theirEphemeralPubKey,
-                   theirSignedPubKey) {
+                   theirSignedPubKey, registrationId) {
     return this.storage.getIdentityKeyPair().then(function(ourIdentityKey) {
         if (isInitiator) {
             if (ourSignedKey !== undefined) {
@@ -35956,6 +35934,7 @@ SessionBuilder.prototype = {
             return Internal.HKDF(sharedSecret.buffer, new ArrayBuffer(32), "WhisperText");
         }).then(function(masterKey) {
             var session = {
+                registrationId: registrationId,
                 currentRatchet: {
                     rootKey                : masterKey[0],
                     lastRemoteEphemeralKey : theirSignedPubKey,
@@ -36114,14 +36093,14 @@ SessionCipher.prototype = {
               return {
                   type           : 3,
                   body           : result,
-                  registrationId : record.registrationId
+                  registrationId : session.registrationId
               };
 
           } else {
               return {
                   type           : 1,
                   body           : util.toString(message),
-                  registrationId : record.registrationId
+                  registrationId : session.registrationId
               };
           }
       });
@@ -36346,7 +36325,11 @@ SessionCipher.prototype = {
           if (record === undefined) {
               return undefined;
           }
-          return record.registrationId;
+          var openSession = record.getOpenSession();
+          if (openSession === undefined) {
+              return null;
+          }
+          return openSession.registrationId;
       });
     }.bind(this));
   },

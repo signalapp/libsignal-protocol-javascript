@@ -55,23 +55,15 @@ Internal.SessionRecord = function() {
         return JSON.stringify(ensureStringed(thing)); //TODO: jquery???
     }
 
-    var SessionRecord = function(registrationId) {
+    var SessionRecord = function() {
         this._sessions = {};
-        this.registrationId = registrationId;
-
-        if (this.registrationId === undefined || typeof this.registrationId !== 'number') {
-            this.registrationId = null;
-        }
     };
 
     SessionRecord.deserialize = function(serialized) {
         var data = JSON.parse(serialized);
-        var record = new SessionRecord(data.registrationId);
+        var record = new SessionRecord();
         record._sessions = data.sessions;
         if (record._sessions === undefined || record._sessions === null || typeof record._sessions !== "object" || Array.isArray(record._sessions)) {
-            throw new Error("Error deserializing SessionRecord");
-        }
-        if (record.registrationId === undefined) {
             throw new Error("Error deserializing SessionRecord");
         }
         return record;
@@ -80,12 +72,11 @@ Internal.SessionRecord = function() {
     SessionRecord.prototype = {
         serialize: function() {
             return jsonThing({
-                sessions       : this._sessions,
-                registrationId : this.registrationId
+                sessions       : this._sessions
             });
         },
         haveOpenSession: function() {
-            return this.registrationId !== null;
+            return this.getOpenSession() !== undefined;
         },
 
         getSessionByBaseKey: function(baseKey) {
@@ -144,7 +135,7 @@ Internal.SessionRecord = function() {
                 }
             }
         },
-        updateSessionState: function(session, registrationId) {
+        updateSessionState: function(session) {
             var sessions = this._sessions;
 
             this.removeOldChains(session);
@@ -153,19 +144,6 @@ Internal.SessionRecord = function() {
 
             this.removeOldSessions();
 
-            var openSessionRemaining = false;
-            for (var key in sessions) {
-                if (sessions[key].indexInfo.closed == -1) {
-                    openSessionRemaining = true;
-                }
-            }
-            if (!openSessionRemaining) { // Used as a flag to get new pre keys for the next session
-                this.registrationId = null;
-            } else if (this.registrationId === null && registrationId !== undefined) {
-                this.registrationId = registrationId;
-            } else if (this.registrationId === null) {
-                throw new Error("Had open sessions on a record that had no registrationId set");
-            }
         },
         getSessions: function() {
             // return an array of sessions ordered by time closed,

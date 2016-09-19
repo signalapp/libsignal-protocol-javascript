@@ -23,7 +23,7 @@ SessionBuilder.prototype = {
       }).then(function(baseKey) {
         var devicePreKey = (device.preKey.publicKey);
         return this.initSession(true, baseKey, undefined, device.identityKey,
-          devicePreKey, device.signedPreKey.publicKey
+          devicePreKey, device.signedPreKey.publicKey, device.registrationId
         ).then(function(session) {
             session.pendingPreKey = {
                 preKeyId    : device.preKey.keyId,
@@ -39,7 +39,7 @@ SessionBuilder.prototype = {
           if (serialized !== undefined) {
             record = Internal.SessionRecord.deserialize(serialized);
           } else {
-            record = new Internal.SessionRecord(device.registrationId);
+            record = new Internal.SessionRecord();
           }
 
           record.archiveCurrentState();
@@ -97,7 +97,7 @@ SessionBuilder.prototype = {
         }
         return this.initSession(false, preKeyPair, signedPreKeyPair,
             message.identityKey.toArrayBuffer(),
-            message.baseKey.toArrayBuffer(), undefined
+            message.baseKey.toArrayBuffer(), undefined, message.registrationId
         ).then(function(new_session) {
             // Note that the session is not actually saved until the very
             // end of decryptWhisperMessage ... to ensure that the sender
@@ -111,7 +111,7 @@ SessionBuilder.prototype = {
   },
   initSession: function(isInitiator, ourEphemeralKey, ourSignedKey,
                    theirIdentityPubKey, theirEphemeralPubKey,
-                   theirSignedPubKey) {
+                   theirSignedPubKey, registrationId) {
     return this.storage.getIdentityKeyPair().then(function(ourIdentityKey) {
         if (isInitiator) {
             if (ourSignedKey !== undefined) {
@@ -161,6 +161,7 @@ SessionBuilder.prototype = {
             return Internal.HKDF(sharedSecret.buffer, new ArrayBuffer(32), "WhisperText");
         }).then(function(masterKey) {
             var session = {
+                registrationId: registrationId,
                 currentRatchet: {
                     rootKey                : masterKey[0],
                     lastRemoteEphemeralKey : theirSignedPubKey,
