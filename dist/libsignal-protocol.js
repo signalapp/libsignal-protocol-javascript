@@ -35512,11 +35512,9 @@ Internal.ChainType = {
   RECEIVING: 2
 };
 
-var ARCHIVED_STATES_MAX_LENGTH = 40;
-
 Internal.SessionRecord = function() {
     'use strict';
-    var MESSAGE_LOST_THRESHOLD_MS = 1000*60*60*24*7;
+    var ARCHIVED_STATES_MAX_LENGTH = 40;
 
     var StaticByteBufferProto = new dcodeIO.ByteBuffer().__proto__;
     var StaticArrayBufferProto = new ArrayBuffer().__proto__;
