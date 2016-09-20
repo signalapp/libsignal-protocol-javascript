@@ -56,6 +56,36 @@ Internal.SessionRecord = function() {
         return JSON.stringify(ensureStringed(thing)); //TODO: jquery???
     }
 
+    var migrations = [
+      {
+        version: 'v1',
+        migrate: function migrateV1(data) {
+          var sessions = data.sessions;
+          if (data.registrationId) {
+              for (var key in sessions) {
+                  if (!sessions[key].registrationId) {
+                      sessions[key].registrationId = data.registrationId;
+                  }
+              }
+          }
+        }
+      }
+    ];
+
+    function migrate(data) {
+      var run = (data.version === undefined);
+      for (var i=0; i < migrations.length; ++i) {
+        if (run) {
+          migrations[i].migrate(data);
+        } else if (migrations[i].version === data.version) {
+          run = true;
+        }
+      }
+      if (!run) {
+        throw new Error("Error migrating SessionRecord");
+      }
+    }
+
     var SessionRecord = function() {
         this._sessions = {};
         this.version = SESSION_RECORD_VERSION;
@@ -63,6 +93,8 @@ Internal.SessionRecord = function() {
 
     SessionRecord.deserialize = function(serialized) {
         var data = JSON.parse(serialized);
+        if (data.version !== SESSION_RECORD_VERSION) { migrate(data); }
+
         var record = new SessionRecord();
         record._sessions = data.sessions;
         if (record._sessions === undefined || record._sessions === null || typeof record._sessions !== "object" || Array.isArray(record._sessions)) {
