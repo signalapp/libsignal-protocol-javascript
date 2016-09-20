@@ -35515,6 +35515,7 @@ Internal.ChainType = {
 Internal.SessionRecord = function() {
     'use strict';
     var ARCHIVED_STATES_MAX_LENGTH = 40;
+    var SESSION_RECORD_VERSION = 'v1';
 
     var StaticByteBufferProto = new dcodeIO.ByteBuffer().__proto__;
     var StaticArrayBufferProto = new ArrayBuffer().__proto__;
@@ -35556,6 +35557,7 @@ Internal.SessionRecord = function() {
 
     var SessionRecord = function() {
         this._sessions = {};
+        this.version = SESSION_RECORD_VERSION;
     };
 
     SessionRecord.deserialize = function(serialized) {
@@ -35571,7 +35573,8 @@ Internal.SessionRecord = function() {
     SessionRecord.prototype = {
         serialize: function() {
             return jsonThing({
-                sessions       : this._sessions
+                sessions       : this._sessions,
+                version        : this.version
             });
         },
         haveOpenSession: function() {
