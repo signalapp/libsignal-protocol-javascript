@@ -66,10 +66,19 @@ Internal.SessionRecord = function() {
         version: 'v1',
         migrate: function migrateV1(data) {
           var sessions = data.sessions;
+          var key;
           if (data.registrationId) {
-              for (var key in sessions) {
+              for (key in sessions) {
                   if (!sessions[key].registrationId) {
                       sessions[key].registrationId = data.registrationId;
+                  }
+              }
+          } else {
+              for (key in sessions) {
+                  if (sessions[key].indexInfo.closed === -1) {
+                      console.log('V1 session storage migration error: registrationId',
+                          data.registrationId, 'for open session version',
+                          data.version);
                   }
               }
           }
