@@ -42,7 +42,12 @@ Internal.SessionRecord = function() {
         } else if (thing === Object(thing)) {
             var obj = {};
             for (var key in thing) {
-                obj[key] = ensureStringed(thing[key]);
+                try {
+                  obj[key] = ensureStringed(thing[key]);
+                } catch (ex) {
+                  console.log('Error serializing key', key);
+                  throw ex;
+                }
             }
             return obj;
         } else if (thing === null) {
