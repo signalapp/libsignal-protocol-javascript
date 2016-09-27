@@ -101,7 +101,7 @@ Internal.SessionRecord = function() {
     }
 
     var SessionRecord = function() {
-        this._sessions = {};
+        this.sessions = {};
         this.version = SESSION_RECORD_VERSION;
     };
 
@@ -110,8 +110,8 @@ Internal.SessionRecord = function() {
         if (data.version !== SESSION_RECORD_VERSION) { migrate(data); }
 
         var record = new SessionRecord();
-        record._sessions = data.sessions;
-        if (record._sessions === undefined || record._sessions === null || typeof record._sessions !== "object" || Array.isArray(record._sessions)) {
+        record.sessions = data.sessions;
+        if (record.sessions === undefined || record.sessions === null || typeof record.sessions !== "object" || Array.isArray(record.sessions)) {
             throw new Error("Error deserializing SessionRecord");
         }
         return record;
@@ -120,7 +120,7 @@ Internal.SessionRecord = function() {
     SessionRecord.prototype = {
         serialize: function() {
             return jsonThing({
-                sessions       : this._sessions,
+                sessions       : this.sessions,
                 version        : this.version
             });
         },
@@ -130,7 +130,7 @@ Internal.SessionRecord = function() {
         },
 
         getSessionByBaseKey: function(baseKey) {
-            var session = this._sessions[util.toString(baseKey)];
+            var session = this.sessions[util.toString(baseKey)];
             if (session && session.indexInfo.baseKeyType === Internal.BaseKeyType.OURS) {
                 console.log("Tried to lookup a session using our basekey");
                 return undefined;
@@ -139,7 +139,7 @@ Internal.SessionRecord = function() {
         },
         getSessionByRemoteEphemeralKey: function(remoteEphemeralKey) {
             this.detectDuplicateOpenSessions();
-            var sessions = this._sessions;
+            var sessions = this.sessions;
 
             var searchKey = util.toString(remoteEphemeralKey);
 
@@ -159,7 +159,7 @@ Internal.SessionRecord = function() {
             return undefined;
         },
         getOpenSession: function() {
-            var sessions = this._sessions;
+            var sessions = this.sessions;
             if (sessions === undefined) {
                 return undefined;
             }
@@ -175,7 +175,7 @@ Internal.SessionRecord = function() {
         },
         detectDuplicateOpenSessions: function() {
             var openSession;
-            var sessions = this._sessions;
+            var sessions = this.sessions;
             for (var key in sessions) {
                 if (sessions[key].indexInfo.closed == -1) {
                     if (openSession !== undefined) {
@@ -186,7 +186,7 @@ Internal.SessionRecord = function() {
             }
         },
         updateSessionState: function(session) {
-            var sessions = this._sessions;
+            var sessions = this.sessions;
 
             this.removeOldChains(session);
 
@@ -200,11 +200,11 @@ Internal.SessionRecord = function() {
             // followed by the open session
             var list = [];
             var openSession;
-            for (var k in this._sessions) {
-                if (this._sessions[k].indexInfo.closed === -1) {
-                    openSession = this._sessions[k];
+            for (var k in this.sessions) {
+                if (this.sessions[k].indexInfo.closed === -1) {
+                    openSession = this.sessions[k];
                 } else {
-                    list.push(this._sessions[k]);
+                    list.push(this.sessions[k]);
                 }
             }
             list = list.sort(function(s1, s2) {
@@ -265,7 +265,7 @@ Internal.SessionRecord = function() {
         },
         removeOldSessions: function() {
             // Retain only the last 20 sessions
-            var sessions = this._sessions;
+            var sessions = this.sessions;
             var oldestBaseKey, oldestSession;
             while (Object.keys(sessions).length > ARCHIVED_STATES_MAX_LENGTH) {
                 for (var key in sessions) {
