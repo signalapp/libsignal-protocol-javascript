@@ -125,7 +125,8 @@ Internal.SessionRecord = function() {
             });
         },
         haveOpenSession: function() {
-            return this.getOpenSession() !== undefined;
+            var openSession = this.getOpenSession();
+            return (!!openSession && !!openSession.registrationId);
         },
 
         getSessionByBaseKey: function(baseKey) {
