@@ -16,6 +16,7 @@ Internal.ChainType = {
 Internal.SessionRecord = function() {
     'use strict';
     var ARCHIVED_STATES_MAX_LENGTH = 40;
+    var OLD_RATCHETS_MAX_LENGTH = 10;
     var SESSION_RECORD_VERSION = 'v1';
 
     var StaticByteBufferProto = new dcodeIO.ByteBuffer().__proto__;
@@ -248,8 +249,8 @@ Internal.SessionRecord = function() {
         removeOldChains: function(session) {
             // Sending ratchets are always removed when we step because we never need them again
             // Receiving ratchets are added to the oldRatchetList, which we parse
-            // here and remove all but the last five.
-            while (session.oldRatchetList.length > 5) {
+            // here and remove all but the last ten.
+            while (session.oldRatchetList.length > OLD_RATCHETS_MAX_LENGTH) {
                 var index = 0;
                 var oldest = session.oldRatchetList[0];
                 for (var i = 0; i < session.oldRatchetList.length; i++) {
