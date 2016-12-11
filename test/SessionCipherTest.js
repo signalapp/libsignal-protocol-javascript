@@ -1,17 +1,28 @@
 /*
  * vim: ts=4:sw=4
  */
-
 'use strict';
+
+var util = require('../src/helpers.js');
+var TestVectors = require('./testvectors.js');
+var SignalProtocolStore = require('./InMemorySignalProtocolStore.js');
+var SignalProtocolAddress = require('../src/SignalProtocolAddress.js');
+var SessionCipher = require('../src/SessionCipher.js');
+var Crypto = require('../src/crypto.js');
+var SessionRecord = require('../src/SessionRecord.js');
+var SessionBuilder = require('../src/SessionBuilder.js');
+var textsecure = require('./temp_helpers.js');
+var protobuf = require('../build/protobufs_concat.js');
+
 describe('SessionCipher', function() {
     describe('getRemoteRegistrationId', function() {
         var store = new SignalProtocolStore();
         var registrationId = 1337;
-        var address = new libsignal.SignalProtocolAddress('foo', 1);
-        var sessionCipher = new libsignal.SessionCipher(store, address.toString());
+        var address = new SignalProtocolAddress('foo', 1);
+        var sessionCipher = new SessionCipher(store, address.toString());
         describe('when a record exists', function() {
             before(function(done) {
-                var record = new Internal.SessionRecord('identityKey', registrationId);
+                var record = new SessionRecord('identityKey', registrationId);
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
             it('returns a valid registrationId', function(done) {
@@ -22,7 +33,7 @@ describe('SessionCipher', function() {
         });
         describe('when a record does not exist', function() {
             it('returns undefined', function(done) {
-                var sessionCipher = new libsignal.SessionCipher(store, 'bar.1');
+                var sessionCipher = new SessionCipher(store, 'bar.1');
                 sessionCipher.getRemoteRegistrationId().then(function(value) {
                     assert.isUndefined(value);
                 }).then(done,done);
@@ -32,11 +43,11 @@ describe('SessionCipher', function() {
 
     describe('hasOpenSession', function() {
         var store = new SignalProtocolStore();
-        var address = new libsignal.SignalProtocolAddress('foo', 1);
-        var sessionCipher = new libsignal.SessionCipher(store, address.toString());
+        var address = new SignalProtocolAddress('foo', 1);
+        var sessionCipher = new SessionCipher(store, address.toString());
         describe('registrationId is valid', function() {
             before(function(done) {
-                var record = new Internal.SessionRecord('identityKey', 1);
+                var record = new SessionRecord('identityKey', 1);
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
             it('returns true for a session with a valid registrationId', function(done) {
@@ -47,7 +58,7 @@ describe('SessionCipher', function() {
         });
         describe('registrationId is null', function() {
             before(function(done) {
-                var record = new Internal.SessionRecord('identityKey');
+                var record = new SessionRecord('identityKey');
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
             it('returns false for a session with a null registrationId', function(done) {
@@ -75,15 +86,15 @@ describe('SessionCipher', function() {
             return Promise.resolve();
         }
 
-        return Internal.crypto.createKeyPair(data.ourIdentityKey).then(function(keyPair) {
+      return Crypto.crypto.createKeyPair(data.ourIdentityKey).then(function(keyPair) {
             store.put('identityKey', keyPair);
         }).then(function() {
-            return Internal.crypto.createKeyPair(data.ourSignedPreKey);
+            return Crypto.crypto.createKeyPair(data.ourSignedPreKey);
         }).then(function(signedKeyPair) {
             store.storeSignedPreKey(data.signedPreKeyId, signedKeyPair);
         }).then(function() {
             if (data.ourPreKey !== undefined) {
-                return Internal.crypto.createKeyPair(data.ourPreKey).then(function(keyPair) {
+                return Crypto.crypto.createKeyPair(data.ourPreKey).then(function(keyPair) {
                     store.storePreKey(data.preKeyId, keyPair);
                 });
             }
@@ -128,7 +139,7 @@ describe('SessionCipher', function() {
 
     function doReceiveStep(store, data, privKeyQueue, address) {
         return setupReceiveStep(store, data, privKeyQueue).then(function() {
-            var sessionCipher = new libsignal.SessionCipher(store, address);
+            var sessionCipher = new SessionCipher(store, address);
 
             if (data.type == textsecure.protobuf.IncomingPushMessageSignal.Type.CIPHERTEXT) {
                 return sessionCipher.decryptWhisperMessage(data.message).then(unpad);
@@ -169,7 +180,7 @@ describe('SessionCipher', function() {
         }
 
         if (data.ourIdentityKey !== undefined) {
-            return Internal.crypto.createKeyPair(data.ourIdentityKey).then(function(keyPair) {
+            return Crypto.crypto.createKeyPair(data.ourIdentityKey).then(function(keyPair) {
                 store.put('identityKey', keyPair);
             });
         }
@@ -187,7 +198,7 @@ describe('SessionCipher', function() {
                     registrationId : data.getKeys.devices[0].registrationId
                 };
 
-                var builder = new libsignal.SessionBuilder(store, address);
+                var builder = new SessionBuilder(store, address);
 
                 return builder.processPreKey(deviceObject);
             }
@@ -210,7 +221,7 @@ describe('SessionCipher', function() {
                         throw new Error("Bad version byte");
                     }
 
-                    var expected = Internal.protobuf.PreKeyWhisperMessage.decode(
+                    var expected = protobuf.PreKeyWhisperMessage.decode(
                         data.expectedCiphertext.slice(1)
                     ).encode();
 
@@ -258,12 +269,12 @@ describe('SessionCipher', function() {
             this.timeout(20000);
 
             var privKeyQueue = [];
-            var origCreateKeyPair = Internal.crypto.createKeyPair;
+            var origCreateKeyPair = Crypto.crypto.createKeyPair;
 
             before(function() {
                 // Shim createKeyPair to return predetermined keys from
                 // privKeyQueue instead of random keys.
-                Internal.crypto.createKeyPair = function(privKey) {
+                Crypto.crypto.createKeyPair = function(privKey) {
                     if (privKey !== undefined) {
                         return origCreateKeyPair(privKey);
                     }
@@ -271,7 +282,7 @@ describe('SessionCipher', function() {
                         throw new Error('Out of private keys');
                     } else {
                         var privKey = privKeyQueue.shift();
-                        return Internal.crypto.createKeyPair(privKey).then(function(keyPair) {
+                        return Crypto.crypto.createKeyPair(privKey).then(function(keyPair) {
                             var a = btoa(util.toString(keyPair.privKey));
                             var b = btoa(util.toString(privKey));
                             if (util.toString(keyPair.privKey) != util.toString(privKey))
@@ -284,7 +295,7 @@ describe('SessionCipher', function() {
             });
 
             after(function() {
-                Internal.crypto.createKeyPair = origCreateKeyPair;
+                Crypto.crypto.createKeyPair = origCreateKeyPair;
                 if (privKeyQueue.length != 0) {
                     throw new Error('Leftover private keys');
                 }
@@ -313,7 +324,7 @@ describe('SessionCipher', function() {
             }
 
             var store = new SignalProtocolStore();
-            var address = libsignal.SignalProtocolAddress.fromString("SNOWDEN.1");
+            var address = SignalProtocolAddress.fromString("SNOWDEN.1");
             test.vectors.forEach(function(step) {
                 it(getDescription(step), function(done) {
                     var doStep;

@@ -3,6 +3,10 @@
  */
 
 'use strict';
+
+var Crypto = require('../src/crypto.js');
+var FingerprintGenerator = require('../src/NumericFingerprint.js');
+
 describe('NumericFingerprint', function() {
     this.timeout(5000);
     var ALICE_IDENTITY = [
@@ -27,7 +31,7 @@ describe('NumericFingerprint', function() {
     };
 
     it('returns the correct fingerprint', function(done) {
-        var generator = new libsignal.FingerprintGenerator(5200);
+        var generator = new FingerprintGenerator(5200);
         generator.createFor(
             alice.identifier, alice.key, bob.identifier, bob.key
         ).then(function(fingerprint) {
@@ -36,7 +40,7 @@ describe('NumericFingerprint', function() {
     });
 
     it ('alice and bob results match', function(done) {
-        var generator = new libsignal.FingerprintGenerator(1024);
+        var generator = new FingerprintGenerator(1024);
         Promise.all([
             generator.createFor(
                 alice.identifier, alice.key, bob.identifier, bob.key
@@ -50,7 +54,7 @@ describe('NumericFingerprint', function() {
     });
 
     it ('alice and !bob results mismatch', function(done) {
-        var generator = new libsignal.FingerprintGenerator(1024);
+        var generator = new FingerprintGenerator(1024);
         Promise.all([
             generator.createFor(
                 alice.identifier, alice.key, '+15558675309', bob.key
@@ -64,8 +68,8 @@ describe('NumericFingerprint', function() {
     });
 
     it ('alice and mitm results mismatch', function(done) {
-        var mitm   = libsignal.crypto.getRandomBytes(33);
-        var generator = new libsignal.FingerprintGenerator(1024);
+        var mitm   = Crypto.crypto.getRandomBytes(33);
+        var generator = new FingerprintGenerator(1024);
         Promise.all([
             generator.createFor(
                 alice.identifier, alice.key, bob.identifier, mitm

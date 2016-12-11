@@ -1,6 +1,8 @@
 /* vim: ts=4:sw=4 */
-
 'use strict';
+
+var util = require('../src/helpers.js');
+
 describe('util', function() {
     describe("isEqual", function(){
         it('returns false when a or b is undefined', function(){

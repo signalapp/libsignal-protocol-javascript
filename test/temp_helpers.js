@@ -1,4 +1,5 @@
-var pushMessages     = dcodeIO.ProtoBuf.loadProto('package textsecure;\n' +
+var dcodeIO = require('../build/dcodeIO.js');
+var pushMessages     = dcodeIO.loadProto('package textsecure;\n' +
 '\n' +
 'option java_package = "org.whispersystems.textsecure.push";\n' +
 'option java_outer_classname = "PushMessageProtos";\n' +
@@ -54,7 +55,7 @@ var pushMessages     = dcodeIO.ProtoBuf.loadProto('package textsecure;\n' +
 '  optional uint32            flags       = 4;\n' +
 '}').build('textsecure');
 
-window.textsecure = {
+module.exports = {
     protobuf: {
         IncomingPushMessageSignal : pushMessages.IncomingPushMessageSignal,
         PushMessageContent        : pushMessages.PushMessageContent,

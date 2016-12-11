@@ -30,9 +30,13 @@ for (var key in Module) {
 
 // The environment setup code below is customized to use Module.
 // *** Environment setup code ***
-var ENVIRONMENT_IS_NODE = typeof process === 'object' && typeof require === 'function';
 var ENVIRONMENT_IS_WEB = typeof window === 'object';
+// Three configurations we can be running in:
+// 1) We could be the application main() thread running in the main JS UI thread. (ENVIRONMENT_IS_WORKER == false and ENVIRONMENT_IS_PTHREAD == false)
+// 2) We could be the application main() thread proxied to worker. (with Emscripten -s PROXY_TO_WORKER=1) (ENVIRONMENT_IS_WORKER == true, ENVIRONMENT_IS_PTHREAD == false)
+// 3) We could be an application pthread running in a worker. (ENVIRONMENT_IS_WORKER == true and ENVIRONMENT_IS_PTHREAD == true)
 var ENVIRONMENT_IS_WORKER = typeof importScripts === 'function';
+var ENVIRONMENT_IS_NODE = typeof process === 'object' && typeof require === 'function' && !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_WORKER;
 var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIRONMENT_IS_WORKER;
 
 if (ENVIRONMENT_IS_NODE) {
@@ -60,16 +64,25 @@ if (ENVIRONMENT_IS_NODE) {
     return ret;
   };
 
-  Module['readBinary'] = function readBinary(filename) { return Module['read'](filename, true) };
+  Module['readBinary'] = function readBinary(filename) {
+    var ret = Module['read'](filename, true);
+    if (!ret.buffer) {
+      ret = new Uint8Array(ret);
+    }
+    assert(ret.buffer);
+    return ret;
+  };
 
   Module['load'] = function load(f) {
     globalEval(read(f));
   };
 
-  if (process['argv'].length > 1) {
-    Module['thisProgram'] = process['argv'][1].replace(/\\/g, '/');
-  } else {
-    Module['thisProgram'] = 'unknown-program';
+  if (!Module['thisProgram']) {
+    if (process['argv'].length > 1) {
+      Module['thisProgram'] = process['argv'][1].replace(/\\/g, '/');
+    } else {
+      Module['thisProgram'] = 'unknown-program';
+    }
   }
 
   Module['arguments'] = process['argv'].slice(2);
@@ -84,6 +97,8 @@ if (ENVIRONMENT_IS_NODE) {
       throw ex;
     }
   });
+
+  Module['inspect'] = function () { return '[Emscripten Module object]'; };
 }
 else if (ENVIRONMENT_IS_SHELL) {
   if (!Module['print']) Module['print'] = print;
@@ -109,8 +124,6 @@ else if (ENVIRONMENT_IS_SHELL) {
   } else if (typeof arguments != 'undefined') {
     Module['arguments'] = arguments;
   }
-
-  this['Module'] = Module;
 
 }
 else if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
@@ -142,10 +155,12 @@ else if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
     }));
   }
 
-  if (ENVIRONMENT_IS_WEB) {
-    window['Module'] = Module;
-  } else {
+  if (ENVIRONMENT_IS_WORKER) {
     Module['load'] = importScripts;
+  }
+
+  if (typeof Module['setWindowTitle'] === 'undefined') {
+    Module['setWindowTitle'] = function(title) { document.title = title };
   }
 }
 else {
@@ -245,6 +260,18 @@ var Runtime = {
     return Math.max(Runtime.getNativeTypeSize(type), Runtime.QUANTUM_SIZE);
   },
   STACK_ALIGN: 16,
+  prepVararg: function (ptr, type) {
+    if (type === 'double' || type === 'i64') {
+      // move so the load is aligned
+      if (ptr & 7) {
+        assert((ptr & 7) === 4);
+        ptr += 4;
+      }
+    } else {
+      assert((ptr & 3) === 0);
+    }
+    return ptr;
+  },
   getAlignSize: function (type, size, vararg) {
     // we align i64s and doubles on 64-bit boundaries, unlike x86
     if (!vararg && (type == 'i64' || type == 'double')) return 8;
@@ -273,34 +300,6 @@ var Runtime = {
   removeFunction: function (index) {
     Runtime.functionPointers[(index-2)/2] = null;
   },
-  getAsmConst: function (code, numArgs) {
-    // code is a constant string on the heap, so we can cache these
-    if (!Runtime.asmConstCache) Runtime.asmConstCache = {};
-    var func = Runtime.asmConstCache[code];
-    if (func) return func;
-    var args = [];
-    for (var i = 0; i < numArgs; i++) {
-      args.push(String.fromCharCode(36) + i); // $0, $1 etc
-    }
-    var source = Pointer_stringify(code);
-    if (source[0] === '"') {
-      // tolerate EM_ASM("..code..") even though EM_ASM(..code..) is correct
-      if (source.indexOf('"', 1) === source.length-1) {
-        source = source.substr(1, source.length-2);
-      } else {
-        // something invalid happened, e.g. EM_ASM("..code($0)..", input)
-        abort('invalid EM_ASM input |' + source + '|. Please use EM_ASM(..code..) (no quotes) or EM_ASM({ ..code($0).. }, input) (to input values)');
-      }
-    }
-    try {
-      // Module is the only 'upvar', which we provide directly. We also provide FS for legacy support.
-      var evalled = eval('(function(Module, FS) { return function(' + args.join(',') + '){ ' + source + ' } })')(Module, typeof FS !== 'undefined' ? FS : null);
-    } catch(e) {
-      Module.printErr('error in executing inline EM_ASM code: ' + e + ' on: \n\n' + source + '\n\nwith args |' + args + '| (make sure to use the right one out of EM_ASM, EM_ASM_ARGS, etc.)');
-      throw e;
-    }
-    return Runtime.asmConstCache[code] = evalled;
-  },
   warnOnce: function (text) {
     if (!Runtime.warnOnce.shown) Runtime.warnOnce.shown = {};
     if (!Runtime.warnOnce.shown[text]) {
@@ -322,73 +321,12 @@ var Runtime = {
     }
     return sigCache[func];
   },
-  UTF8Processor: function () {
-    var buffer = [];
-    var needed = 0;
-    this.processCChar = function (code) {
-      code = code & 0xFF;
-
-      if (buffer.length == 0) {
-        if ((code & 0x80) == 0x00) {        // 0xxxxxxx
-          return String.fromCharCode(code);
-        }
-        buffer.push(code);
-        if ((code & 0xE0) == 0xC0) {        // 110xxxxx
-          needed = 1;
-        } else if ((code & 0xF0) == 0xE0) { // 1110xxxx
-          needed = 2;
-        } else {                            // 11110xxx
-          needed = 3;
-        }
-        return '';
-      }
-
-      if (needed) {
-        buffer.push(code);
-        needed--;
-        if (needed > 0) return '';
-      }
-
-      var c1 = buffer[0];
-      var c2 = buffer[1];
-      var c3 = buffer[2];
-      var c4 = buffer[3];
-      var ret;
-      if (buffer.length == 2) {
-        ret = String.fromCharCode(((c1 & 0x1F) << 6)  | (c2 & 0x3F));
-      } else if (buffer.length == 3) {
-        ret = String.fromCharCode(((c1 & 0x0F) << 12) | ((c2 & 0x3F) << 6)  | (c3 & 0x3F));
-      } else {
-        // http://mathiasbynens.be/notes/javascript-encoding#surrogate-formulae
-        var codePoint = ((c1 & 0x07) << 18) | ((c2 & 0x3F) << 12) |
-                        ((c3 & 0x3F) << 6)  | (c4 & 0x3F);
-        ret = String.fromCharCode(
-          (((codePoint - 0x10000) / 0x400)|0) + 0xD800,
-          (codePoint - 0x10000) % 0x400 + 0xDC00);
-      }
-      buffer.length = 0;
-      return ret;
-    }
-    this.processJSString = function processJSString(string) {
-      /* TODO: use TextEncoder when present,
-        var encoder = new TextEncoder();
-        encoder['encoding'] = "utf-8";
-        var utf8Array = encoder['encode'](aMsg.data);
-      */
-      string = unescape(encodeURIComponent(string));
-      var ret = [];
-      for (var i = 0; i < string.length; i++) {
-        ret.push(string.charCodeAt(i));
-      }
-      return ret;
-    }
-  },
   getCompilerSetting: function (name) {
     throw 'You must build with -s RETAIN_COMPILER_SETTINGS=1 for Runtime.getCompilerSetting or emscripten_get_compiler_setting to work';
   },
   stackAlloc: function (size) { var ret = STACKTOP;STACKTOP = (STACKTOP + size)|0;STACKTOP = (((STACKTOP)+15)&-16); return ret; },
   staticAlloc: function (size) { var ret = STATICTOP;STATICTOP = (STATICTOP + size)|0;STATICTOP = (((STATICTOP)+15)&-16); return ret; },
-  dynamicAlloc: function (size) { var ret = DYNAMICTOP;DYNAMICTOP = (DYNAMICTOP + size)|0;DYNAMICTOP = (((DYNAMICTOP)+15)&-16); if (DYNAMICTOP >= TOTAL_MEMORY) enlargeMemory();; return ret; },
+  dynamicAlloc: function (size) { var ret = DYNAMICTOP;DYNAMICTOP = (DYNAMICTOP + size)|0;DYNAMICTOP = (((DYNAMICTOP)+15)&-16); if (DYNAMICTOP >= TOTAL_MEMORY) { var success = enlargeMemory(); if (!success) { DYNAMICTOP = ret;  return 0; } }; return ret; },
   alignMemory: function (size,quantum) { var ret = size = Math.ceil((size)/(quantum ? quantum : 16))*(quantum ? quantum : 16); return ret; },
   makeBigInt: function (low,high,unsigned) { var ret = (unsigned ? ((+((low>>>0)))+((+((high>>>0)))*4294967296.0)) : ((+((low>>>0)))+((+((high|0)))*4294967296.0))); return ret; },
   GLOBAL_BASE: 8,
@@ -397,13 +335,8 @@ var Runtime = {
 }
 
 
-Module['Runtime'] = Runtime;
 
-
-
-
-
-
+Module["Runtime"] = Runtime;
 
 
 
@@ -475,7 +408,7 @@ var cwrap, ccall;
   var toC = {'string' : JSfuncs['stringToC'], 'array' : JSfuncs['arrayToC']};
 
   // C calling interface. 
-  ccall = function ccallFunc(ident, returnType, argTypes, args) {
+  ccall = function ccallFunc(ident, returnType, argTypes, args, opts) {
     var func = getCFunc(ident);
     var cArgs = [];
     var stack = 0;
@@ -492,7 +425,15 @@ var cwrap, ccall;
     }
     var ret = func.apply(null, cArgs);
     if (returnType === 'string') ret = Pointer_stringify(ret);
-    if (stack !== 0) Runtime.stackRestore(stack);
+    if (stack !== 0) {
+      if (opts && opts.async) {
+        EmterpreterAsync.asyncFinalizers.push(function() {
+          Runtime.stackRestore(stack);
+        });
+        return;
+      }
+      Runtime.stackRestore(stack);
+    }
     return ret;
   }
 
@@ -557,9 +498,8 @@ var cwrap, ccall;
     return eval(funcstr);
   };
 })();
-Module["cwrap"] = cwrap;
 Module["ccall"] = ccall;
-
+Module["cwrap"] = cwrap;
 
 function setValue(ptr, value, type, noSafe) {
   type = type || 'i8';
@@ -575,7 +515,7 @@ function setValue(ptr, value, type, noSafe) {
       default: abort('invalid type for setValue: ' + type);
     }
 }
-Module['setValue'] = setValue;
+Module["setValue"] = setValue;
 
 
 function getValue(ptr, type, noSafe) {
@@ -593,18 +533,18 @@ function getValue(ptr, type, noSafe) {
     }
   return null;
 }
-Module['getValue'] = getValue;
+Module["getValue"] = getValue;
 
 var ALLOC_NORMAL = 0; // Tries to use _malloc()
 var ALLOC_STACK = 1; // Lives for the duration of the current function call
 var ALLOC_STATIC = 2; // Cannot be freed
 var ALLOC_DYNAMIC = 3; // Cannot be freed except through sbrk
 var ALLOC_NONE = 4; // Do not allocate
-Module['ALLOC_NORMAL'] = ALLOC_NORMAL;
-Module['ALLOC_STACK'] = ALLOC_STACK;
-Module['ALLOC_STATIC'] = ALLOC_STATIC;
-Module['ALLOC_DYNAMIC'] = ALLOC_DYNAMIC;
-Module['ALLOC_NONE'] = ALLOC_NONE;
+Module["ALLOC_NORMAL"] = ALLOC_NORMAL;
+Module["ALLOC_STACK"] = ALLOC_STACK;
+Module["ALLOC_STATIC"] = ALLOC_STATIC;
+Module["ALLOC_DYNAMIC"] = ALLOC_DYNAMIC;
+Module["ALLOC_NONE"] = ALLOC_NONE;
 
 // allocate(): This is for internal use. You can use it yourself as well, but the interface
 //             is a little tricky (see docs right below). The reason is that it is optimized
@@ -689,19 +629,27 @@ function allocate(slab, types, allocator, ptr) {
 
   return ret;
 }
-Module['allocate'] = allocate;
+Module["allocate"] = allocate;
+
+// Allocate memory during any stage of startup - static memory early on, dynamic memory later, malloc when ready
+function getMemory(size) {
+  if (!staticSealed) return Runtime.staticAlloc(size);
+  if ((typeof _sbrk !== 'undefined' && !_sbrk.called) || !runtimeInitialized) return Runtime.dynamicAlloc(size);
+  return _malloc(size);
+}
+Module["getMemory"] = getMemory;
 
 function Pointer_stringify(ptr, /* optional */ length) {
   if (length === 0 || !ptr) return '';
   // TODO: use TextDecoder
   // Find the length, and check for UTF while doing so
-  var hasUtf = false;
+  var hasUtf = 0;
   var t;
   var i = 0;
   while (1) {
     t = HEAPU8[(((ptr)+(i))>>0)];
-    if (t >= 128) hasUtf = true;
-    else if (t == 0 && !length) break;
+    hasUtf |= t;
+    if (t == 0 && !length) break;
     i++;
     if (length && i == length) break;
   }
@@ -709,7 +657,7 @@ function Pointer_stringify(ptr, /* optional */ length) {
 
   var ret = '';
 
-  if (!hasUtf) {
+  if (hasUtf < 128) {
     var MAX_CHUNK = 1024; // split up into chunks, because .apply on a huge string can overflow the stack
     var curr;
     while (length > 0) {
@@ -720,15 +668,184 @@ function Pointer_stringify(ptr, /* optional */ length) {
     }
     return ret;
   }
-
-  var utf8 = new Runtime.UTF8Processor();
-  for (i = 0; i < length; i++) {
-    t = HEAPU8[(((ptr)+(i))>>0)];
-    ret += utf8.processCChar(t);
-  }
-  return ret;
+  return Module['UTF8ToString'](ptr);
 }
-Module['Pointer_stringify'] = Pointer_stringify;
+Module["Pointer_stringify"] = Pointer_stringify;
+
+// Given a pointer 'ptr' to a null-terminated ASCII-encoded string in the emscripten HEAP, returns
+// a copy of that string as a Javascript String object.
+
+function AsciiToString(ptr) {
+  var str = '';
+  while (1) {
+    var ch = HEAP8[((ptr++)>>0)];
+    if (!ch) return str;
+    str += String.fromCharCode(ch);
+  }
+}
+Module["AsciiToString"] = AsciiToString;
+
+// Copies the given Javascript String object 'str' to the emscripten HEAP at address 'outPtr',
+// null-terminated and encoded in ASCII form. The copy will require at most str.length+1 bytes of space in the HEAP.
+
+function stringToAscii(str, outPtr) {
+  return writeAsciiToMemory(str, outPtr, false);
+}
+Module["stringToAscii"] = stringToAscii;
+
+// Given a pointer 'ptr' to a null-terminated UTF8-encoded string in the given array that contains uint8 values, returns
+// a copy of that string as a Javascript String object.
+
+function UTF8ArrayToString(u8Array, idx) {
+  var u0, u1, u2, u3, u4, u5;
+
+  var str = '';
+  while (1) {
+    // For UTF8 byte structure, see http://en.wikipedia.org/wiki/UTF-8#Description and https://www.ietf.org/rfc/rfc2279.txt and https://tools.ietf.org/html/rfc3629
+    u0 = u8Array[idx++];
+    if (!u0) return str;
+    if (!(u0 & 0x80)) { str += String.fromCharCode(u0); continue; }
+    u1 = u8Array[idx++] & 63;
+    if ((u0 & 0xE0) == 0xC0) { str += String.fromCharCode(((u0 & 31) << 6) | u1); continue; }
+    u2 = u8Array[idx++] & 63;
+    if ((u0 & 0xF0) == 0xE0) {
+      u0 = ((u0 & 15) << 12) | (u1 << 6) | u2;
+    } else {
+      u3 = u8Array[idx++] & 63;
+      if ((u0 & 0xF8) == 0xF0) {
+        u0 = ((u0 & 7) << 18) | (u1 << 12) | (u2 << 6) | u3;
+      } else {
+        u4 = u8Array[idx++] & 63;
+        if ((u0 & 0xFC) == 0xF8) {
+          u0 = ((u0 & 3) << 24) | (u1 << 18) | (u2 << 12) | (u3 << 6) | u4;
+        } else {
+          u5 = u8Array[idx++] & 63;
+          u0 = ((u0 & 1) << 30) | (u1 << 24) | (u2 << 18) | (u3 << 12) | (u4 << 6) | u5;
+        }
+      }
+    }
+    if (u0 < 0x10000) {
+      str += String.fromCharCode(u0);
+    } else {
+      var ch = u0 - 0x10000;
+      str += String.fromCharCode(0xD800 | (ch >> 10), 0xDC00 | (ch & 0x3FF));
+    }
+  }
+}
+Module["UTF8ArrayToString"] = UTF8ArrayToString;
+
+// Given a pointer 'ptr' to a null-terminated UTF8-encoded string in the emscripten HEAP, returns
+// a copy of that string as a Javascript String object.
+
+function UTF8ToString(ptr) {
+  return UTF8ArrayToString(HEAPU8,ptr);
+}
+Module["UTF8ToString"] = UTF8ToString;
+
+// Copies the given Javascript String object 'str' to the given byte array at address 'outIdx',
+// encoded in UTF8 form and null-terminated. The copy will require at most str.length*4+1 bytes of space in the HEAP.
+// Use the function lengthBytesUTF8() to compute the exact number of bytes (excluding null terminator) that this function will write.
+// Parameters:
+//   str: the Javascript string to copy.
+//   outU8Array: the array to copy to. Each index in this array is assumed to be one 8-byte element.
+//   outIdx: The starting offset in the array to begin the copying.
+//   maxBytesToWrite: The maximum number of bytes this function can write to the array. This count should include the null 
+//                    terminator, i.e. if maxBytesToWrite=1, only the null terminator will be written and nothing else.
+//                    maxBytesToWrite=0 does not write any bytes to the output, not even the null terminator.
+// Returns the number of bytes written, EXCLUDING the null terminator.
+
+function stringToUTF8Array(str, outU8Array, outIdx, maxBytesToWrite) {
+  if (!(maxBytesToWrite > 0)) // Parameter maxBytesToWrite is not optional. Negative values, 0, null, undefined and false each don't write out any bytes.
+    return 0;
+
+  var startIdx = outIdx;
+  var endIdx = outIdx + maxBytesToWrite - 1; // -1 for string null terminator.
+  for (var i = 0; i < str.length; ++i) {
+    // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code unit, not a Unicode code point of the character! So decode UTF16->UTF32->UTF8.
+    // See http://unicode.org/faq/utf_bom.html#utf16-3
+    // For UTF8 byte structure, see http://en.wikipedia.org/wiki/UTF-8#Description and https://www.ietf.org/rfc/rfc2279.txt and https://tools.ietf.org/html/rfc3629
+    var u = str.charCodeAt(i); // possibly a lead surrogate
+    if (u >= 0xD800 && u <= 0xDFFF) u = 0x10000 + ((u & 0x3FF) << 10) | (str.charCodeAt(++i) & 0x3FF);
+    if (u <= 0x7F) {
+      if (outIdx >= endIdx) break;
+      outU8Array[outIdx++] = u;
+    } else if (u <= 0x7FF) {
+      if (outIdx + 1 >= endIdx) break;
+      outU8Array[outIdx++] = 0xC0 | (u >> 6);
+      outU8Array[outIdx++] = 0x80 | (u & 63);
+    } else if (u <= 0xFFFF) {
+      if (outIdx + 2 >= endIdx) break;
+      outU8Array[outIdx++] = 0xE0 | (u >> 12);
+      outU8Array[outIdx++] = 0x80 | ((u >> 6) & 63);
+      outU8Array[outIdx++] = 0x80 | (u & 63);
+    } else if (u <= 0x1FFFFF) {
+      if (outIdx + 3 >= endIdx) break;
+      outU8Array[outIdx++] = 0xF0 | (u >> 18);
+      outU8Array[outIdx++] = 0x80 | ((u >> 12) & 63);
+      outU8Array[outIdx++] = 0x80 | ((u >> 6) & 63);
+      outU8Array[outIdx++] = 0x80 | (u & 63);
+    } else if (u <= 0x3FFFFFF) {
+      if (outIdx + 4 >= endIdx) break;
+      outU8Array[outIdx++] = 0xF8 | (u >> 24);
+      outU8Array[outIdx++] = 0x80 | ((u >> 18) & 63);
+      outU8Array[outIdx++] = 0x80 | ((u >> 12) & 63);
+      outU8Array[outIdx++] = 0x80 | ((u >> 6) & 63);
+      outU8Array[outIdx++] = 0x80 | (u & 63);
+    } else {
+      if (outIdx + 5 >= endIdx) break;
+      outU8Array[outIdx++] = 0xFC | (u >> 30);
+      outU8Array[outIdx++] = 0x80 | ((u >> 24) & 63);
+      outU8Array[outIdx++] = 0x80 | ((u >> 18) & 63);
+      outU8Array[outIdx++] = 0x80 | ((u >> 12) & 63);
+      outU8Array[outIdx++] = 0x80 | ((u >> 6) & 63);
+      outU8Array[outIdx++] = 0x80 | (u & 63);
+    }
+  }
+  // Null-terminate the pointer to the buffer.
+  outU8Array[outIdx] = 0;
+  return outIdx - startIdx;
+}
+Module["stringToUTF8Array"] = stringToUTF8Array;
+
+// Copies the given Javascript String object 'str' to the emscripten HEAP at address 'outPtr',
+// null-terminated and encoded in UTF8 form. The copy will require at most str.length*4+1 bytes of space in the HEAP.
+// Use the function lengthBytesUTF8() to compute the exact number of bytes (excluding null terminator) that this function will write.
+// Returns the number of bytes written, EXCLUDING the null terminator.
+
+function stringToUTF8(str, outPtr, maxBytesToWrite) {
+  return stringToUTF8Array(str, HEAPU8,outPtr, maxBytesToWrite);
+}
+Module["stringToUTF8"] = stringToUTF8;
+
+// Returns the number of bytes the given Javascript string takes if encoded as a UTF8 byte array, EXCLUDING the null terminator byte.
+
+function lengthBytesUTF8(str) {
+  var len = 0;
+  for (var i = 0; i < str.length; ++i) {
+    // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code unit, not a Unicode code point of the character! So decode UTF16->UTF32->UTF8.
+    // See http://unicode.org/faq/utf_bom.html#utf16-3
+    var u = str.charCodeAt(i); // possibly a lead surrogate
+    if (u >= 0xD800 && u <= 0xDFFF) u = 0x10000 + ((u & 0x3FF) << 10) | (str.charCodeAt(++i) & 0x3FF);
+    if (u <= 0x7F) {
+      ++len;
+    } else if (u <= 0x7FF) {
+      len += 2;
+    } else if (u <= 0xFFFF) {
+      len += 3;
+    } else if (u <= 0x1FFFFF) {
+      len += 4;
+    } else if (u <= 0x3FFFFFF) {
+      len += 5;
+    } else {
+      len += 6;
+    }
+  }
+  return len;
+}
+Module["lengthBytesUTF8"] = lengthBytesUTF8;
+
+// Given a pointer 'ptr' to a null-terminated UTF16LE-encoded string in the emscripten HEAP, returns
+// a copy of that string as a Javascript String object.
 
 function UTF16ToString(ptr) {
   var i = 0;
@@ -743,20 +860,46 @@ function UTF16ToString(ptr) {
     str += String.fromCharCode(codeUnit);
   }
 }
-Module['UTF16ToString'] = UTF16ToString;
+Module["UTF16ToString"] = UTF16ToString;
 
+// Copies the given Javascript String object 'str' to the emscripten HEAP at address 'outPtr',
+// null-terminated and encoded in UTF16 form. The copy will require at most str.length*4+2 bytes of space in the HEAP.
+// Use the function lengthBytesUTF16() to compute the exact number of bytes (excluding null terminator) that this function will write.
+// Parameters:
+//   str: the Javascript string to copy.
+//   outPtr: Byte address in Emscripten HEAP where to write the string to.
+//   maxBytesToWrite: The maximum number of bytes this function can write to the array. This count should include the null 
+//                    terminator, i.e. if maxBytesToWrite=2, only the null terminator will be written and nothing else.
+//                    maxBytesToWrite<2 does not write any bytes to the output, not even the null terminator.
+// Returns the number of bytes written, EXCLUDING the null terminator.
 
-function stringToUTF16(str, outPtr) {
-  for(var i = 0; i < str.length; ++i) {
+function stringToUTF16(str, outPtr, maxBytesToWrite) {
+  // Backwards compatibility: if max bytes is not specified, assume unsafe unbounded write is allowed.
+  if (maxBytesToWrite === undefined) {
+    maxBytesToWrite = 0x7FFFFFFF;
+  }
+  if (maxBytesToWrite < 2) return 0;
+  maxBytesToWrite -= 2; // Null terminator.
+  var startPtr = outPtr;
+  var numCharsToWrite = (maxBytesToWrite < str.length*2) ? (maxBytesToWrite / 2) : str.length;
+  for (var i = 0; i < numCharsToWrite; ++i) {
     // charCodeAt returns a UTF-16 encoded code unit, so it can be directly written to the HEAP.
     var codeUnit = str.charCodeAt(i); // possibly a lead surrogate
-    HEAP16[(((outPtr)+(i*2))>>1)]=codeUnit;
+    HEAP16[((outPtr)>>1)]=codeUnit;
+    outPtr += 2;
   }
   // Null-terminate the pointer to the HEAP.
-  HEAP16[(((outPtr)+(str.length*2))>>1)]=0;
+  HEAP16[((outPtr)>>1)]=0;
+  return outPtr - startPtr;
 }
-Module['stringToUTF16'] = stringToUTF16;
+Module["stringToUTF16"] = stringToUTF16;
 
+// Returns the number of bytes the given Javascript string takes if encoded as a UTF16 byte array, EXCLUDING the null terminator byte.
+
+function lengthBytesUTF16(str) {
+  return str.length*2;
+}
+Module["lengthBytesUTF16"] = lengthBytesUTF16;
 
 function UTF32ToString(ptr) {
   var i = 0;
@@ -768,6 +911,7 @@ function UTF32ToString(ptr) {
       return str;
     ++i;
     // Gotcha: fromCharCode constructs a character from a UTF-16 encoded code (pair), not from a Unicode code point! So encode the code point to UTF-16 for constructing.
+    // See http://unicode.org/faq/utf_bom.html#utf16-3
     if (utf32 >= 0x10000) {
       var ch = utf32 - 0x10000;
       str += String.fromCharCode(0xD800 | (ch >> 10), 0xDC00 | (ch & 0x3FF));
@@ -776,25 +920,60 @@ function UTF32ToString(ptr) {
     }
   }
 }
-Module['UTF32ToString'] = UTF32ToString;
+Module["UTF32ToString"] = UTF32ToString;
 
+// Copies the given Javascript String object 'str' to the emscripten HEAP at address 'outPtr',
+// null-terminated and encoded in UTF32 form. The copy will require at most str.length*4+4 bytes of space in the HEAP.
+// Use the function lengthBytesUTF32() to compute the exact number of bytes (excluding null terminator) that this function will write.
+// Parameters:
+//   str: the Javascript string to copy.
+//   outPtr: Byte address in Emscripten HEAP where to write the string to.
+//   maxBytesToWrite: The maximum number of bytes this function can write to the array. This count should include the null 
+//                    terminator, i.e. if maxBytesToWrite=4, only the null terminator will be written and nothing else.
+//                    maxBytesToWrite<4 does not write any bytes to the output, not even the null terminator.
+// Returns the number of bytes written, EXCLUDING the null terminator.
 
-function stringToUTF32(str, outPtr) {
-  var iChar = 0;
-  for(var iCodeUnit = 0; iCodeUnit < str.length; ++iCodeUnit) {
+function stringToUTF32(str, outPtr, maxBytesToWrite) {
+  // Backwards compatibility: if max bytes is not specified, assume unsafe unbounded write is allowed.
+  if (maxBytesToWrite === undefined) {
+    maxBytesToWrite = 0x7FFFFFFF;
+  }
+  if (maxBytesToWrite < 4) return 0;
+  var startPtr = outPtr;
+  var endPtr = startPtr + maxBytesToWrite - 4;
+  for (var i = 0; i < str.length; ++i) {
     // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code unit, not a Unicode code point of the character! We must decode the string to UTF-32 to the heap.
-    var codeUnit = str.charCodeAt(iCodeUnit); // possibly a lead surrogate
+    // See http://unicode.org/faq/utf_bom.html#utf16-3
+    var codeUnit = str.charCodeAt(i); // possibly a lead surrogate
     if (codeUnit >= 0xD800 && codeUnit <= 0xDFFF) {
-      var trailSurrogate = str.charCodeAt(++iCodeUnit);
+      var trailSurrogate = str.charCodeAt(++i);
       codeUnit = 0x10000 + ((codeUnit & 0x3FF) << 10) | (trailSurrogate & 0x3FF);
     }
-    HEAP32[(((outPtr)+(iChar*4))>>2)]=codeUnit;
-    ++iChar;
+    HEAP32[((outPtr)>>2)]=codeUnit;
+    outPtr += 4;
+    if (outPtr + 4 > endPtr) break;
   }
   // Null-terminate the pointer to the HEAP.
-  HEAP32[(((outPtr)+(iChar*4))>>2)]=0;
+  HEAP32[((outPtr)>>2)]=0;
+  return outPtr - startPtr;
 }
-Module['stringToUTF32'] = stringToUTF32;
+Module["stringToUTF32"] = stringToUTF32;
+
+// Returns the number of bytes the given Javascript string takes if encoded as a UTF16 byte array, EXCLUDING the null terminator byte.
+
+function lengthBytesUTF32(str) {
+  var len = 0;
+  for (var i = 0; i < str.length; ++i) {
+    // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code unit, not a Unicode code point of the character! We must decode the string to UTF-32 to the heap.
+    // See http://unicode.org/faq/utf_bom.html#utf16-3
+    var codeUnit = str.charCodeAt(i);
+    if (codeUnit >= 0xD800 && codeUnit <= 0xDFFF) ++i; // possibly a lead surrogate, so skip over the tail surrogate.
+    len += 4;
+  }
+
+  return len;
+}
+Module["lengthBytesUTF32"] = lengthBytesUTF32;
 
 function demangle(func) {
   var hasLibcxxabi = !!Module['___cxa_demangle'];
@@ -995,13 +1174,17 @@ function jsStackTrace() {
 function stackTrace() {
   return demangleAll(jsStackTrace());
 }
-Module['stackTrace'] = stackTrace;
+Module["stackTrace"] = stackTrace;
 
 // Memory management
 
 var PAGE_SIZE = 4096;
+
 function alignMemoryPage(x) {
-  return (x+4095)&-4096;
+  if (x % 4096 > 0) {
+    x += (4096 - (x % 4096));
+  }
+  return x;
 }
 
 var HEAP;
@@ -1011,14 +1194,18 @@ var STATIC_BASE = 0, STATICTOP = 0, staticSealed = false; // static area
 var STACK_BASE = 0, STACKTOP = 0, STACK_MAX = 0; // stack area
 var DYNAMIC_BASE = 0, DYNAMICTOP = 0; // dynamic area handled by sbrk
 
+
+function abortOnCannotGrowMemory() {
+  abort('Cannot enlarge memory arrays. Either (1) compile with  -s TOTAL_MEMORY=X  with X higher than the current value ' + TOTAL_MEMORY + ', (2) compile with  -s ALLOW_MEMORY_GROWTH=1  which adjusts the size at runtime but prevents some optimizations, (3) set Module.TOTAL_MEMORY to a higher value before the program runs, or if you want malloc to return NULL (0) instead of this abort, compile with  -s ABORTING_MALLOC=0 ');
+}
+
 function enlargeMemory() {
-  abort('Cannot enlarge memory arrays. Either (1) compile with -s TOTAL_MEMORY=X with X higher than the current value ' + TOTAL_MEMORY + ', (2) compile with ALLOW_MEMORY_GROWTH which adjusts the size at runtime but prevents some optimizations, or (3) set Module.TOTAL_MEMORY before the program runs.');
+  abortOnCannotGrowMemory();
 }
 
 
 var TOTAL_STACK = Module['TOTAL_STACK'] || 5242880;
 var TOTAL_MEMORY = Module['TOTAL_MEMORY'] || 16777216;
-var FAST_MEMORY = Module['FAST_MEMORY'] || 2097152;
 
 var totalMemory = 64*1024;
 while (totalMemory < TOTAL_MEMORY || totalMemory < 2*TOTAL_STACK) {
@@ -1029,7 +1216,6 @@ while (totalMemory < TOTAL_MEMORY || totalMemory < 2*TOTAL_STACK) {
   }
 }
 if (totalMemory !== TOTAL_MEMORY) {
-  Module.printErr('increasing TOTAL_MEMORY to ' + totalMemory + ' to be compliant with the asm.js spec');
   TOTAL_MEMORY = totalMemory;
 }
 
@@ -1038,7 +1224,11 @@ if (totalMemory !== TOTAL_MEMORY) {
 assert(typeof Int32Array !== 'undefined' && typeof Float64Array !== 'undefined' && !!(new Int32Array(1)['subarray']) && !!(new Int32Array(1)['set']),
        'JS engine does not provide full typed array support');
 
-var buffer = new ArrayBuffer(TOTAL_MEMORY);
+var buffer;
+
+
+
+buffer = new ArrayBuffer(TOTAL_MEMORY);
 HEAP8 = new Int8Array(buffer);
 HEAP16 = new Int16Array(buffer);
 HEAP32 = new Int32Array(buffer);
@@ -1047,6 +1237,7 @@ HEAPU16 = new Uint16Array(buffer);
 HEAPU32 = new Uint32Array(buffer);
 HEAPF32 = new Float32Array(buffer);
 HEAPF64 = new Float64Array(buffer);
+
 
 // Endianness check (note: assumes compiler arch was little-endian)
 HEAP32[0] = 255;
@@ -1092,6 +1283,7 @@ var __ATPOSTRUN__ = []; // functions called after the runtime has exited
 var runtimeInitialized = false;
 var runtimeExited = false;
 
+
 function preRun() {
   // compatibility - merge in anything from Module['preRun'] at this time
   if (Module['preRun']) {
@@ -1132,42 +1324,39 @@ function postRun() {
 function addOnPreRun(cb) {
   __ATPRERUN__.unshift(cb);
 }
-Module['addOnPreRun'] = Module.addOnPreRun = addOnPreRun;
+Module["addOnPreRun"] = addOnPreRun;
 
 function addOnInit(cb) {
   __ATINIT__.unshift(cb);
 }
-Module['addOnInit'] = Module.addOnInit = addOnInit;
+Module["addOnInit"] = addOnInit;
 
 function addOnPreMain(cb) {
   __ATMAIN__.unshift(cb);
 }
-Module['addOnPreMain'] = Module.addOnPreMain = addOnPreMain;
+Module["addOnPreMain"] = addOnPreMain;
 
 function addOnExit(cb) {
   __ATEXIT__.unshift(cb);
 }
-Module['addOnExit'] = Module.addOnExit = addOnExit;
+Module["addOnExit"] = addOnExit;
 
 function addOnPostRun(cb) {
   __ATPOSTRUN__.unshift(cb);
 }
-Module['addOnPostRun'] = Module.addOnPostRun = addOnPostRun;
+Module["addOnPostRun"] = addOnPostRun;
 
 // Tools
 
 
 function intArrayFromString(stringy, dontAddNull, length /* optional */) {
-  var ret = (new Runtime.UTF8Processor()).processJSString(stringy);
-  if (length) {
-    ret.length = length;
-  }
-  if (!dontAddNull) {
-    ret.push(0);
-  }
-  return ret;
+  var len = length > 0 ? length : lengthBytesUTF8(stringy)+1;
+  var u8array = new Array(len);
+  var numBytesWritten = stringToUTF8Array(stringy, u8array, 0, u8array.length);
+  if (dontAddNull) u8array.length = numBytesWritten;
+  return u8array;
 }
-Module['intArrayFromString'] = intArrayFromString;
+Module["intArrayFromString"] = intArrayFromString;
 
 function intArrayToString(array) {
   var ret = [];
@@ -1180,7 +1369,7 @@ function intArrayToString(array) {
   }
   return ret.join('');
 }
-Module['intArrayToString'] = intArrayToString;
+Module["intArrayToString"] = intArrayToString;
 
 function writeStringToMemory(string, buffer, dontAddNull) {
   var array = intArrayFromString(string, dontAddNull);
@@ -1191,22 +1380,23 @@ function writeStringToMemory(string, buffer, dontAddNull) {
     i = i + 1;
   }
 }
-Module['writeStringToMemory'] = writeStringToMemory;
+Module["writeStringToMemory"] = writeStringToMemory;
 
 function writeArrayToMemory(array, buffer) {
   for (var i = 0; i < array.length; i++) {
-    HEAP8[(((buffer)+(i))>>0)]=array[i];
+    HEAP8[((buffer++)>>0)]=array[i];
   }
 }
-Module['writeArrayToMemory'] = writeArrayToMemory;
+Module["writeArrayToMemory"] = writeArrayToMemory;
 
 function writeAsciiToMemory(str, buffer, dontAddNull) {
-  for (var i = 0; i < str.length; i++) {
-    HEAP8[(((buffer)+(i))>>0)]=str.charCodeAt(i);
+  for (var i = 0; i < str.length; ++i) {
+    HEAP8[((buffer++)>>0)]=str.charCodeAt(i);
   }
-  if (!dontAddNull) HEAP8[(((buffer)+(str.length))>>0)]=0;
+  // Null-terminate the pointer to the HEAP.
+  if (!dontAddNull) HEAP8[((buffer)>>0)]=0;
 }
-Module['writeAsciiToMemory'] = writeAsciiToMemory;
+Module["writeAsciiToMemory"] = writeAsciiToMemory;
 
 function unSign(value, bits, ignore) {
   if (value >= 0) {
@@ -1229,6 +1419,7 @@ function reSign(value, bits, ignore) {
   return value;
 }
 
+
 // check for imul support, and also for correctness ( https://bugs.webkit.org/show_bug.cgi?id=126345 )
 if (!Math['imul'] || Math['imul'](0xffffffff, 5) !== -5) Math['imul'] = function imul(a, b) {
   var ah  = a >>> 16;
@@ -1239,6 +1430,15 @@ if (!Math['imul'] || Math['imul'](0xffffffff, 5) !== -5) Math['imul'] = function
 };
 Math.imul = Math['imul'];
 
+
+if (!Math['clz32']) Math['clz32'] = function(x) {
+  x = x >>> 0;
+  for (var i = 0; i < 32; i++) {
+    if (x & (1 << (31 - i))) return i;
+  }
+  return 32;
+};
+Math.clz32 = Math['clz32']
 
 var Math_abs = Math.abs;
 var Math_cos = Math.cos;
@@ -1257,6 +1457,7 @@ var Math_pow = Math.pow;
 var Math_imul = Math.imul;
 var Math_fround = Math.fround;
 var Math_min = Math.min;
+var Math_clz32 = Math.clz32;
 
 // A counter of dependencies for calling run(). If we need to
 // do asynchronous work before running, increment this and
@@ -1269,13 +1470,18 @@ var runDependencies = 0;
 var runDependencyWatcher = null;
 var dependenciesFulfilled = null; // overridden to take different actions when all run dependencies are fulfilled
 
+function getUniqueRunDependency(id) {
+  return id;
+}
+
 function addRunDependency(id) {
   runDependencies++;
   if (Module['monitorRunDependencies']) {
     Module['monitorRunDependencies'](runDependencies);
   }
 }
-Module['addRunDependency'] = addRunDependency;
+Module["addRunDependency"] = addRunDependency;
+
 function removeRunDependency(id) {
   runDependencies--;
   if (Module['monitorRunDependencies']) {
@@ -1293,34 +1499,40 @@ function removeRunDependency(id) {
     }
   }
 }
-Module['removeRunDependency'] = removeRunDependency;
+Module["removeRunDependency"] = removeRunDependency;
 
 Module["preloadedImages"] = {}; // maps url to image data
 Module["preloadedAudios"] = {}; // maps url to audio data
 
 
+
 var memoryInitializer = null;
+
+
 
 // === Body ===
 
+var ASM_CONSTS = [];
 
 
 
 
 STATIC_BASE = 8;
 
-STATICTOP = STATIC_BASE + 33040;
-  /* global initializers */ __ATINIT__.push();
+STATICTOP = STATIC_BASE + 34240;
+  /* global initializers */  __ATINIT__.push();
   
 
-/* memory initializer */ allocate([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,133,59,140,1,189,241,36,255,248,37,195,1,96,220,55,0,183,76,62,255,195,66,61,0,50,76,164,1,225,164,76,255,76,61,163,255,117,62,31,0,81,145,64,255,118,65,14,0,162,115,214,255,6,138,46,0,124,230,244,255,10,138,143,0,52,26,194,0,184,244,76,0,129,143,41,1,190,244,19,255,123,170,122,255,98,129,68,0,121,213,147,0,86,101,30,255,161,103,155,0,140,89,67,255,239,229,190,1,67,11,181,0,198,240,137,254,238,69,188,255,67,151,238,0,19,42,108,255,229,85,113,1,50,68,135,255,17,106,9,0,50,103,1,255,80,1,168,1,35,152,30,255,16,168,185,1,56,89,232,255,101,210,252,0,41,250,71,0,204,170,79,255,14,46,239,255,80,77,239,0,189,214,75,255,17,141,249,0,38,80,76,255,190,85,117,0,86,228,170,0,156,216,208,1,195,207,164,255,150,66,76,255,175,225,16,255,141,80,98,1,76,219,242,0,198,162,114,0,46,218,152,0,155,43,241,254,155,160,104,255,51,187,165,0,2,17,175,0,66,84,160,1,247,58,30,0,35,65,53,254,69,236,191,0,45,134,245,1,163,123,221,0,32,110,20,255,52,23,165,0,186,214,71,0,233,176,96,0,242,239,54,1,57,89,138,0,83,0,84,255,136,160,100,0,92,142,120,254,104,124,190,0,181,177,62,255,250,41,85,0,152,130,42,1,96,252,246,0,151,151,63,254,239,133,62,0,32,56,156,0,45,167,189,255,142,133,179,1,131,86,211,0,187,179,150,254,250,170,14,255,210,163,78,0,37,52,151,0,99,77,26,0,238,156,213,255,213,192,209,1,73,46,84,0,20,65,41,1,54,206,79,0,201,131,146,254,170,111,24,255,177,33,50,254,171,38,203,255,78,247,116,0,209,221,153,0,133,128,178,1,58,44,25,0,201,39,59,1,189,19,252,0,49,229,210,1,117,187,117,0,181,179,184,1,0,114,219,0,48,94,147,0,245,41,56,0,125,13,204,254,244,173,119,0,44,221,32,254,84,234,20,0,249,160,198,1,236,126,234,255,47,99,168,254,170,226,153,255,102,179,216,0,226,141,122,255,122,66,153,254,182,245,134,0,227,228,25,1,214,57,235,255,216,173,56,255,181,231,210,0,119,128,157,255,129,95,136,255,110,126,51,0,2,169,183,255,7,130,98,254,69,176,94,255,116,4,227,1,217,242,145,255,202,173,31,1,105,1,39,255,46,175,69,0,228,47,58,255,215,224,69,254,207,56,69,255,16,254,139,255,23,207,212,255,202,20,126,255,95,213,96,255,9,176,33,0,200,5,207,255,241,42,128,254,35,33,192,255,248,229,196,1,129,17,120,0,251,103,151,255,7,52,112,255,140,56,66,255,40,226,245,255,217,70,37,254,172,214,9,255,72,67,134,1,146,192,214,255,44,38,112,0,68,184,75,255,206,90,251,0,149,235,141,0,181,170,58,0,116,244,239,0,92,157,2,0,102,173,98,0,233,137,96,1,127,49,203,0,5,155,148,0,23,148,9,255,211,122,12,0,34,134,26,255,219,204,136,0,134,8,41,255,224,83,43,254,85,25,247,0,109,127,0,254,169,136,48,0,238,119,219,255,231,173,213,0,206,18,254,254,8,186,7,255,126,9,7,1,111,42,72,0,111,52,236,254,96,63,141,0,147,191,127,254,205,78,192,255,14,106,237,1,187,219,76,0,175,243,187,254,105,89,173,0,85,25,89,1,162,243,148,0,2,118,209,254,33,158,9,0,139,163,46,255,93,70,40,0,108,42,142,254,111,252,142,255,155,223,144,0,51,229,167,255,73,252,155,255,94,116,12,255,152,160,218,255,156,238,37,255,179,234,207,255,197,0,179,255,154,164,141,0,225,196,104,0,10,35,25,254,209,212,242,255,97,253,222,254,184,101,229,0,222,18,127,1,164,136,135,255,30,207,140,254,146,97,243,0,129,192,26,254,201,84,33,255,111,10,78,255,147,81,178,255,4,4,24,0,161,238,215,255,6,141,33,0,53,215,14,255,41,181,208,255,231,139,157,0,179,203,221,255,255,185,113,0,189,226,172,255,113,66,214,255,202,62,45,255,102,64,8,255,78,174,16,254,133,117,68,255,182,120,89,255,133,114,211,0,189,110,21,255,15,10,106,0,41,192,1,0,152,232,121,255,188,60,160,255,153,113,206,255,0,183,226,254,180,13,72,255,176,160,14,254,211,201,134,255,158,24,143,0,127,105,53,0,96,12,189,0,167,215,251,255,159,76,128,254,106,101,225,255,30,252,4,0,146,12,174,0,89,241,178,254,10,229,166,255,123,221,42,254,30,20,212,0,82,128,3,0,48,209,243,0,119,121,64,255,50,227,156,255,0,110,197,1,103,27,144,0,133,59,140,1,189,241,36,255,248,37,195,1,96,220,55,0,183,76,62,255,195,66,61,0,50,76,164,1,225,164,76,255,76,61,163,255,117,62,31,0,81,145,64,255,118,65,14,0,162,115,214,255,6,138,46,0,124,230,244,255,10,138,143,0,52,26,194,0,184,244,76,0,129,143,41,1,190,244,19,255,123,170,122,255,98,129,68,0,121,213,147,0,86,101,30,255,161,103,155,0,140,89,67,255,239,229,190,1,67,11,181,0,198,240,137,254,238,69,188,255,234,113,60,255,37,255,57,255,69,178,182,254,128,208,179,0,118,26,125,254,3,7,214,255,241,50,77,255,85,203,197,255,211,135,250,255,25,48,100,255,187,213,180,254,17,88,105,0,83,209,158,1,5,115,98,0,4,174,60,254,171,55,110,255,217,181,17,255,20,188,170,0,146,156,102,254,87,214,174,255,114,122,155,1,233,44,170,0,127,8,239,1,214,236,234,0,175,5,219,0,49,106,61,255,6,66,208,255,2,106,110,255,81,234,19,255,215,107,192,255,67,151,238,0,19,42,108,255,229,85,113,1,50,68,135,255,17,106,9,0,50,103,1,255,80,1,168,1,35,152,30,255,16,168,185,1,56,89,232,255,101,210,252,0,41,250,71,0,204,170,79,255,14,46,239,255,80,77,239,0,189,214,75,255,17,141,249,0,38,80,76,255,190,85,117,0,86,228,170,0,156,216,208,1,195,207,164,255,150,66,76,255,175,225,16,255,141,80,98,1,76,219,242,0,198,162,114,0,46,218,152,0,155,43,241,254,155,160,104,255,178,9,252,254,100,110,212,0,14,5,167,0,233,239,163,255,28,151,157,1,101,146,10,255,254,158,70,254,71,249,228,0,88,30,50,0,68,58,160,255,191,24,104,1,129,66,129,255,192,50,85,255,8,179,138,255,38,250,201,0,115,80,160,0,131,230,113,0,125,88,147,0,90,68,199,0,253,76,158,0,28,255,118,0,113,250,254,0,66,75,46,0,230,218,43,0,229,120,186,1,148,68,43,0,136,124,238,1,187,107,197,255,84,53,246,255,51,116,254,255,51,187,165,0,2,17,175,0,66,84,160,1,247,58,30,0,35,65,53,254,69,236,191,0,45,134,245,1,163,123,221,0,32,110,20,255,52,23,165,0,186,214,71,0,233,176,96,0,242,239,54,1,57,89,138,0,83,0,84,255,136,160,100,0,92,142,120,254,104,124,190,0,181,177,62,255,250,41,85,0,152,130,42,1,96,252,246,0,151,151,63,254,239,133,62,0,32,56,156,0,45,167,189,255,142,133,179,1,131,86,211,0,187,179,150,254,250,170,14,255,68,113,21,255,222,186,59,255,66,7,241,1,69,6,72,0,86,156,108,254,55,167,89,0,109,52,219,254,13,176,23,255,196,44,106,255,239,149,71,255,164,140,125,255,159,173,1,0,51,41,231,0,145,62,33,0,138,111,93,1,185,83,69,0,144,115,46,0,97,151,16,255,24,228,26,0,49,217,226,0,113,75,234,254,193,153,12,255,182,48,96,255,14,13,26,0,128,195,249,254,69,193,59,0,132,37,81,254,125,106,60,0,214,240,169,1,164,227,66,0,210,163,78,0,37,52,151,0,99,77,26,0,238,156,213,255,213,192,209,1,73,46,84,0,20,65,41,1,54,206,79,0,201,131,146,254,170,111,24,255,177,33,50,254,171,38,203,255,78,247,116,0,209,221,153,0,133,128,178,1,58,44,25,0,201,39,59,1,189,19,252,0,49,229,210,1,117,187,117,0,181,179,184,1,0,114,219,0,48,94,147,0,245,41,56,0,125,13,204,254,244,173,119,0,44,221,32,254,84,234,20,0,249,160,198,1,236,126,234,255,143,62,221,0,129,89,214,255,55,139,5,254,68,20,191,255,14,204,178,1,35,195,217,0,47,51,206,1,38,246,165,0,206,27,6,254,158,87,36,0,217,52,146,255,125,123,215,255,85,60,31,255,171,13,7,0,218,245,88,254,252,35,60,0,55,214,160,255,133,101,56,0,224,32,19,254,147,64,234,0,26,145,162,1,114,118,125,0,248,252,250,0,101,94,196,255,198,141,226,254,51,42,182,0,135,12,9,254,109,172,210,255,197,236,194,1,241,65,154,0,48,156,47,255,153,67,55,255,218,165,34,254,74,180,179,0,218,66,71,1,88,122,99,0,212,181,219,255,92,42,231,255,239,0,154,0,245,77,183,255,94,81,170,1,18,213,216,0,171,93,71,0,52,94,248,0,18,151,161,254,197,209,66,255,174,244,15,254,162,48,183,0,49,61,240,254,182,93,195,0,199,228,6,1,200,5,17,255,137,45,237,255,108,148,4,0,90,79,237,255,39,63,77,255,53,82,207,1,142,22,118,255,101,232,18,1,92,26,67,0,5,200,88,255,33,168,138,255,149,225,72,0,2,209,27,255,44,245,168,1,220,237,17,255,30,211,105,254,141,238,221,0,128,80,245,254,111,254,14,0,222,95,190,1,223,9,241,0,146,76,212,255,108,205,104,255,63,117,153,0,144,69,48,0,35,228,111,0,192,33,193,255,112,214,190,254,115,152,151,0,23,102,88,0,51,74,248,0,226,199,143,254,204,162,101,255,208,97,189,1,245,104,18,0,230,246,30,255,23,148,69,0,110,88,52,254,226,181,89,255,208,47,90,254,114,161,80,255,33,116,248,0,179,152,87,255,69,144,177,1,88,238,26,255,58,32,113,1,1,77,69,0,59,121,52,255,152,238,83,0,52,8,193,0,231,39,233,255,199,34,138,0,222,68,173,0,91,57,242,254,220,210,127,255,192,7,246,254,151,35,187,0,195,236,165,0,111,93,206,0,212,247,133,1,154,133,209,255,155,231,10,0,64,78,38,0,122,249,100,1,30,19,97,255,62,91,249,1,248,133,77,0,197,63,168,254,116,10,82,0,184,236,113,254,212,203,194,255,61,100,252,254,36,5,202,255,119,91,153,255,129,79,29,0,103,103,171,254,237,215,111,255,216,53,69,0,239,240,23,0,194,149,221,255,38,225,222,0,232,255,180,254,118,82,133,255,57,209,177,1,139,232,133,0,158,176,46,254,194,115,46,0,88,247,229,1,28,103,191,0,221,222,175,254,149,235,44,0,151,228,25,254,218,105,103,0,142,85,210,0,149,129,190,255,213,65,94,254,117,134,224,255,82,198,117,0,157,221,220,0,163,101,36,0,197,114,37,0,104,172,166,254,11,182,0,0,81,72,188,255,97,188,16,255,69,6,10,0,199,147,145,255,8,9,115,1,65,214,175,255,217,173,209,0,80,127,166,0,247,229,4,254,167,183,124,255,90,28,204,254,175,59,240,255,11,41,248,1,108,40,51,255,144,177,195,254,150,250,126,0,138,91,65,1,120,60,222,255,245,193,239,0,29,214,189,255,128,2,25,0,80,154,162,0,77,220,107,1,234,205,74,255,54,166,103,255,116,72,9,0,228,94,47,255,30,200,25,255,35,214,89,255,61,176,140,255,83,226,163,255,75,130,172,0,128,38,17,0,95,137,152,255,215,124,159,1,79,93,0,0,148,82,157,254,195,130,251,255,40,202,76,255,251,126,224,0,157,99,62,254,207,7,225,255,96,68,195,0,140,186,157,255,131,19,231,255,42,128,254,0,52,219,61,254,102,203,72,0,141,7,11,255,186,164,213,0,31,122,119,0,133,242,145,0,208,252,232,255,91,213,182,255,143,4,250,254,249,215,74,0,165,30,111,1,171,9,223,0,229,123,34,1,92,130,26,255,77,155,45,1,195,139,28,255,59,224,78,0,136,17,247,0,108,121,32,0,79,250,189,255,96,227,252,254,38,241,62,0,62,174,125,255,155,111,93,255,10,230,206,1,97,197,40,255,0,49,57,254,65,250,13,0,18,251,150,255,220,109,210,255,5,174,166,254,44,129,189,0,235,35,147,255,37,247,141,255,72,141,4,255,103,107,255,0,247,90,4,0,53,44,42,0,2,30,240,0,4,59,63,0,88,78,36,0,113,167,180,0,190,71,193,255,199,158,164,255,58,8,172,0,77,33,12,0,65,63,3,0,153,77,33,255,172,254,102,1,228,221,4,255,87,30,254,1,146,41,86,255,138,204,239,254,108,141,17,255,187,242,135,0,210,208,127,0,68,45,14,254,73,96,62,0,81,60,24,255,170,6,36,255,3,249,26,0,35,213,109,0,22,129,54,255,21,35,225,255,234,61,56,255,58,217,6,0,143,124,88,0,236,126,66,0,209,38,183,255,34,238,6,255,174,145,102,0,95,22,211,0,196,15,153,254,46,84,232,255,117,34,146,1,231,250,74,255,27,134,100,1,92,187,195,255,170,198,112,0,120,28,42,0,209,70,67,0,29,81,31,0,29,168,100,1,169,173,160,0,107,35,117,0,62,96,59,255,81,12,69,1,135,239,190,255,220,252,18,0,163,220,58,255,137,137,188,255,83,102,109,0,96,6,76,0,234,222,210,255,185,174,205,1,60,158,213,255,13,241,214,0,172,129,140,0,93,104,242,0,192,156,251,0,43,117,30,0,225,81,158,0,127,232,218,0,226,28,203,0,233,27,151,255,117,43,5,255,242,14,47,255,33,20,6,0,137,251,44,254,27,31,245,255,183,214,125,254,40,121,149,0,186,158,213,255,89,8,227,0,69,88,0,254,203,135,225,0,201,174,203,0,147,71,184,0,18,121,41,254,94,5,78,0,224,214,240,254,36,5,180,0,251,135,231,1,163,138,212,0,210,249,116,254,88,129,187,0,19,8,49,254,62,14,144,255,159,76,211,0,214,51,82,0,109,117,228,254,103,223,203,255,75,252,15,1,154,71,220,255,23,13,91,1,141,168,96,255,181,182,133,0,250,51,55,0,234,234,212,254,175,63,158,0,39,240,52,1,158,189,36,255,213,40,85,1,32,180,247,255,19,102,26,1,84,24,97,255,69,21,222,0,148,139,122,255,220,213,235,1,232,203,255,0,121,57,147,0,227,7,154,0,53,22,147,1,72,1,225,0,82,134,48,254,83,60,157,255,145,72,169,0,34,103,239,0,198,233,47,0,116,19,4,255,184,106,9,255,183,129,83,0,36,176,230,1,34,103,72,0,219,162,134,0,245,42,158,0,32,149,96,254,165,44,144,0,202,239,72,254,215,150,5,0,42,66,36,1,132,215,175,0,86,174,86,255,26,197,156,255,49,232,135,254,103,182,82,0,253,128,176,1,153,178,122,0,245,250,10,0,236,24,178,0,137,106,132,0,40,29,41,0,50,30,152,255,124,105,38,0,230,191,75,0,143,43,170,0,44,131,20,255,44,13,23,255,237,255,155,1,159,109,100,255,112,181,24,255,104,220,108,0,55,211,131,0,99,12,213,255,152,151,145,255,238,5,159,0,97,155,8,0,33,108,81,0,1,3,103,0,62,109,34,255,250,155,180,0,32,71,195,255,38,70,145,1,159,95,245,0,69,229,101,1,136,28,240,0,79,224,25,0,78,110,121,255,248,168,124,0,187,128,247,0,2,147,235,254,79,11,132,0,70,58,12,1,181,8,163,255,79,137,133,255,37,170,11,255,141,243,85,255,176,231,215,255,204,150,164,255,239,215,39,255,46,87,156,254,8,163,88,255,172,34,232,0,66,44,102,255,27,54,41,254,236,99,87,255,41,123,169,1,52,114,43,0,117,134,40,0,155,134,26,0,231,207,91,254,35,132,38,255,19,102,125,254,36,227,133,255,118,3,113,255,29,13,124,0,152,96,74,1,88,146,206,255,167,191,220,254,162,18,88,255,182,100,23,0,31,117,52,0,81,46,106,1,12,2,7,0,69,80,201,1,209,246,172,0,12,48,141,1,224,211,88,0,116,226,159,0,122,98,130,0,65,236,234,1,225,226,9,255,207,226,123,1,89,214,59,0,112,135,88,1,90,244,203,255,49,11,38,1,129,108,186,0,89,112,15,1,101,46,204,255,127,204,45,254,79,255,221,255,51,73,18,255,127,42,101,255,241,21,202,0,160,227,7,0,105,50,236,0,79,52,197,255,104,202,208,1,180,15,16,0,101,197,78,255,98,77,203,0,41,185,241,1,35,193,124,0,35,155,23,255,207,53,192,0,11,125,163,1,249,158,185,255,4,131,48,0,21,93,111,255,61,121,231,1,69,200,36,255,185,48,185,255,111,238,21,255,39,50,25,255,99,215,163,255,87,212,30,255,164,147,5,255,128,6,35,1,108,223,110,255,194,76,178,0,74,101,180,0,243,47,48,0,174,25,43,255,82,173,253,1,54,114,192,255,40,55,91,0,215,108,176,255,11,56,7,0,224,233,76,0,209,98,202,254,242,25,125,0,44,193,93,254,203,8,177,0,135,176,19,0,112,71,213,255,206,59,176,1,4,67,26,0,14,143,213,254,42,55,208,255,60,67,120,0,193,21,163,0,99,164,115,0,10,20,118,0,156,212,222,254,160,7,217,255,114,245,76,1,117,59,123,0,176,194,86,254,213,15,176,0,78,206,207,254,213,129,59,0,233,251,22,1,96,55,152,255,236,255,15,255,197,89,84,255,93,149,133,0,174,160,113,0,234,99,169,255,152,116,88,0,144,164,83,255,95,29,198,255,34,47,15,255,99,120,134,255,5,236,193,0,249,247,126,255,147,187,30,0,50,230,117,255,108,217,219,255,163,81,166,255,72,25,169,254,155,121,79,255,28,155,89,254,7,126,17,0,147,65,33,1,47,234,253,0,26,51,18,0,105,83,199,255,163,196,230,0,113,248,164,0,226,254,218,0,189,209,203,255,164,247,222,254,255,35,165,0,4,188,243,1,127,179,71,0,37,237,254,255,100,186,240,0,5,57,71,254,103,72,73,255,244,18,81,254,229,210,132,255,238,6,180,255,11,229,174,255,227,221,192,1,17,49,28,0,163,215,196,254,9,118,4,255,51,240,71,0,113,129,109,255,76,240,231,0,188,177,127,0,125,71,44,1,26,175,243,0,94,169,25,254,27,230,29,0,15,139,119,1,168,170,186,255,172,197,76,255,252,75,188,0,137,124,196,0,72,22,96,255,45,151,249,1,220,145,100,0,64,192,159,255,120,239,226,0,129,178,146,0,0,192,125,0,235,138,234,0,183,157,146,0,83,199,192,255,184,172,72,255,73,225,128,0,77,6,250,255,186,65,67,0,104,246,207,0,188,32,138,255,218,24,242,0,67,138,81,254,237,129,121,255,20,207,150,1,41,199,16,255,6,20,128,0,159,118,5,0,181,16,143,255,220,38,15,0,23,64,147,254,73,26,13,0,87,228,57,1,204,124,128,0,43,24,223,0,219,99,199,0,22,75,20,255,19,27,126,0,157,62,215,0,110,29,230,0,179,167,255,1,54,252,190,0,221,204,182,254,179,158,65,255,81,157,3,0,194,218,159,0,170,223,0,0,224,11,32,255,38,197,98,0,168,164,37,0,23,88,7,1,164,186,110,0,96,36,134,0,234,242,229,0,250,121,19,0,242,254,112,255,3,47,94,1,9,239,6,255,81,134,153,254,214,253,168,255,67,124,224,0,245,95,74,0,28,30,44,254,1,109,220,255,178,89,89,0,252,36,76,0,24,198,46,255,76,77,111,0,134,234,136,255,39,94,29,0,185,72,234,255,70,68,135,255,231,102,7,254,77,231,140,0,167,47,58,1,148,97,118,255,16,27,225,1,166,206,143,255,110,178,214,255,180,131,162,0,143,141,225,1,13,218,78,255,114,153,33,1,98,104,204,0,175,114,117,1,167,206,75,0,202,196,83,1,58,64,67,0,138,47,111,1,196,247,128,255,137,224,224,254,158,112,207,0,154,100,255,1,134,37,107,0,198,128,79,255,127,209,155,255,163,254,185,254,60,14,243,0,31,219,112,254,29,217,65,0,200,13,116,254,123,60,196,255,224,59,184,254,242,89,196,0,123,16,75,254,149,16,206,0,69,254,48,1,231,116,223,255,209,160,65,1,200,80,98,0,37,194,184,254,148,63,34,0,139,240,65,255,217,144,132,255,56,38,45,254,199,120,210,0,108,177,166,255,160,222,4,0,220,126,119,254,165,107,160,255,82,220,248,1,241,175,136,0,144,141,23,255,169,138,84,0,160,137,78,255,226,118,80,255,52,27,132,255,63,96,139,255,152,250,39,0,188,155,15,0,232,51,150,254,40,15,232,255,240,229,9,255,137,175,27,255,75,73,97,1,218,212,11,0,135,5,162,1,107,185,213,0,2,249,107,255,40,242,70,0,219,200,25,0,25,157,13,0,67,82,80,255,196,249,23,255,145,20,149,0,50,72,146,0,94,76,148,1,24,251,65,0,31,192,23,0,184,212,201,255,123,233,162,1,247,173,72,0,162,87,219,254,126,134,89,0,159,11,12,254,166,105,29,0,73,27,228,1,113,120,183,255,66,163,109,1,212,143,11,255,159,231,168,1,255,128,90,0,57,14,58,254,89,52,10,255,253,8,163,1,0,145,210,255,10,129,85,1,46,181,27,0,103,136,160,254,126,188,209,255,34,35,111,0,215,219,24,255,212,11,214,254,101,5,118,0,232,197,133,255,223,167,109,255,237,80,86,255,70,139,94,0,158,193,191,1,155,15,51,255,15,190,115,0,78,135,207,255,249,10,27,1,181,125,233,0,95,172,13,254,170,213,161,255,39,236,138,255,95,93,87,255,190,128,95,0,125,15,206,0,166,150,159,0,227,15,158,255,206,158,120,255,42,141,128,0,101,178,120,1,156,109,131,0,218,14,44,254,247,168,206,255,212,112,28,0,112,17,228,255,90,16,37,1,197,222,108,0,254,207,83,255,9,90,243,255,243,244,172,0,26,88,115,255,205,116,122,0,191,230,193,0,180,100,11,1,217,37,96,255,154,78,156,0,235,234,31,255,206,178,178,255,149,192,251,0,182,250,135,0,246,22,105,0,124,193,109,255,2,210,149,255,169,17,170,0,0,96,110,255,117,9,8,1,50,123,40,255,193,189,99,0,34,227,160,0,48,80,70,254,211,51,236,0,45,122,245,254,44,174,8,0,173,37,233,255,158,65,171,0,122,69,215,255,90,80,2,255,131,106,96,254,227,114,135,0,205,49,119,254,176,62,64,255,82,51,17,255,241,20,243,255,130,13,8,254,128,217,243,255,162,27,1,254,90,118,241,0,246,198,246,255,55,16,118,255,200,159,157,0,163,17,1,0,140,107,121,0,85,161,118,255,38,0,149,0,156,47,238,0,9,166,166,1,75,98,181,255,50,74,25,0,66,15,47,0,139,225,159,0,76,3,142,255,14,238,184,0,11,207,53,255,183,192,186,1,171,32,174,255,191,76,221,1,247,170,219,0,25,172,50,254,217,9,233,0,203,126,68,255,183,92,48,0,127,167,183,1,65,49,254,0,16,63,127,1,254,21,170,255,59,224,127,254,22,48,63,255,27,78,130,254,40,195,29,0,250,132,112,254,35,203,144,0,104,169,168,0,207,253,30,255,104,40,38,254,94,228,88,0,206,16,128,255,212,55,122,255,223,22,234,0,223,197,127,0,253,181,181,1,145,102,118,0,236,153,36,255,212,217,72,255,20,38,24,254,138,62,62,0,152,140,4,0,230,220,99,255,1,21,212,255,148,201,231,0,244,123,9,254,0,171,210,0,51,58,37,255,1,255,14,255,244,183,145,254,0,242,166,0,22,74,132,0,121,216,41,0,95,195,114,254,133,24,151,255,156,226,231,255,247,5,77,255,246,148,115,254,225,92,81,255,222,80,246,254,170,123,89,255,74,199,141,0,29,20,8,255,138,136,70,255,93,75,92,0,221,147,49,254,52,126,226,0,229,124,23,0,46,9,181,0,205,64,52,1,131,254,28,0,151,158,212,0,131,64,78,0,206,25,171,0,0,230,139,0,191,253,110,254,103,247,167,0,64,40,40,1,42,165,241,255,59,75,228,254,124,243,189,255,196,92,178,255,130,140,86,255,141,89,56,1,147,198,5,255,203,248,158,254,144,162,141,0,11,172,226,0,130,42,21,255,1,167,143,255,144,36,36,255,48,88,164,254,168,170,220,0,98,71,214,0,91,208,79,0,159,76,201,1,166,42,214,255,69,255,0,255,6,128,125,255,190,1,140,0,146,83,218,255,215,238,72,1,122,127,53,0,189,116,165,255,84,8,66,255,214,3,208,255,213,110,133,0,195,168,44,1,158,231,69,0,162,64,200,254,91,58,104,0,182,58,187,254,249,228,136,0,203,134,76,254,99,221,233,0,75,254,214,254,80,69,154,0,64,152,248,254,236,136,202,255,157,105,153,254,149,175,20,0,22,35,19,255,124,121,233,0,186,250,198,254,132,229,139,0,137,80,174,255,165,125,68,0,144,202,148,254,235,239,248,0,135,184,118,0,101,94,17,255,122,72,70,254,69,130,146,0,127,222,248,1,69,127,118,255,30,82,215,254,188,74,19,255,229,167,194,254,117,25,66,255,65,234,56,254,213,22,156,0,151,59,93,254,45,28,27,255,186,126,164,255,32,6,239,0,127,114,99,1,219,52,2,255,99,96,166,254,62,190,126,255,108,222,168,1,75,226,174,0,230,226,199,0,60,117,218,255,252,248,20,1,214,188,204,0,31,194,134,254,123,69,192,255,169,173,36,254,55,98,91,0,223,42,102,254,137,1,102,0,157,90,25,0,239,122,64,255,252,6,233,0,7,54,20,255,82,116,174,0,135,37,54,255,15,186,125,0,227,112,175,255,100,180,225,255,42,237,244,255,244,173,226,254,248,18,33,0,171,99,150,255,74,235,50,255,117,82,32,254,106,168,237,0,207,109,208,1,228,9,186,0,135,60,169,254,179,92,143,0,244,170,104,255,235,45,124,255,70,99,186,0,117,137,183,0,224,31,215,0,40,9,100,0,26,16,95,1,68,217,87,0,8,151,20,255,26,100,58,255,176,165,203,1,52,118,70,0,7,32,254,254,244,254,245,255,167,144,194,255,125,113,23,255,176,121,181,0,136,84,209,0,138,6,30,255,89,48,28,0,33,155,14,255,25,240,154,0,141,205,109,1,70,115,62,255,20,40,107,254,138,154,199,255,94,223,226,255,157,171,38,0,163,177,25,254,45,118,3,255,14,222,23,1,209,190,81,255,118,123,232,1,13,213,101,255,123,55,123,254,27,246,165,0,50,99,76,255,140,214,32,255,97,65,67,255,24,12,28,0,174,86,78,1,64,247,96,0,160,135,67,0,66,55,243,255,147,204,96,255,26,6,33,255,98,51,83,1,153,213,208,255,2,184,54,255,25,218,11,0,49,67,246,254,18,149,72,255,13,25,72,0,42,79,214,0,42,4,38,1,27,139,144,255,149,187,23,0,18,164,132,0,245,84,184,254,120,198,104,255,126,218,96,0,56,117,234,255,13,29,214,254,68,47,10,255,167,154,132,254,152,38,198,0,66,178,89,255,200,46,171,255,13,99,83,255,210,187,253,255,170,45,42,1,138,209,124,0,214,162,141,0,12,230,156,0,102,36,112,254,3,147,67,0,52,215,123,255,233,171,54,255,98,137,62,0,247,218,39,255,231,218,236,0,247,191,127,0,195,146,84,0,165,176,92,255,19,212,94,255,17,74,227,0,88,40,153,1,198,147,1,255,206,67,245,254,240,3,218,255,61,141,213,255,97,183,106,0,195,232,235,254,95,86,154,0,209,48,205,254,118,209,241,255,240,120,223,1,213,29,159,0,163,127,147,255,13,218,93,0,85,24,68,254,70,20,80,255,189,5,140,1,82,97,254,255,99,99,191,255,132,84,133,255,107,218,116,255,112,122,46,0,105,17,32,0,194,160,63,255,68,222,39,1,216,253,92,0,177,105,205,255,149,201,195,0,42,225,11,255,40,162,115,0,9,7,81,0,165,218,219,0,180,22,0,254,29,146,252,255,146,207,225,1,180,135,96,0,31,163,112,0,177,11,219,255,133,12,193,254,43,78,50,0,65,113,121,1,59,217,6,255,110,94,24,1,112,172,111,0,7,15,96,0,36,85,123,0,71,150,21,255,208,73,188,0,192,11,167,1,213,245,34,0,9,230,92,0,162,142,39,255,215,90,27,0,98,97,89,0,94,79,211,0,90,157,240,0,95,220,126,1,102,176,226,0,36,30,224,254,35,31,127,0,231,232,115,1,85,83,130,0,210,73,245,255,47,143,114,255,68,65,197,0,59,72,62,255,183,133,173,254,93,121,118,255,59,177,81,255,234,69,173,255,205,128,177,0,220,244,51,0,26,244,209,1,73,222,77,255,163,8,96,254,150,149,211,0,158,254,203,1,54,127,139,0,161,224,59,0,4,109,22,255,222,42,45,255,208,146,102,255,236,142,187,0,50,205,245,255,10,74,89,254,48,79,142,0,222,76,130,255,30,166,63,0,236,12,13,255,49,184,244,0,187,113,102,0,218,101,253,0,153,57,182,254,32,150,42,0,25,198,146,1,237,241,56,0,140,68,5,0,91,164,172,255,78,145,186,254,67,52,205,0,219,207,129,1,109,115,17,0,54,143,58,1,21,248,120,255,179,255,30,0,193,236,66,255,1,255,7,255,253,192,48,255,19,69,217,1,3,214,0,255,64,101,146,1,223,125,35,255,235,73,179,255,249,167,226,0,225,175,10,1,97,162,58,0,106,112,171,1,84,172,5,255,133,140,178,255,134,245,142,0,97,90,125,255,186,203,185,255,223,77,23,255,192,92,106,0,15,198,115,255,217,152,248,0,171,178,120,255,228,134,53,0,176,54,193,1,250,251,53,0,213,10,100,1,34,199,106,0,151,31,244,254,172,224,87,255,14,237,23,255,253,85,26,255,127,39,116,255,172,104,100,0,251,14,70,255,212,208,138,255,253,211,250,0,176,49,165,0,15,76,123,255,37,218,160,255,92,135,16,1,10,126,114,255,70,5,224,255,247,249,141,0,68,20,60,1,241,210,189,255,195,217,187,1,151,3,113,0,151,92,174,0,231,62,178,255,219,183,225,0,23,23,33,255,205,181,80,0,57,184,248,255,67,180,1,255,90,123,93,255,39,0,162,255,96,248,52,255,84,66,140,0,34,127,228,255,194,138,7,1,166,110,188,0,21,17,155,1,154,190,198,255,214,80,59,255,18,7,143,0,72,29,226,1,199,217,249,0,232,161,71,1,149,190,201,0,217,175,95,254,113,147,67,255,138,143,199,255,127,204,1,0,29,182,83,1,206,230,155,255,186,204,60,0,10,125,85,255,232,96,25,255,255,89,247,255,213,254,175,1,232,193,81,0,28,43,156,254,12,69,8,0,147,24,248,0,18,198,49,0,134,60,35,0,118,246,18,255,49,88,254,254,228,21,186,255,182,65,112,1,219,22,1,255,22,126,52,255,189,53,49,255,112,25,143,0,38,127,55,255,226,101,163,254,208,133,61,255,137,69,174,1,190,118,145,255,60,98,219,255,217,13,245,255,250,136,10,0,84,254,226,0,201,31,125,1,240,51,251,255,31,131,130,255,2,138,50,255,215,215,177,1,223,12,238,255,252,149,56,255,124,91,68,255,72,126,170,254,119,255,100,0,130,135,232,255,14,79,178,0,250,131,197,0,138,198,208,0,121,216,139,254,119,18,36,255,29,193,122,0,16,42,45,255,213,240,235,1,230,190,169,255,198,35,228,254,110,173,72,0,214,221,241,255,56,148,135,0,192,117,78,254,141,93,207,255,143,65,149,0,21,18,98,255,95,44,244,1,106,191,77,0,254,85,8,254,214,110,176,255,73,173,19,254,160,196,199,255,237,90,144,0,193,172,113,255,200,155,136,254,228,90,221,0,137,49,74,1,164,221,215,255,209,189,5,255,105,236,55,255,42,31,129,1,193,255,236,0,46,217,60,0,138,88,187,255,226,82,236,255,81,69,151,255,142,190,16,1,13,134,8,0,127,122,48,255,81,64,156,0,171,243,139,0,237,35,246,0,122,143,193,254,212,122,146,0,95,41,255,1,87,132,77,0,4,212,31,0,17,31,78,0,39,45,173,254,24,142,217,255,95,9,6,255,227,83,6,0,98,59,130,254,62,30,33,0,8,115,211,1,162,97,128,255,7,184,23,254,116,28,168,255,248,138,151,255,98,244,240,0,186,118,130,0,114,248,235,255,105,173,200,1,160,124,71,255,94,36,164,1,175,65,146,255,238,241,170,254,202,198,197,0,228,71,138,254,45,246,109,255,194,52,158,0,133,187,176,0,83,252,154,254,89,189,221,255,170,73,252,0,148,58,125,0,36,68,51,254,42,69,177,255,168,76,86,255,38,100,204,255,38,53,35,0,175,19,97,0,225,238,253,255,81,81,135,0,210,27,255,254,235,73,107,0,8,207,115,0,82,127,136,0,84,99,21,254,207,19,136,0,100,164,101,0,80,208,77,255,132,207,237,255,15,3,15,255,33,166,110,0,156,95,85,255,37,185,111,1,150,106,35,255,166,151,76,0,114,87,135,255,159,194,64,0,12,122,31,255,232,7,101,254,173,119,98,0,154,71,220,254,191,57,53,255,168,232,160,255,224,32,99,255,218,156,165,0,151,153,163,0,217,13,148,1,197,113,89,0,149,28,161,254,207,23,30,0,105,132,227,255,54,230,94,255,133,173,204,255,92,183,157,255,88,144,252,254,102,33,90,0,159,97,3,0,181,218,155,255,240,114,119,0,106,214,53,255,165,190,115,1,152,91,225,255,88,106,44,255,208,61,113,0,151,52,124,0,191,27,156,255,110,54,236,1,14,30,166,255,39,127,207,1,229,199,28,0,188,228,188,254,100,157,235,0,246,218,183,1,107,22,193,255,206,160,95,0,76,239,147,0,207,161,117,0,51,166,2,255,52,117,10,254,73,56,227,255,152,193,225,0,132,94,136,255,101,191,209,0,32,107,229,255,198,43,180,1,100,210,118,0,114,67,153,255,23,88,26,255,89,154,92,1,220,120,140,255,144,114,207,255,252,115,250,255,34,206,72,0,138,133,127,255,8,178,124,1,87,75,97,0,15,229,92,254,240,67,131,255,118,123,227,254,146,120,104,255,145,213,255,1,129,187,70,255,219,119,54,0,1,19,173,0,45,150,148,1,248,83,72,0,203,233,169,1,142,107,56,0,247,249,38,1,45,242,80,255,30,233,103,0,96,82,70,0,23,201,111,0,81,39,30,255,161,183,78,255,194,234,33,255,68,227,140,254,216,206,116,0,70,27,235,255,104,144,79,0,164,230,93,254,214,135,156,0,154,187,242,254,188,20,131,255,36,109,174,0,159,112,241,0,5,110,149,1,36,165,218,0,166,29,19,1,178,46,73,0,93,43,32,254,248,189,237,0,102,155,141,0,201,93,195,255,241,139,253,255,15,111,98,255,108,65,163,254,155,79,190,255,73,174,193,254,246,40,48,255,107,88,11,254,202,97,85,255,253,204,18,255,113,242,66,0,110,160,194,254,208,18,186,0,81,21,60,0,188,104,167,255,124,166,97,254,210,133,142,0,56,242,137,254,41,111,130,0,111,151,58,1,111,213,141,255,183,172,241,255,38,6,196,255,185,7,123,255,46,11,246,0,245,105,119,1,15,2,161,255,8,206,45,255,18,202,74,255,83,124,115,1,212,141,157,0,83,8,209,254,139,15,232,255,172,54,173,254,50,247,132,0,214,189,213,0,144,184,105,0,223,254,248,0,255,147,240,255,23,188,72,0,7,51,54,0,188,25,180,254,220,180,0,255,83,160,20,0,163,189,243,255,58,209,194,255,87,73,60,0,106,24,49,0,245,249,220,0,22,173,167,0,118,11,195,255,19,126,237,0,110,159,37,255,59,82,47,0,180,187,86,0,188,148,208,1,100,37,133,255,7,112,193,0,129,188,156,255,84,106,129,255,133,225,202,0,14,236,111,255,40,20,101,0,172,172,49,254,51,54,74,255,251,185,184,255,93,155,224,255,180,249,224,1,230,178,146,0,72,57,54,254,178,62,184,0,119,205,72,0,185,239,253,255,61,15,218,0,196,67,56,255,234,32,171,1,46,219,228,0,208,108,234,255,20,63,232,255,165,53,199,1,133,228,5,255,52,205,107,0,74,238,140,255,150,156,219,254,239,172,178,255,251,189,223,254,32,142,211,255,218,15,138,1,241,196,80,0,28,36,98,254,22,234,199,0,61,237,220,255,246,57,37,0,142,17,142,255,157,62,26,0,43,238,95,254,3,217,6,255,213,25,240,1,39,220,174,255,154,205,48,254,19,13,192,255,244,34,54,254,140,16,155,0,240,181,5,254,155,193,60,0,166,128,4,255,36,145,56,255,150,240,219,0,120,51,145,0,82,153,42,1,140,236,146,0,107,92,248,1,189,10,3,0,63,136,242,0,211,39,24,0,19,202,161,1,173,27,186,255,210,204,239,254,41,209,162,255,182,254,159,255,172,116,52,0,195,103,222,254,205,69,59,0,53,22,41,1,218,48,194,0,80,210,242,0,210,188,207,0,187,161,161,254,216,17,1,0,136,225,113,0,250,184,63,0,223,30,98,254,77,168,162,0,59,53,175,0,19,201,10,255,139,224,194,0,147,193,154,255,212,189,12,254,1,200,174,255,50,133,113,1,94,179,90,0,173,182,135,0,94,177,113,0,43,89,215,255,136,252,106,255,123,134,83,254,5,245,66,255,82,49,39,1,220,2,224,0,97,129,177,0,77,59,89,0,61,29,155,1,203,171,220,255,92,78,139,0,145,33,181,255,169,24,141,1,55,150,179,0,139,60,80,255,218,39,97,0,2,147,107,255,60,248,72,0,173,230,47,1,6,83,182,255,16,105,162,254,137,212,81,255,180,184,134,1,39,222,164,255,221,105,251,1,239,112,125,0,63,7,97,0,63,104,227,255,148,58,12,0,90,60,224,255,84,212,252,0,79,215,168,0,248,221,199,1,115,121,1,0,36,172,120,0,32,162,187,255,57,107,49,255,147,42,21,0,106,198,43,1,57,74,87,0,126,203,81,255,129,135,195,0,140,31,177,0,221,139,194,0,3,222,215,0,131,68,231,0,177,86,178,254,124,151,180,0,184,124,38,1,70,163,17,0,249,251,181,1,42,55,227,0,226,161,44,0,23,236,110,0,51,149,142,1,93,5,236,0,218,183,106,254,67,24,77,0,40,245,209,255,222,121,153,0,165,57,30,0,83,125,60,0,70,38,82,1,229,6,188,0,109,222,157,255,55,118,63,255,205,151,186,0,227,33,149,255,254,176,246,1,227,177,227,0,34,106,163,254,176,43,79,0,106,95,78,1,185,241,122,255,185,14,61,0,36,1,202,0,13,178,162,255,247,11,132,0,161,230,92,1,65,1,185,255,212,50,165,1,141,146,64,255,158,242,218,0,21,164,125,0,213,139,122,1,67,71,87,0,203,158,178,1,151,92,43,0,152,111,5,255,39,3,239,255,217,255,250,255,176,63,71,255,74,245,77,1,250,174,18,255,34,49,227,255,246,46,251,255,154,35,48,1,125,157,61,255,106,36,78,255,97,236,153,0,136,187,120,255,113,134,171,255,19,213,217,254,216,94,209,255,252,5,61,0,94,3,202,0,3,26,183,255,64,191,43,255,30,23,21,0,129,141,77,255,102,120,7,1,194,76,140,0,188,175,52,255,17,81,148,0,232,86,55,1,225,48,172,0,134,42,42,255,238,50,47,0,169,18,254,0,20,147,87,255,14,195,239,255,69,247,23,0,238,229,128,255,177,49,112,0,168,98,251,255,121,71,248,0,243,8,145,254,246,227,153,255,219,169,177,254,251,139,165,255,12,163,185,255,164,40,171,255,153,159,27,254,243,109,91,255,222,24,112,1,18,214,231,0,107,157,181,254,195,147,0,255,194,99,104,255,89,140,190,255,177,66,126,254,106,185,66,0,49,218,31,0,252,174,158,0,188,79,230,1,238,41,224,0,212,234,8,1,136,11,181,0,166,117,83,255,68,195,94,0,46,132,201,0,240,152,88,0,164,57,69,254,160,224,42,255,59,215,67,255,119,195,141,255,36,180,121,254,207,47,8,255,174,210,223,0,101,197,68,255,255,82,141,1,250,137,233,0,97,86,133,1,16,80,69,0,132,131,159,0,116,93,100,0,45,141,139,0,152,172,157,255,90,43,91,0,71,153,46,0,39,16,112,255,217,136,97,255,220,198,25,254,177,53,49,0,222,88,134,255,128,15,60,0,207,192,169,255,192,116,209,255,106,78,211,1,200,213,183,255,7,12,122,254,222,203,60,255,33,110,199,254,251,106,117,0,228,225,4,1,120,58,7,255,221,193,84,254,112,133,27,0,189,200,201,255,139,135,150,0,234,55,176,255,61,50,65,0,152,108,169,255,220,85,1,255,112,135,227,0,162,26,186,0,207,96,185,254,244,136,107,0,93,153,50,1,198,97,151,0,110,11,86,255,143,117,174,255,115,212,200,0,5,202,183,0,237,164,10,254,185,239,62,0,236,120,18,254,98,123,99,255,168,201,194,254,46,234,214,0,191,133,49,255,99,169,119,0,190,187,35,1,115,21,45,255,249,131,72,0,112,6,123,255,214,49,181,254,166,233,34,0,92,197,102,254,253,228,205,255,3,59,201,1,42,98,46,0,219,37,35,255,169,195,38,0,94,124,193,1,156,43,223,0,95,72,133,254,120,206,191,0,122,197,239,255,177,187,79,255,254,46,2,1,250,167,190,0,84,129,19,0,203,113,166,255,249,31,189,254,72,157,202,255,208,71,73,255,207,24,72,0,10,16,18,1,210,81,76,255,88,208,192,255,126,243,107,255,238,141,120,255,199,121,234,255,137,12,59,255,36,220,123,255,148,179,60,254,240,12,29,0,66,0,97,1,36,30,38,255,115,1,93,255,96,103,231,255,197,158,59,1,192,164,240,0,202,202,57,255,24,174,48,0,89,77,155,1,42,76,215,0,244,151,233,0,23,48,81,0,239,127,52,254,227,130,37,255,248,116,93,1,124,132,118,0,173,254,192,1,6,235,83,255,110,175,231,1,251,28,182,0,129,249,93,254,84,184,128,0,76,181,62,0,175,128,186,0,100,53,136,254,109,29,226,0,221,233,58,1,20,99,74,0,0,22,160,0,134,13,21,0,9,52,55,255,17,89,140,0,175,34,59,0,84,165,119,255,224,226,234,255,7,72,166,255,123,115,255,1,18,214,246,0,250,7,71,1,217,220,185,0,212,35,76,255,38,125,175,0,189,97,210,0,114,238,44,255,41,188,169,254,45,186,154,0,81,92,22,0,132,160,193,0,121,208,98,255,13,81,44,255,203,156,82,0,71,58,21,255,208,114,191,254,50,38,147,0,154,216,195,0,101,25,18,0,60,250,215,255,233,132,235,255,103,175,142,1,16,14,92,0,141,31,110,254,238,241,45,255,153,217,239,1,97,168,47,255,249,85,16,1,28,175,62,255,57,254,54,0,222,231,126,0,166,45,117,254,18,189,96,255,228,76,50,0,200,244,94,0,198,152,120,1,68,34,69,255,12,65,160,254,101,19,90,0,167,197,120,255,68,54,185,255,41,218,188,0,113,168,48,0,88,105,189,1,26,82,32,255,185,93,164,1,228,240,237,255,66,182,53,0,171,197,92,255,107,9,233,1,199,120,144,255,78,49,10,255,109,170,105,255,90,4,31,255,28,244,113,255,74,58,11,0,62,220,246,255,121,154,200,254,144,210,178,255,126,57,129,1,43,250,14,255,101,111,28,1,47,86,241,255,61,70,150,255,53,73,5,255,30,26,158,0,209,26,86,0,138,237,74,0,164,95,188,0,142,60,29,254,162,116,248,255,187,175,160,0,151,18,16,0,209,111,65,254,203,134,39,255,88,108,49,255,131,26,71,255,221,27,215,254,104,105,93,255,31,236,31,254,135,0,211,255,143,127,110,1,212,73,229,0,233,67,167,254,195,1,208,255,132,17,221,255,51,217,90,0,67,235,50,255,223,210,143,0,179,53,130,1,233,106,198,0,217,173,220,255,112,229,24,255,175,154,93,254,71,203,246,255,48,66,133,255,3,136,230,255,23,221,113,254,235,111,213,0,170,120,95,254,251,221,2,0,45,130,158,254,105,94,217,255,242,52,180,254,213,68,45,255,104,38,28,0,244,158,76,0,161,200,96,255,207,53,13,255,187,67,148,0,170,54,248,0,119,162,178,255,83,20,11,0,42,42,192,1,146,159,163,255,183,232,111,0,77,229,21,255,71,53,143,0,27,76,34,0,246,136,47,255,219,39,182,255,92,224,201,1,19,142,14,255,69,182,241,255,163,118,245,0,9,109,106,1,170,181,247,255,78,47,238,255,84,210,176,255,213,107,139,0,39,38,11,0,72,21,150,0,72,130,69,0,205,77,155,254,142,133,21], "i8", ALLOC_NONE, Runtime.GLOBAL_BASE);
-/* memory initializer */ allocate([71,111,172,254,226,42,59,255,179,0,215,1,33,128,241,0,234,252,13,1,184,79,8,0,110,30,73,255,246,141,189,0,170,207,218,1,74,154,69,255,138,246,49,255,155,32,100,0,125,74,105,255,90,85,61,255,35,229,177,255,62,125,193,255,153,86,188,1,73,120,212,0,209,123,246,254,135,209,38,255,151,58,44,1,92,69,214,255,14,12,88,255,252,153,166,255,253,207,112,255,60,78,83,255,227,124,110,0,180,96,252,255,53,117,33,254,164,220,82,255,41,1,27,255,38,164,166,255,164,99,169,254,61,144,70,255,192,166,18,0,107,250,66,0,197,65,50,0,1,179,18,255,255,104,1,255,43,153,35,255,80,111,168,0,110,175,168,0,41,105,45,255,219,14,205,255,164,233,140,254,43,1,118,0,233,67,195,0,178,82,159,255,138,87,122,255,212,238,90,255,144,35,124,254,25,140,164,0,251,215,44,254,133,70,107,255,101,227,80,254,92,169,55,0,215,42,49,0,114,180,85,255,33,232,27,1,172,213,25,0,62,176,123,254,32,133,24,255,225,191,62,0,93,70,153,0,181,42,104,1,22,191,224,255,200,200,140,255,249,234,37,0,149,57,141,0,195,56,208,255,254,130,70,255,32,173,240,255,29,220,199,0,110,100,115,255,132,229,249,0,228,233,223,255,37,216,209,254,178,177,209,255,183,45,165,254,224,97,114,0,137,97,168,255,225,222,172,0,165,13,49,1,210,235,204,255,252,4,28,254,70,160,151,0,232,190,52,254,83,248,93,255,62,215,77,1,175,175,179,255,160,50,66,0,121,48,208,0,63,169,209,255,0,210,200,0,224,187,44,1,73,162,82,0,9,176,143,255,19,76,193,255,29,59,167,1,24,43,154,0,28,190,190,0,141,188,129,0,232,235,203,255,234,0,109,255,54,65,159,0,60,88,232,255,121,253,150,254,252,233,131,255,198,110,41,1,83,77,71,255,200,22,59,254,106,253,242,255,21,12,207,255,237,66,189,0,90,198,202,1,225,172,127,0,53,22,202,0,56,230,132,0,1,86,183,0,109,190,42,0,243,68,174,1,109,228,154,0,200,177,122,1,35,160,183,255,177,48,85,255,90,218,169,255,248,152,78,0,202,254,110,0,6,52,43,0,142,98,65,255,63,145,22,0,70,106,93,0,232,138,107,1,110,179,61,255,211,129,218,1,242,209,92,0,35,90,217,1,182,143,106,255,116,101,217,255,114,250,221,255,173,204,6,0,60,150,163,0,73,172,44,255,239,110,80,255,237,76,153,254,161,140,249,0,149,232,229,0,133,31,40,255,174,164,119,0,113,51,214,0,129,228,2,254,64,34,243,0,107,227,244,255,174,106,200,255,84,153,70,1,50,35,16,0,250,74,216,254,236,189,66,255,153,249,13,0,230,178,4,255,221,41,238,0,118,227,121,255,94,87,140,254,254,119,92,0,73,239,246,254,117,87,128,0,19,211,145,255,177,46,252,0,229,91,246,1,69,128,247,255,202,77,54,1,8,11,9,255,153,96,166,0,217,214,173,255,134,192,2,1,0,207,0,0,189,174,107,1,140,134,100,0,158,193,243,1,182,102,171,0,235,154,51,0,142,5,123,255,60,168,89,1,217,14,92,255,19,214,5,1,211,167,254,0,44,6,202,254,120,18,236,255,15,113,184,255,184,223,139,0,40,177,119,254,182,123,90,255,176,165,176,0,247,77,194,0,27,234,120,0,231,0,214,255,59,39,30,0,125,99,145,255,150,68,68,1,141,222,248,0,153,123,210,255,110,127,152,255,229,33,214,1,135,221,197,0,137,97,2,0,12,143,204,255,81,41,188,0,115,79,130,255,94,3,132,0,152,175,187,255,124,141,10,255,126,192,179,255,11,103,198,0,149,6,45,0,219,85,187,1,230,18,178,255,72,182,152,0,3,198,184,255,128,112,224,1,97,161,230,0,254,99,38,255,58,159,197,0,151,66,219,0,59,69,143,255,185,112,249,0,119,136,47,255,123,130,132,0,168,71,95,255,113,176,40,1,232,185,173,0,207,93,117,1,68,157,108,255,102,5,147,254,49,97,33,0,89,65,111,254,247,30,163,255,124,217,221,1,102,250,216,0,198,174,75,254,57,55,18,0,227,5,236,1,229,213,173,0,201,109,218,1,49,233,239,0,30,55,158,1,25,178,106,0,155,111,188,1,94,126,140,0,215,31,238,1,77,240,16,0,213,242,25,1,38,71,168,0,205,186,93,254,49,211,140,255,219,0,180,255,134,118,165,0,160,147,134,255,110,186,35,255,198,243,42,0,243,146,119,0,134,235,163,1,4,241,135,255,193,46,193,254,103,180,79,255,225,4,184,254,242,118,130,0,146,135,176,1,234,111,30,0,69,66,213,254,41,96,123,0,121,94,42,255,178,191,195,255,46,130,42,0,117,84,8,255,233,49,214,254,238,122,109,0,6,71,89,1,236,211,123,0,244,13,48,254,119,148,14,0,114,28,86,255,75,237,25,255,145,229,16,254,129,100,53,255,134,150,120,254,168,157,50,0,23,72,104,255,224,49,14,0,255,123,22,255,151,185,151,255,170,80,184,1,134,182,20,0,41,100,101,1,153,33,16,0,76,154,111,1,86,206,234,255,192,160,164,254,165,123,93,255,1,216,164,254,67,17,175,255,169,11,59,255,158,41,61,255,73,188,14,255,195,6,137,255,22,147,29,255,20,103,3,255,246,130,227,255,122,40,128,0,226,47,24,254,35,36,32,0,152,186,183,255,69,202,20,0,195,133,195,0,222,51,247,0,169,171,94,1,183,0,160,255,64,205,18,1,156,83,15,255,197,58,249,254,251,89,110,255,50,10,88,254,51,43,216,0,98,242,198,1,245,151,113,0,171,236,194,1,197,31,199,255,229,81,38,1,41,59,20,0,253,104,230,0,152,93,14,255,246,242,146,254,214,169,240,255,240,102,108,254,160,167,236,0,154,218,188,0,150,233,202,255,27,19,250,1,2,71,133,255,175,12,63,1,145,183,198,0,104,120,115,255,130,251,247,0,17,212,167,255,62,123,132,255,247,100,189,0,155,223,152,0,143,197,33,0,155,59,44,255,150,93,240,1,127,3,87,255,95,71,207,1,167,85,1,255,188,152,116,255,10,23,23,0,137,195,93,1,54,98,97,0,240,0,168,255,148,188,127,0,134,107,151,0,76,253,171,0,90,132,192,0,146,22,54,0,224,66,54,254,230,186,229,255,39,182,196,0,148,251,130,255,65,131,108,254,128,1,160,0,169,49,167,254,199,254,148,255,251,6,131,0,187,254,129,255,85,82,62,0,178,23,58,255,254,132,5,0,164,213,39,0,134,252,146,254,37,53,81,255,155,134,82,0,205,167,238,255,94,45,180,255,132,40,161,0,254,111,112,1,54,75,217,0,179,230,221,1,235,94,191,255,23,243,48,1,202,145,203,255,39,118,42,255,117,141,253,0,254,0,222,0,43,251,50,0,54,169,234,1,80,68,208,0,148,203,243,254,145,7,135,0,6,254,0,0,252,185,127,0,98,8,129,255,38,35,72,255,211,36,220,1,40,26,89,0,168,64,197,254,3,222,239,255,2,83,215,254,180,159,105,0,58,115,194,0,186,116,106,255,229,247,219,255,129,118,193,0,202,174,183,1,166,161,72,0,201,107,147,254,237,136,74,0,233,230,106,1,105,111,168,0,64,224,30,1,1,229,3,0,102,151,175,255,194,238,228,255,254,250,212,0,187,237,121,0,67,251,96,1,197,30,11,0,183,95,204,0,205,89,138,0,64,221,37,1,255,223,30,255,178,48,211,255,241,200,90,255,167,209,96,255,57,130,221,0,46,114,200,255,61,184,66,0,55,182,24,254,110,182,33,0,171,190,232,255,114,94,31,0,18,221,8,0,47,231,254,0,255,112,83,0,118,15,215,255,173,25,40,254,192,193,31,255,238,21,146,255,171,193,118,255,101,234,53,254,131,212,112,0,89,192,107,1,8,208,27,0,181,217,15,255,231,149,232,0,140,236,126,0,144,9,199,255,12,79,181,254,147,182,202,255,19,109,182,255,49,212,225,0,74,163,203,0,175,233,148,0,26,112,51,0,193,193,9,255,15,135,249,0,150,227,130,0,204,0,219,1,24,242,205,0,238,208,117,255,22,244,112,0,26,229,34,0,37,80,188,255,38,45,206,254,240,90,225,255,29,3,47,255,42,224,76,0,186,243,167,0,32,132,15,255,5,51,125,0,139,135,24,0,6,241,219,0,172,229,133,255,246,214,50,0,231,11,207,255,191,126,83,1,180,163,170,255,245,56,24,1,178,164,211,255,3,16,202,1,98,57,118,255,141,131,89,254,33,51,24,0,243,149,91,255,253,52,14,0,35,169,67,254,49,30,88,255,179,27,36,255,165,140,183,0,58,189,151,0,88,31,0,0,75,169,66,0,66,101,199,255,24,216,199,1,121,196,26,255,14,79,203,254,240,226,81,255,94,28,10,255,83,193,240,255,204,193,131,255,94,15,86,0,218,40,157,0,51,193,209,0,0,242,177,0,102,185,247,0,158,109,116,0,38,135,91,0,223,175,149,0,220,66,1,255,86,60,232,0,25,96,37,255,225,122,162,1,215,187,168,255,158,157,46,0,56,171,162,0,232,240,101,1,122,22,9,0,51,9,21,255,53,25,238,255,217,30,232,254,125,169,148,0,13,232,102,0,148,9,37,0,165,97,141,1,228,131,41,0,222,15,243,255,254,18,17,0,6,60,237,1,106,3,113,0,59,132,189,0,92,112,30,0,105,208,213,0,48,84,179,255,187,121,231,254,27,216,109,255,162,221,107,254,73,239,195,255,250,31,57,255,149,135,89,255,185,23,115,1,3,163,157,255,18,112,250,0,25,57,187,255,161,96,164,0,47,16,243,0,12,141,251,254,67,234,184,255,41,18,161,0,175,6,96,255,160,172,52,254,24,176,183,255,198,193,85,1,124,121,137,255,151,50,114,255,220,203,60,255,207,239,5,1,0,38,107,255,55,238,94,254,70,152,94,0,213,220,77,1,120,17,69,255,85,164,190,255,203,234,81,0,38,49,37,254,61,144,124,0,137,78,49,254,168,247,48,0,95,164,252,0,105,169,135,0,253,228,134,0,64,166,75,0,81,73,20,255,207,210,10,0,234,106,150,255,94,34,90,255,254,159,57,254,220,133,99,0,139,147,180,254,24,23,185,0,41,57,30,255,189,97,76,0,65,187,223,255,224,172,37,255,34,62,95,1,231,144,240,0,77,106,126,254,64,152,91,0,29,98,155,0,226,251,53,255,234,211,5,255,144,203,222,255,164,176,221,254,5,231,24,0,179,122,205,0,36,1,134,255,125,70,151,254,97,228,252,0,172,129,23,254,48,90,209,255,150,224,82,1,84,134,30,0,241,196,46,0,103,113,234,255,46,101,121,254,40,124,250,255,135,45,242,254,9,249,168,255,140,108,131,255,143,163,171,0,50,173,199,255,88,222,142,255,200,95,158,0,142,192,163,255,7,117,135,0,111,124,22,0,236,12,65,254,68,38,65,255,227,174,254,0,244,245,38,0,240,50,208,255,161,63,250,0,60,209,239,0,122,35,19,0,14,33,230,254,2,159,113,0,106,20,127,255,228,205,96,0,137,210,174,254,180,212,144,255,89,98,154,1,34,88,139,0,167,162,112,1,65,110,197,0,241,37,169,0,66,56,131,255,10,201,83,254,133,253,187,255,177,112,45,254,196,251,0,0,196,250,151,255,238,232,214,255,150,209,205,0,28,240,118,0,71,76,83,1,236,99,91,0,42,250,131,1,96,18,64,255,118,222,35,0,113,214,203,255,122,119,184,255,66,19,36,0,204,64,249,0,146,89,139,0,134,62,135,1,104,233,101,0,188,84,26,0,49,249,129,0,208,214,75,255,207,130,77,255,115,175,235,0,171,2,137,255,175,145,186,1,55,245,135,255,154,86,181,1,100,58,246,255,109,199,60,255,82,204,134,255,215,49,230,1,140,229,192,255,222,193,251,255,81,136,15,255,179,149,162,255,23,39,29,255,7,95,75,254,191,81,222,0,241,81,90,255,107,49,201,255,244,211,157,0,222,140,149,255,65,219,56,254,189,246,90,255,178,59,157,1,48,219,52,0,98,34,215,0,28,17,187,255,175,169,24,0,92,79,161,255,236,200,194,1,147,143,234,0,229,225,7,1,197,168,14,0,235,51,53,1,253,120,174,0,197,6,168,255,202,117,171,0,163,21,206,0,114,85,90,255,15,41,10,255,194,19,99,0,65,55,216,254,162,146,116,0,50,206,212,255,64,146,29,255,158,158,131,1,100,165,130,255,172,23,129,255,125,53,9,255,15,193,18,1,26,49,11,255,181,174,201,1,135,201,14,255,100,19,149,0,219,98,79,0,42,99,143,254,96,0,48,255,197,249,83,254,104,149,79,255,235,110,136,254,82,128,44,255,65,41,36,254,88,211,10,0,187,121,187,0,98,134,199,0,171,188,179,254,210,11,238,255,66,123,130,254,52,234,61,0,48,113,23,254,6,86,120,255,119,178,245,0,87,129,201,0,242,141,209,0,202,114,85,0,148,22,161,0,103,195,48,0,25,49,171,255,138,67,130,0,182,73,122,254,148,24,130,0,211,229,154,0,32,155,158,0,84,105,61,0,177,194,9,255,166,89,86,1,54,83,187,0,249,40,117,255,109,3,215,255,53,146,44,1,63,47,179,0,194,216,3,254,14,84,136,0,136,177,13,255,72,243,186,255,117,17,125,255,211,58,211,255,93,79,223,0,90,88,245,255,139,209,111,255,70,222,47,0,10,246,79,255,198,217,178,0,227,225,11,1,78,126,179,255,62,43,126,0,103,148,35,0,129,8,165,254,245,240,148,0,61,51,142,0,81,208,134,0,15,137,115,255,211,119,236,255,159,245,248,255,2,134,136,255,230,139,58,1,160,164,254,0,114,85,141,255,49,166,182,255,144,70,84,1,85,182,7,0,46,53,93,0,9,166,161,255,55,162,178,255,45,184,188,0,146,28,44,254,169,90,49,0,120,178,241,1,14,123,127,255,7,241,199,1,189,66,50,255,198,143,101,254,189,243,135,255,141,24,24,254,75,97,87,0,118,251,154,1,237,54,156,0,171,146,207,255,131,196,246,255,136,64,113,1,151,232,57,0,240,218,115,0,49,61,27,255,64,129,73,1,252,169,27,255,40,132,10,1,90,201,193,255,252,121,240,1,186,206,41,0,43,198,97,0,145,100,183,0,204,216,80,254,172,150,65,0,249,229,196,254,104,123,73,255,77,104,96,254,130,180,8,0,104,123,57,0,220,202,229,255,102,249,211,0,86,14,232,255,182,78,209,0,239,225,164,0,106,13,32,255,120,73,17,255,134,67,233,0,83,254,181,0,183,236,112,1,48,64,131,255,241,216,243,255,65,193,226,0,206,241,100,254,100,134,166,255,237,202,197,0,55,13,81,0,32,124,102,255,40,228,177,0,118,181,31,1,231,160,134,255,119,187,202,0,0,142,60,255,128,38,189,255,166,201,150,0,207,120,26,1,54,184,172,0,12,242,204,254,133,66,230,0,34,38,31,1,184,112,80,0,32,51,165,254,191,243,55,0,58,73,146,254,155,167,205,255,100,104,152,255,197,254,207,255,173,19,247,0,238,10,202,0,239,151,242,0,94,59,39,255,240,29,102,255,10,92,154,255,229,84,219,255,161,129,80,0,208,90,204,1,240,219,174,255,158,102,145,1,53,178,76,255,52,108,168,1,83,222,107,0,211,36,109,0,118,58,56,0,8,29,22,0,237,160,199,0,170,209,157,0,137,71,47,0,143,86,32,0,198,242,2,0,212,48,136,1,92,172,186,0,230,151,105,1,96,191,229,0,138,80,191,254,240,216,130,255,98,43,6,254,168,196,49,0,253,18,91,1,144,73,121,0,61,146,39,1,63,104,24,255,184,165,112,254,126,235,98,0,80,213,98,255,123,60,87,255,82,140,245,1,223,120,173,255,15,198,134,1,206,60,239,0,231,234,92,255,33,238,19,255,165,113,142,1,176,119,38,0,160,43,166,254,239,91,105,0,107,61,194,1,25,4,68,0,15,139,51,0,164,132,106,255,34,116,46,254,168,95,197,0,137,212,23,0,72,156,58,0,137,112,69,254,150,105,154,255,236,201,157,0,23,212,154,255,136,82,227,254,226,59,221,255,95,149,192,0,81,118,52,255,33,43,215,1,14,147,75,255,89,156,121,254,14,18,79,0,147,208,139,1,151,218,62,255,156,88,8,1,210,184,98,255,20,175,123,255,102,83,229,0,220,65,116,1,150,250,4,255,92,142,220,255,34,247,66,255,204,225,179,254,151,81,151,0,71,40,236,255,138,63,62,0,6,79,240,255,183,185,181,0,118,50,27,0,63,227,192,0,123,99,58,1,50,224,155,255,17,225,223,254,220,224,77,255,14,44,123,1,141,128,175,0,248,212,200,0,150,59,183,255,147,97,29,0,150,204,181,0,253,37,71,0,145,85,119,0,154,200,186,0,2,128,249,255,83,24,124,0,14,87,143,0,168,51,245,1,124,151,231,255,208,240,197,1,124,190,185,0,48,58,246,0,20,233,232,0,125,18,98,255,13,254,31,255,245,177,130,255,108,142,35,0,171,125,242,254,140,12,34,255,165,161,162,0,206,205,101,0,247,25,34,1,100,145,57,0,39,70,57,0,118,204,203,255,242,0,162,0,165,244,30,0,198,116,226,0,128,111,153,255,140,54,182,1,60,122,15,255,155,58,57,1,54,50,198,0,171,211,29,255,107,138,167,255,173,107,199,255,109,161,193,0,89,72,242,255,206,115,89,255,250,254,142,254,177,202,94,255,81,89,50,0,7,105,66,255,25,254,255,254,203,64,23,255,79,222,108,255,39,249,75,0,241,124,50,0,239,152,133,0,221,241,105,0,147,151,98,0,213,161,121,254,242,49,137,0,233,37,249,254,42,183,27,0,184,119,230,255,217,32,163,255,208,251,228,1,137,62,131,255,79,64,9,254,94,48,113,0,17,138,50,254,193,255,22,0,247,18,197,1,67,55,104,0,16,205,95,255,48,37,66,0,55,156,63,1,64,82,74,255,200,53,71,254,239,67,125,0,26,224,222,0,223,137,93,255,30,224,202,255,9,220,132,0,198,38,235,1,102,141,86,0,60,43,81,1,136,28,26,0,233,36,8,254,207,242,148,0,164,162,63,0,51,46,224,255,114,48,79,255,9,175,226,0,222,3,193,255,47,160,232,255,255,93,105,254,14,42,230,0,26,138,82,1,208,43,244,0,27,39,38,255,98,208,127,255,64,149,182,255,5,250,209,0,187,60,28,254,49,25,218,255,169,116,205,255,119,18,120,0,156,116,147,255,132,53,109,255,13,10,202,0,110,83,167,0,157,219,137,255,6,3,130,255,50,167,30,255,60,159,47,255,129,128,157,254,94,3,189,0,3,166,68,0,83,223,215,0,150,90,194,1,15,168,65,0,227,83,51,255,205,171,66,255,54,187,60,1,152,102,45,255,119,154,225,0,240,247,136,0,100,197,178,255,139,71,223,255,204,82,16,1,41,206,42,255,156,192,221,255,216,123,244,255,218,218,185,255,187,186,239,255,252,172,160,255,195,52,22,0,144,174,181,254,187,100,115,255,211,78,176,255,27,7,193,0,147,213,104,255,90,201,10,255,80,123,66,1,22,33,186,0,1,7,99,254,30,206,10,0,229,234,5,0,53,30,210,0,138,8,220,254,71,55,167,0,72,225,86,1,118,190,188,0,254,193,101,1,171,249,172,255,94,158,183,254,93,2,108,255,176,93,76,255,73,99,79,255,74,64,129,254,246,46,65,0,99,241,127,254,246,151,102,255,44,53,208,254,59,102,234,0,154,175,164,255,88,242,32,0,111,38,1,0,255,182,190,255,115,176,15,254,169,60,129,0,122,237,241,0,90,76,63,0,62,74,120,255,122,195,110,0,119,4,178,0,222,242,210,0,130,33,46,254,156,40,41,0,167,146,112,1,49,163,111,255,121,176,235,0,76,207,14,255,3,25,198,1,41,235,213,0,85,36,214,1,49,92,109,255,200,24,30,254,168,236,195,0,145,39,124,1,236,195,149,0,90,36,184,255,67,85,170,255,38,35,26,254,131,124,68,255,239,155,35,255,54,201,164,0,196,22,117,255,49,15,205,0,24,224,29,1,126,113,144,0,117,21,182,0,203,159,141,0,223,135,77,0,176,230,176,255,190,229,215,255,99,37,181,255,51,21,138,255,25,189,89,255,49,48,165,254,152,45,247,0,170,108,222,0,80,202,5,0,27,69,103,254,204,22,129,255,180,252,62,254,210,1,91,255,146,110,254,255,219,162,28,0,223,252,213,1,59,8,33,0,206,16,244,0,129,211,48,0,107,160,208,0,112,59,209,0,109,77,216,254,34,21,185,255,246,99,56,255,179,139,19,255,185,29,50,255,84,89,19,0,74,250,98,255,225,42,200,255,192,217,205,255,210,16,167,0,99,132,95,1,43,230,57,0,254,11,203,255,99,188,63,255,119,193,251,254,80,105,54,0,232,181,189,1,183,69,112,255,208,171,165,255,47,109,180,255,123,83,165,0,146,162,52,255,154,11,4,255,151,227,90,255,146,137,97,254,61,233,41,255,94,42,55,255,108,164,236,0,152,68,254,0,10,140,131,255,10,106,79,254,243,158,137,0,67,178,66,254,177,123,198,255,15,62,34,0,197,88,42,255,149,95,177,255,152,0,198,255,149,254,113,255,225,90,163,255,125,217,247,0,18,17,224,0,128,66,120,254,192,25,9,255,50,221,205,0,49,212,70,0,233,255,164,0,2,209,9,0,221,52,219,254,172,224,244,255,94,56,206,1,242,179,2,255,31,91,164,1,230,46,138,255,189,230,220,0,57,47,61,255,111,11,157,0,177,91,152,0,28,230,98,0,97,87,126,0,198,89,145,255,167,79,107,0,249,77,160,1,29,233,230,255,150,21,86,254,60,11,193,0,151,37,36,254,185,150,243,255,228,212,83,1,172,151,180,0,201,169,155,0,244,60,234,0,142,235,4,1,67,218,60,0,192,113,75,1,116,243,207,255,65,172,155,0,81,30,156,255,80,72,33,254,18,231,109,255,142,107,21,254,125,26,132,255,176,16,59,255,150,201,58,0,206,169,201,0,208,121,226,0,40,172,14,255,150,61,94,255,56,57,156,255,141,60,145,255,45,108,149,255,238,145,155,255,209,85,31,254,192,12,210,0,99,98,93,254,152,16,151,0,225,185,220,0,141,235,44,255,160,172,21,254,71,26,31,255,13,64,93,254,28,56,198,0,177,62,248,1,182,8,241,0,166,101,148,255,78,81,133,255,129,222,215,1,188,169,129,255,232,7,97,0,49,112,60,255,217,229,251,0,119,108,138,0,39,19,123,254,131,49,235,0,132,84,145,0,130,230,148,255,25,74,187,0,5,245,54,255,185,219,241,1,18,194,228,255,241,202,102,0,105,113,202,0,155,235,79,0,21,9,178,255,156,1,239,0,200,148,61,0,115,247,210,255,49,221,135,0,58,189,8,1,35,46,9,0,81,65,5,255,52,158,185,255,125,116,46,255,74,140,13,255,210,92,172,254,147,23,71,0,217,224,253,254,115,108,180,255,145,58,48,254,219,177,24,255,156,255,60,1,154,147,242,0,253,134,87,0,53,75,229,0,48,195,222,255,31,175,50,255,156,210,120,255,208,35,222,255,18,248,179,1,2,10,101,255,157,194,248,255,158,204,101,255,104,254,197,255,79,62,4,0,178,172,101,1,96,146,251,255,65,10,156,0,2,137,165,255,116,4,231,0,242,215,1,0,19,35,29,255,43,161,79,0,59,149,246,1,251,66,176,0,200,33,3,255,80,110,142,255,195,161,17,1,228,56,66,255,123,47,145,254,132,4,164,0,67,174,172,0,25,253,114,0,87,97,87,1,250,220,84,0,96,91,200,255,37,125,59,0,19,65,118,0,161,52,241,255,237,172,6,255,176,191,255,255,1,65,130,254,223,190,230,0,101,253,231,255,146,35,109,0,250,29,77,1,49,0,19,0,123,90,155,1,22,86,32,255,218,213,65,0,111,93,127,0,60,93,169,255,8,127,182,0,17,186,14,254,253,137,246,255,213,25,48,254,76,238,0,255,248,92,70,255,99,224,139,0,184,9,255,1,7,164,208,0,205,131,198,1,87,214,199,0,130,214,95,0,221,149,222,0,23,38,171,254,197,110,213,0,43,115,140,254,215,177,118,0,96,52,66,1,117,158,237,0,14,64,182,255,46,63,174,255,158,95,190,255,225,205,177,255,43,5,142,255,172,99,212,255,244,187,147,0,29,51,153,255,228,116,24,254,30,101,207,0,19,246,150,255,134,231,5,0,125,134,226,1,77,65,98,0,236,130,33,255,5,110,62,0,69,108,127,255,7,113,22,0,145,20,83,254,194,161,231,255,131,181,60,0,217,209,177,255,229,148,212,254,3,131,184,0,117,177,187,1,28,14,31,255,176,102,80,0,50,84,151,255,125,31,54,255,21,157,133,255,19,179,139,1,224,232,26,0,34,117,170,255,167,252,171,255,73,141,206,254,129,250,35,0,72,79,236,1,220,229,20,255,41,202,173,255,99,76,238,255,198,22,224,255,108,198,195,255,36,141,96,1,236,158,59,255,106,100,87,0,110,226,2,0,227,234,222,0,154,93,119,255,74,112,164,255,67,91,2,255,21,145,33,255,102,214,137,255,175,230,103,254,163,246,166,0,93,247,116,254,167,224,28,255,220,2,57,1,171,206,84,0,123,228,17,255,27,120,119,0,119,11,147,1,180,47,225,255,104,200,185,254,165,2,114,0,77,78,212,0,45,154,177,255,24,196,121,254,82,157,182,0,90,16,190,1,12,147,197,0,95,239,152,255,11,235,71,0,86,146,119,255,172,134,214,0,60,131,196,0,161,225,129,0,31,130,120,254,95,200,51,0,105,231,210,255,58,9,148,255,43,168,221,255,124,237,142,0,198,211,50,254,46,245,103,0,164,248,84,0,152,70,208,255,180,117,177,0,70,79,185,0,243,74,32,0,149,156,207,0,197,196,161,1,245,53,239,0,15,93,246,254,139,240,49,255,196,88,36,255,162,38,123,0,128,200,157,1,174,76,103,255,173,169,34,254,216,1,171,255,114,51,17,0,136,228,194,0,110,150,56,254,106,246,159,0,19,184,79,255,150,77,240,255,155,80,162,0,0,53,169,255,29,151,86,0,68,94,16,0,92,7,110,254,98,117,149,255,249,77,230,255,253,10,140,0,214,124,92,254,35,118,235,0,89,48,57,1,22,53,166,0,184,144,61,255,179,255,194,0,214,248,61,254,59,110,246,0,121,21,81,254,166,3,228,0,106,64,26,255,69,232,134,255,242,220,53,254,46,220,85,0,113,149,247,255,97,179,103,255,190,127,11,0,135,209,182,0,95,52,129,1,170,144,206,255,122,200,204,255,168,100,146,0,60,144,149,254,70,60,40,0,122,52,177,255,246,211,101,255,174,237,8,0,7,51,120,0,19,31,173,0,126,239,156,255,143,189,203,0,196,128,88,255,233,133,226,255,30,125,173,255,201,108,50,0,123,100,59,255,254,163,3,1,221,148,181,255,214,136,57,254,222,180,137,255,207,88,54,255,28,33,251,255,67,214,52,1,210,208,100,0,81,170,94,0,145,40,53,0,224,111,231,254,35,28,244,255,226,199,195,254,238,17,230,0,217,217,164,254,169,157,221,0,218,46,162,1,199,207,163,255,108,115,162,1,14,96,187,255,118,60,76,0,184,159,152,0,209,231,71,254,42,164,186,255,186,153,51,254,221,171,182,255,162,142,173,0,235,47,193,0,7,139,16,1,95,164,64,255,16,221,166,0,219,197,16,0,132,29,44,255,100,69,117,255,60,235,88,254,40,81,173,0,71,190,61,255,187,88,157,0,231,11,23,0,237,117,164,0,225,168,223,255,154,114,116,255,163,152,242,1,24,32,170,0,125,98,113,254,168,19,76,0,17,157,220,254,155,52,5,0,19,111,161,255,71,90,252,255,173,110,240,0,10,198,121,255,253,255,240,255,66,123,210,0,221,194,215,254,121,163,17,255,225,7,99,0,190,49,182,0,115,9,133,1,232,26,138,255,213,68,132,0,44,119,122,255,179,98,51,0,149,90,106,0,71,50,230,255,10,153,118,255,177,70,25,0,165,87,205,0,55,138,234,0,238,30,97,0,113,155,207,0,98,153,127,0,34,107,219,254,117,114,172,255,76,180,255,254,242,57,179,255,221,34,172,254,56,162,49,255,83,3,255,255,113,221,189,255,188,25,228,254,16,88,89,255,71,28,198,254,22,17,149,255,243,121,254,255,107,202,99,255,9,206,14,1,220,47,153,0,107,137,39,1,97,49,194,255,149,51,197,254,186,58,11,255,107,43,232,1,200,6,14,255,181,133,65,254,221,228,171,255,123,62,231,1,227,234,179,255,34,189,212,254,244,187,249,0,190,13,80,1,130,89,1,0,223,133,173,0,9,222,198,255,66,127,74,0,167,216,93,255,155,168,198,1,66,145,0,0,68,102,46,1,172,90,154,0,216,128,75,255,160,40,51,0,158,17,27,1,124,240,49,0,236,202,176,255,151,124,192,255,38,193,190,0,95,182,61,0,163,147,124,255,255,165,51,255,28,40,17,254,215,96,78,0,86,145,218,254,31,36,202,255,86,9,5,0,111,41,200,255,237,108,97,0,57,62,44,0,117,184,15,1,45,241,116,0,152,1,220,255,157,165,188,0,250,15,131,1,60,44,125,255,65,220,251,255,75,50,184,0,53,90,128,255,231,80,194,255,136,129,127,1,21,18,187,255,45,58,161,255,71,147,34,0,174,249,11,254,35,141,29,0,239,68,177,255,115,110,58,0,238,190,177,1,87,245,166,255,190,49,247,255,146,83,184,255,173,14,39,255,146,215,104,0,142,223,120,0,149,200,155,255,212,207,145,1,16,181,217,0,173,32,87,255,255,35,181,0,119,223,161,1,200,223,94,255,70,6,186,255,192,67,85,255,50,169,152,0,144,26,123,255,56,243,179,254,20,68,136,0,39,140,188,254,253,208,5,255,200,115,135,1,43,172,229,255,156,104,187,0,151,251,167,0,52,135,23,0,151,153,72,0,147,197,107,254,148,158,5,255,238,143,206,0,126,153,137,255,88,152,197,254,7,68,167,0,252,159,165,255,239,78,54,255,24,63,55,255,38,222,94,0,237,183,12,255,206,204,210,0,19,39,246,254,30,74,231,0,135,108,29,1,179,115,0,0,117,118,116,1,132,6,252,255,145,129,161,1,105,67,141,0,82,37,226,255,238,226,228,255,204,214,129,254,162,123,100,255,185,121,234,0,45,108,231,0,66,8,56,255,132,136,128,0,172,224,66,254,175,157,188,0,230,223,226,254,242,219,69,0,184,14,119,1,82,162,56,0,114,123,20,0,162,103,85,255,49,239,99,254,156,135,215,0,111,255,167,254,39,196,214,0,144,38,79,1,249,168,125,0,155,97,156,255,23,52,219,255,150,22,144,0,44,149,165,255,40,127,183,0,196,77,233,255,118,129,210,255,170,135,230,255,214,119,198,0,233,240,35,0,253,52,7,255,117,102,48,255,21,204,154,255,179,136,177,255,23,2,3,1,149,130,89,255,252,17,159,1,70,60,26,0,144,107,17,0,180,190,60,255,56,182,59,255,110,71,54,255,198,18,129,255,149,224,87,255,223,21,152,255,138,22,182,255,250,156,205,0,236,45,208,255,79,148,242,1,101,70,209,0,103,78,174,0,101,144,172,255,152,136,237,1,191,194,136,0,113,80,125,1,152,4,141,0,155,150,53,255,196,116,245,0,239,114,73,254,19,82,17,255,124,125,234,255,40,52,191,0,42,210,158,255,155,132,165,0,178,5,42,1,64,92,40,255,36,85,77,255,178,228,118,0,137,66,96,254,115,226,66,0,110,240,69,254,151,111,80,0,167,174,236,255,227,108,107,255,188,242,65,255,183,81,255,0,57,206,181,255,47,34,181,255,213,240,158,1,71,75,95,0,156,40,24,255,102,210,81,0,171,199,228,255,154,34,41,0,227,175,75,0,21,239,195,0,138,229,95,1,76,192,49,0,117,123,87,1,227,225,130,0,125,62,63,255,2,198,171,0,254,36,13,254,145,186,206,0,148,255,244,255,35,0,166,0,30,150,219,1,92,228,212,0,92,198,60,254,62,133,200,255,201,41,59,0,125,238,109,255,180,163,238,1,140,122,82,0,9,22,88,255,197,157,47,255,153,94,57,0,88,30,182,0,84,161,85,0,178,146,124,0,166,166,7,255,21,208,223,0,156,182,242,0,155,121,185,0,83,156,174,254,154,16,118,255,186,83,232,1,223,58,121,255,29,23,88,0,35,125,127,255,170,5,149,254,164,12,130,255,155,196,29,0,161,96,136,0,7,35,29,1,162,37,251,0,3,46,242,255,0,217,188,0,57,174,226,1,206,233,2,0,57,187,136,254,123,189,9,255,201,117,127,255,186,36,204,0,231,25,216,0,80,78,105,0,19,134,129,255,148,203,68,0,141,81,125,254,248,165,200,255,214,144,135,0,151,55,166,255,38,235,91,0,21,46,154,0,223,254,150,255,35,153,180,255,125,176,29,1,43,98,30,255,216,122,230,255,233,160,12,0,57,185,12,254,240,113,7,255,5,9,16,254,26,91,108,0,109,198,203,0,8,147,40,0,129,134,228,255,124,186,40,255,114,98,132,254,166,132,23,0,99,69,44,0,9,242,238,255,184,53,59,0,132,129,102,255,52,32,243,254,147,223,200,255,123,83,179,254,135,144,201,255,141,37,56,1,151,60,227,255,90,73,156,1,203,172,187,0,80,151,47,255,94,137,231,255,36,191,59,255,225,209,181,255,74,215,213,254,6,118,179,255,153,54,193,1,50,0,231,0,104,157,72,1,140,227,154,255,182,226,16,254,96,225,92,255,115,20,170,254,6,250,78,0,248,75,173,255,53,89,6,255,0,180,118,0,72,173,1,0,64,8,206,1,174,133,223,0,185,62,133,255,214,11,98,0,197,31,208,0,171,167,244,255,22,231,181,1,150,218,185,0,247,169,97,1,165,139,247,255,47,120,149,1,103,248,51,0,60,69,28,254,25,179,196,0,124,7,218,254,58,107,81,0,184,233,156,255,252,74,36,0,118,188,67,0,141,95,53,255,222,94,165,254,46,61,53,0,206,59,115,255,47,236,250,255,74,5,32,1,129,154,238,255,106,32,226,0,121,187,61,255,3,166,241,254,67,170,172,255,29,216,178,255,23,201,252,0,253,110,243,0,200,125,57,0,109,192,96,255,52,115,238,0,38,121,243,255,201,56,33,0,194,118,130,0,75,96,25,255,170,30,230,254,39,63,253,0,36,45,250,255,251,1,239,0,160,212,92,1,45,209,237,0,243,33,87,254,237,84,201,255,212,18,157,254,212,99,127,255,217,98,16,254,139,172,239,0,168,201,130,255,143,193,169,255,238,151,193,1,215,104,41,0,239,61,165,254,2,3,242,0,22,203,177,254,177,204,22,0,149,129,213,254,31,11,41,255,0,159,121,254,160,25,114,255,162,80,200,0,157,151,11,0,154,134,78,1,216,54,252,0,48,103,133,0,105,220,197,0,253,168,77,254,53,179,23,0,24,121,240,1,255,46,96,255,107,60,135,254,98,205,249,255,63,249,119,255,120,59,211,255,114,180,55,254,91,85,237,0,149,212,77,1,56,73,49,0,86,198,150,0,93,209,160,0,69,205,182,255,244,90,43,0,20,36,176,0,122,116,221,0,51,167,39,1,231,1,63,255,13,197,134,0,3,209,34,255,135,59,202,0,167,100,78,0,47,223,76,0,185,60,62,0,178,166,123,1,132,12,161,255,61,174,43,0,195,69,144,0,127,47,191,1,34,44,78,0,57,234,52,1,255,22,40,255,246,94,146,0,83,228,128,0,60,78,224,255,0,96,210,255,153,175,236,0,159,21,73,0,180,115,196,254,131,225,106,0,255,167,134,0,159,8,112,255,120,68,194,255,176,196,198,255,118,48,168,255,93,169,1,0,112,200,102,1,74,24,254,0,19,141,4,254,142,62,63,0,131,179,187,255,77,156,155,255,119,86,164,0,170,208,146,255,208,133,154,255,148,155,58,255,162,120,232,254,252,213,155,0,241,13,42,0,94,50,131,0,179,170,112,0,140,83,151,255,55,119,84,1,140,35,239,255,153,45,67,1,236,175,39,0,54,151,103,255,158,42,65,255,196,239,135,254,86,53,203,0,149,97,47,254,216,35,17,255,70,3,70,1,103,36,90,255,40,26,173,0,184,48,13,0,163,219,217,255,81,6,1,255,221,170,108,254,233,208,93,0,100,201,249,254,86,36,35,255,209,154,30,1,227,201,251,255,2,189,167,254,100,57,3,0,13,128,41,0,197,100,75,0,150,204,235,255,145,174,59,0,120,248,149,255,85,55,225,0,114,210,53,254,199,204,119,0,14,247,74,1,63,251,129,0,67,104,151,1,135,130,80,0,79,89,55,255,117,230,157,255,25,96,143,0,213,145,5,0,69,241,120,1,149,243,95,255,114,42,20,0,131,72,2,0,154,53,20,255,73,62,109,0,196,102,152,0,41,12,204,255,122,38,11,1,250,10,145,0,207,125,148,0,246,244,222,255,41,32,85,1,112,213,126,0,162,249,86,1,71,198,127,255,81,9,21,1,98,39,4,255,204,71,45,1,75,111,137,0,234,59,231,0,32,48,95,255,204,31,114,1,29,196,181,255,51,241,167,254,93,109,142,0,104,144,45,0,235,12,181,255,52,112,164,0,76,254,202,255,174,14,162,0,61,235,147,255,43,64,185,254,233,125,217,0,243,88,167,254,74,49,8,0,156,204,66,0,124,214,123,0,38,221,118,1,146,112,236,0,114,98,177,0,151,89,199,0,87,197,112,0,185,149,161,0,44,96,165,0,248,179,20,255,188,219,216,254,40,62,13,0,243,142,141,0,229,227,206,255,172,202,35,255,117,176,225,255,82,110,38,1,42,245,14,255,20,83,97,0,49,171,10,0,242,119,120,0,25,232,61,0,212,240,147,255,4,115,56,255,145,17,239,254,202,17,251,255,249,18,245,255,99,117,239,0,184,4,179,255,246,237,51,255,37,239,137,255,166,112,166,255,81,188,33,255,185,250,142,255,54,187,173,0,208,112,201,0,246,43,228,1,104,184,88,255,212,52,196,255,51,117,108,255,254,117,155,0,46,91,15,255,87,14,144,255,87,227,204,0,83,26,83,1,159,76,227,0,159,27,213,1,24,151,108,0,117,144,179,254,137,209,82,0,38,159,10,0,115,133,201,0,223,182,156,1,110,196,93,255,57,60,233,0,5,167,105,255,154,197,164,0,96,34,186,255,147,133,37,1,220,99,190,0,1,167,84,255,20,145,171,0,194,197,251,254,95,78,133,255,252,248,243,255,225,93,131,255,187,134,196,255,216,153,170,0,20,118,158,254,140,1,118,0,86,158,15,1,45,211,41,255,147,1,100,254,113,116,76,255,211,127,108,1,103,15,48,0,193,16,102,1,69,51,95,255,107,128,157,0,137,171,233,0,90,124,144,1,106,161,182,0,175,76,236,1,200,141,172,255,163,58,104,0,233,180,52,255,240,253,14,255,162,113,254,255,38,239,138,254,52,46,166,0,241,101,33,254,131,186,156,0,111,208,62,255,124,94,160,255,31,172,254,0,112,174,56,255,188,99,27,255,67,138,251,0,125,58,128,1,156,152,174,255,178,12,247,255,252,84,158,0,82,197,14,254,172,200,83,255,37,39,46,1,106,207,167,0,24,189,34,0,131,178,144,0,206,213,4,0,161,226,210,0,72,51,105,255,97,45,187,255,78,184,223,255,176,29,251,0,79,160,86,255,116,37,178,0,82,77,213,1,82,84,141,255,226,101,212,1,175,88,199,255,245,94,247,1,172,118,109,255,166,185,190,0,131,181,120,0,87,254,93,255,134,240,73,255,32,245,143,255,139,162,103,255,179,98,18,254,217,204,112,0,147,223,120,255,53,10,243,0,166,140,150,0,125,80,200,255,14,109,219,255,91,218,1,255,252,252,47,254,109,156,116,255,115,49,127,1,204,87,211,255,148,202,217,255,26,85,249,255,14,245,134,1,76,89,169,255,242,45,230,0,59,98,172,255,114,73,132,254,78,155,49,255,158,126,84,0,49,175,43,255,16,182,84,255,157,103,35,0,104,193,109,255,67,221,154,0,201,172,1,254,8,162,88,0,165,1,29,255,125,155,229,255,30,154,220,1,103,239,92,0,220,1,109,255,202,198,1,0,94,2,142,1,36,54,44,0,235,226,158,255,170,251,214,255,185,77,9,0,97,74,242,0,219,163,149,255,240,35,118,255,223,114,88,254,192,199,3,0,106,37,24,255,201,161,118,255,97,89,99,1,224,58,103,255,101,199,147,254,222,60,99,0,234,25,59,1,52,135,27,0,102,3,91,254,168,216,235,0,229,232,136,0,104,60,129,0,46,168,238,0,39,191,67,0,75,163,47,0,143,97,98,255,56,216,168,1,168,233,252,255,35,111,22,255,92,84,43,0,26,200,87,1,91,253,152,0,202,56,70,0,142,8,77,0,80,10,175,1,252,199,76,0,22,110,82,255,129,1,194,0,11,128,61,1,87,14,145,255,253,222,190,1,15,72,174,0,85,163,86,254,58,99,44,255,45,24,188,254,26,205,15,0,19,229,210,254,248,67,195,0,99,71,184,0,154,199,37,255,151,243,121,255,38,51,75,255,201,85,130,254,44,65,250,0,57,147,243,254,146,43,59,255,89,28,53,0,33,84,24,255,179,51,18,254,189,70,83,0,11,156,179,1,98,134,119,0,158,111,111,0,119,154,73,255,200,63,140,254,45,13,13,255,154,192,2,254,81,72,42,0,46,160,185,254,44,112,6,0,146,215,149,1,26,176,104,0,68,28,87,1,236,50,153,255,179,128,250,254,206,193,191,255,166,92,137,254,53,40,239,0,210,1,204,254,168,173,35,0,141,243,45,1,36,50,109,255,15,242,194,255,227,159,122,255,176,175,202,254,70,57,72,0,40,223,56,0,208,162,58,255,183,98,93,0,15,111,12,0,30,8,76,255,132,127,246,255,45,242,103,0,69,181,15,255,10,209,30,0,3,179,121,0,241,232,218,1,123,199,88,255,2,210,202,1,188,130,81,255,94,101,208,1,103,36,45,0,76,193,24,1,95,26,241,255,165,162,187,0,36,114,140,0,202,66,5,255,37,56,147,0,152,11,243,1,127,85,232,255,250,135,212,1,185,177,113,0,90,220,75,255,69,248,146,0,50,111,50,0,92,22,80,0,244,36,115,254,163,100,82,255,25,193,6,1,127,61,36,0,253,67,30,254,65,236,170,255,161,17,215,254,63,175,140,0,55,127,4,0,79,112,233,0,109,160,40,0,143,83,7,255,65,26,238,255,217,169,140,255,78,94,189,255,0,147,190,255,147,71,186,254,106,77,127,255,233,157,233,1,135,87,237,255,208,13,236,1,155,109,36,255,180,100,218,0,180,163,18,0,190,110,9,1,17,63,123,255,179,136,180,255,165,123,123,255,144,188,81,254,71,240,108,255,25,112,11,255,227,218,51,255,167,50,234,255,114,79,108,255,31,19,115,255,183,240,99,0,227,87,143,255,72,217,248,255,102,169,95,1,129,149,149,0,238,133,12,1,227,204,35,0,208,115,26,1,102,8,234,0,112,88,143,1,144,249,14,0,240,158,172,254,100,112,119,0,194,141,153,254,40,56,83,255,121,176,46,0,42,53,76,255,158,191,154,0,91,209,92,0,173,13,16,1,5,72,226,255,204,254,149,0,80,184,207,0,100,9,122,254,118,101,171,255,252,203,0,254,160,207,54,0,56,72,249,1,56,140,13,255,10,64,107,254,91,101,52,255,225,181,248,1,139,255,132,0,230,145,17,0,233,56,23,0,119,1,241,255,213,169,151,255,99,99,9,254,185,15,191,255,173,103,109,1,174,13,251,255,178,88,7,254,27,59,68,255,10,33,2,255,248,97,59,0,26,30,146,1,176,147,10,0,95,121,207,1,188,88,24,0,185,94,254,254,115,55,201,0,24,50,70,0,120,53,6,0,142,66,146,0,228,226,249,255,104,192,222,1,173,68,219,0,162,184,36,255,143,102,137,255,157,11,23,0,125,45,98,0,235,93,225,254,56,112,160,255,70,116,243,1,153,249,55,255,129,39,17,1,241,80,244,0,87,69,21,1,94,228,73,255,78,66,65,255,194,227,231,0,61,146,87,255,173,155,23,255,112,116,219,254,216,38,11,255,131,186,133,0,94,212,187,0,100,47,91,0,204,254,175,255,222,18,215,254,173,68,108,255,227,228,79,255,38,221,213,0,163,227,150,254,31,190,18,0,160,179,11,1,10,90,94,255,220,174,88,0,163,211,229,255,199,136,52,0,130,95,221,255,140,188,231,254,139,113,128,255,117,171,236,254,49,220,20,255,59,20,171,255,228,109,188,0,20,225,32,254,195,16,174,0,227,254,136,1,135,39,105,0,150,77,206,255,210,238,226,0,55,212,132,254,239,57,124,0,170,194,93,255,249,16,247,255,24,151,62,255,10,151,10,0,79,139,178,255,120,242,202,0,26,219,213,0,62,125,35,255,144,2,108,255,230,33,83,255,81,45,216,1,224,62,17,0,214,217,125,0,98,153,153,255], "i8", ALLOC_NONE, Runtime.GLOBAL_BASE+10240);
-/* memory initializer */ allocate([179,176,106,254,131,93,138,255,109,62,36,255,178,121,32,255,120,252,70,0,220,248,37,0,204,88,103,1,128,220,251,255,236,227,7,1,106,49,198,255,60,56,107,0,99,114,238,0,220,204,94,1,73,187,1,0,89,154,34,0,78,217,165,255,14,195,249,255,9,230,253,255,205,135,245,0,26,252,7,255,84,205,27,1,134,2,112,0,37,158,32,0,231,91,237,255,191,170,204,255,152,7,222,0,109,192,49,0,193,166,146,255,232,19,181,255,105,142,52,255,103,16,27,1,253,200,165,0,195,217,4,255,52,189,144,255,123,155,160,254,87,130,54,255,78,120,61,255,14,56,41,0,25,41,125,255,87,168,245,0,214,165,70,0,212,169,6,255,219,211,194,254,72,93,164,255,197,33,103,255,43,142,141,0,131,225,172,0,244,105,28,0,68,68,225,0,136,84,13,255,130,57,40,254,139,77,56,0,84,150,53,0,54,95,157,0,144,13,177,254,95,115,186,0,117,23,118,255,244,166,241,255,11,186,135,0,178,106,203,255,97,218,93,0,43,253,45,0,164,152,4,0,139,118,239,0,96,1,24,254,235,153,211,255,168,110,20,255,50,239,176,0,114,41,232,0,193,250,53,0,254,160,111,254,136,122,41,255,97,108,67,0,215,152,23,255,140,209,212,0,42,189,163,0,202,42,50,255,106,106,189,255,190,68,217,255,233,58,117,0,229,220,243,1,197,3,4,0,37,120,54,254,4,156,134,255,36,61,171,254,165,136,100,255,212,232,14,0,90,174,10,0,216,198,65,255,12,3,64,0,116,113,115,255,248,103,8,0,231,125,18,255,160,28,197,0,30,184,35,1,223,73,249,255,123,20,46,254,135,56,37,255,173,13,229,1,119,161,34,255,245,61,73,0,205,125,112,0,137,104,134,0,217,246,30,255,237,142,143,0,65,159,102,255,108,164,190,0,219,117,173,255,34,37,120,254,200,69,80,0,31,124,218,254,74,27,160,255,186,154,199,255,71,199,252,0,104,81,159,1,17,200,39,0,211,61,192,1,26,238,91,0,148,217,12,0,59,91,213,255,11,81,183,255,129,230,122,255,114,203,145,1,119,180,66,255,72,138,180,0,224,149,106,0,119,82,104,255,208,140,43,0,98,9,182,255,205,101,134,255,18,101,38,0,95,197,166,255,203,241,147,0,62,208,145,255,133,246,251,0,2,169,14,0,13,247,184,0,142,7,254,0,36,200,23,255,88,205,223,0,91,129,52,255,21,186,30,0,143,228,210,1,247,234,248,255,230,69,31,254,176,186,135,255,238,205,52,1,139,79,43,0,17,176,217,254,32,243,67,0,242,111,233,0,44,35,9,255,227,114,81,1,4,71,12,255,38,105,191,0,7,117,50,255,81,79,16,0,63,68,65,255,157,36,110,255,77,241,3,255,226,45,251,1,142,25,206,0,120,123,209,1,28,254,238,255,5,128,126,255,91,222,215,255,162,15,191,0,86,240,73,0,135,185,81,254,44,241,163,0,212,219,210,255,112,162,155,0,207,101,118,0,168,72,56,255,196,5,52,0,72,172,242,255,126,22,157,255,146,96,59,255,162,121,152,254,140,16,95,0,195,254,200,254,82,150,162,0,119,43,145,254,204,172,78,255,166,224,159,0,104,19,237,255,245,126,208,255,226,59,213,0,117,217,197,0,152,72,237,0,220,31,23,254,14,90,231,255,188,212,64,1,60,101,246,255,85,24,86,0,1,177,109,0,146,83,32,1,75,182,192,0,119,241,224,0,185,237,27,255,184,101,82,1,235,37,77,255,253,134,19,0,232,246,122,0,60,106,179,0,195,11,12,0,109,66,235,1,125,113,59,0,61,40,164,0,175,104,240,0,2,47,187,255,50,12,141,0,194,139,181,255,135,250,104,0,97,92,222,255,217,149,201,255,203,241,118,255,79,151,67,0,122,142,218,255,149,245,239,0,138,42,200,254,80,37,97,255,124,112,167,255,36,138,87,255,130,29,147,255,241,87,78,255,204,97,19,1,177,209,22,255,247,227,127,254,99,119,83,255,212,25,198,1,16,179,179,0,145,77,172,254,89,153,14,255,218,189,167,0,107,233,59,255,35,33,243,254,44,112,112,255,161,127,79,1,204,175,10,0,40,21,138,254,104,116,228,0,199,95,137,255,133,190,168,255,146,165,234,1,183,99,39,0,183,220,54,254,255,222,133,0,162,219,121,254,63,239,6,0,225,102,54,255,251,18,246,0,4,34,129,1,135,36,131,0,206,50,59,1,15,97,183,0,171,216,135,255,101,152,43,255,150,251,91,0,38,145,95,0,34,204,38,254,178,140,83,255,25,129,243,255,76,144,37,0,106,36,26,254,118,144,172,255,68,186,229,255,107,161,213,255,46,163,68,255,149,170,253,0,187,17,15,0,218,160,165,255,171,35,246,1,96,13,19,0,165,203,117,0,214,107,192,255,244,123,177,1,100,3,104,0,178,242,97,255,251,76,130,255,211,77,42,1,250,79,70,255,63,244,80,1,105,101,246,0,61,136,58,1,238,91,213,0,14,59,98,255,167,84,77,0,17,132,46,254,57,175,197,255,185,62,184,0,76,64,207,0,172,175,208,254,175,74,37,0,138,27,211,254,148,125,194,0,10,89,81,0,168,203,101,255,43,213,209,1,235,245,54,0,30,35,226,255,9,126,70,0,226,125,94,254,156,117,20,255,57,248,112,1,230,48,64,255,164,92,166,1,224,214,230,255,36,120,143,0,55,8,43,255,251,1,245,1,106,98,165,0,74,107,106,254,53,4,54,255,90,178,150,1,3,120,123,255,244,5,89,1,114,250,61,255,254,153,82,1,77,15,17,0,57,238,90,1,95,223,230,0,236,52,47,254,103,148,164,255,121,207,36,1,18,16,185,255,75,20,74,0,187,11,101,0,46,48,129,255,22,239,210,255,77,236,129,255,111,77,204,255,61,72,97,255,199,217,251,255,42,215,204,0,133,145,201,255,57,230,146,1,235,100,198,0,146,73,35,254,108,198,20,255,182,79,210,255,82,103,136,0,246,108,176,0,34,17,60,255,19,74,114,254,168,170,78,255,157,239,20,255,149,41,168,0,58,121,28,0,79,179,134,255,231,121,135,255,174,209,98,255,243,122,190,0,171,166,205,0,212,116,48,0,29,108,66,255,162,222,182,1,14,119,21,0,213,39,249,255,254,223,228,255,183,165,198,0,133,190,48,0,124,208,109,255,119,175,85,255,9,209,121,1,48,171,189,255,195,71,134,1,136,219,51,255,182,91,141,254,49,159,72,0,35,118,245,255,112,186,227,255,59,137,31,0,137,44,163,0,114,103,60,254,8,213,150,0,162,10,113,255,194,104,72,0,220,131,116,255,178,79,92,0,203,250,213,254,93,193,189,255,130,255,34,254,212,188,151,0,136,17,20,255,20,101,83,255,212,206,166,0,229,238,73,255,151,74,3,255,168,87,215,0,155,188,133,255,166,129,73,0,240,79,133,255,178,211,81,255,203,72,163,254,193,168,165,0,14,164,199,254,30,255,204,0,65,72,91,1,166,74,102,255,200,42,0,255,194,113,227,255,66,23,208,0,229,216,100,255,24,239,26,0,10,233,62,255,123,10,178,1,26,36,174,255,119,219,199,1,45,163,190,0,16,168,42,0,166,57,198,255,28,26,26,0,126,165,231,0,251,108,100,255,61,229,121,255,58,118,138,0,76,207,17,0,13,34,112,254,89,16,168,0,37,208,105,255,35,201,215,255,40,106,101,254,6,239,114,0,40,103,226,254,246,127,110,255,63,167,58,0,132,240,142,0,5,158,88,255,129,73,158,255,94,89,146,0,230,54,146,0,8,45,173,0,79,169,1,0,115,186,247,0,84,64,131,0,67,224,253,255,207,189,64,0,154,28,81,1,45,184,54,255,87,212,224,255,0,96,73,255,129,33,235,1,52,66,80,255,251,174,155,255,4,179,37,0,234,164,93,254,93,175,253,0,198,69,87,255,224,106,46,0,99,29,210,0,62,188,114,255,44,234,8,0,169,175,247,255,23,109,137,255,229,182,39,0,192,165,94,254,245,101,217,0,191,88,96,0,196,94,99,255,106,238,11,254,53,126,243,0,94,1,101,255,46,147,2,0,201,124,124,255,141,12,218,0,13,166,157,1,48,251,237,255,155,250,124,255,106,148,146,255,182,13,202,0,28,61,167,0,217,152,8,254,220,130,45,255,200,230,255,1,55,65,87,255,93,191,97,254,114,251,14,0,32,105,92,1,26,207,141,0,24,207,13,254,21,50,48,255,186,148,116,255,211,43,225,0,37,34,162,254,164,210,42,255,68,23,96,255,182,214,8,255,245,117,137,255,66,195,50,0,75,12,83,254,80,140,164,0,9,165,36,1,228,110,227,0,241,17,90,1,25,52,212,0,6,223,12,255,139,243,57,0,12,113,75,1,246,183,191,255,213,191,69,255,230,15,142,0,1,195,196,255,138,171,47,255,64,63,106,1,16,169,214,255,207,174,56,1,88,73,133,255,182,133,140,0,177,14,25,255,147,184,53,255,10,227,161,255,120,216,244,255,73,77,233,0,157,238,139,1,59,65,233,0,70,251,216,1,41,184,153,255,32,203,112,0,146,147,253,0,87,101,109,1,44,82,133,255,244,150,53,255,94,152,232,255,59,93,39,255,88,147,220,255,78,81,13,1,32,47,252,255,160,19,114,255,93,107,39,255,118,16,211,1,185,119,209,255,227,219,127,254,88,105,236,255,162,110,23,255,36,166,110,255,91,236,221,255,66,234,116,0,111,19,244,254,10,233,26,0,32,183,6,254,2,191,242,0,218,156,53,254,41,60,70,255,168,236,111,0,121,185,126,255,238,142,207,255,55,126,52,0,220,129,208,254,80,204,164,255,67,23,144,254,218,40,108,255,127,202,164,0,203,33,3,255,2,158,0,0,37,96,188,255,192,49,74,0,109,4,0,0,111,167,10,254,91,218,135,255,203,66,173,255,150,194,226,0,201,253,6,255,174,102,121,0,205,191,110,0,53,194,4,0,81,40,45,254,35,102,143,255,12,108,198,255,16,27,232,255,252,71,186,1,176,110,114,0,142,3,117,1,113,77,142,0,19,156,197,1,92,47,252,0,53,232,22,1,54,18,235,0,46,35,189,255,236,212,129,0,2,96,208,254,200,238,199,255,59,175,164,255,146,43,231,0,194,217,52,255,3,223,12,0,138,54,178,254,85,235,207,0,232,207,34,0,49,52,50,255,166,113,89,255,10,45,216,255,62,173,28,0,111,165,246,0,118,115,91,255,128,84,60,0,167,144,203,0,87,13,243,0,22,30,228,1,177,113,146,255,129,170,230,254,252,153,129,255,145,225,43,0,70,231,5,255,122,105,126,254,86,246,148,255,110,37,154,254,209,3,91,0,68,145,62,0,228,16,165,255,55,221,249,254,178,210,91,0,83,146,226,254,69,146,186,0,93,210,104,254,16,25,173,0,231,186,38,0,189,122,140,255,251,13,112,255,105,110,93,0,251,72,170,0,192,23,223,255,24,3,202,1,225,93,228,0,153,147,199,254,109,170,22,0,248,101,246,255,178,124,12,255,178,254,102,254,55,4,65,0,125,214,180,0,183,96,147,0,45,117,23,254,132,191,249,0,143,176,203,254,136,183,54,255,146,234,177,0,146,101,86,255,44,123,143,1,33,209,152,0,192,90,41,254,83,15,125,255,213,172,82,0,215,169,144,0,16,13,34,0,32,209,100,255,84,18,249,1,197,17,236,255,217,186,230,0,49,160,176,255,111,118,97,255,237,104,235,0,79,59,92,254,69,249,11,255,35,172,74,1,19,118,68,0,222,124,165,255,180,66,35,255,86,174,246,0,43,74,111,255,126,144,86,255,228,234,91,0,242,213,24,254,69,44,235,255,220,180,35,0,8,248,7,255,102,47,92,255,240,205,102,255,113,230,171,1,31,185,201,255,194,246,70,255,122,17,187,0,134,70,199,255,149,3,150,255,117,63,103,0,65,104,123,255,212,54,19,1,6,141,88,0,83,134,243,255,136,53,103,0,169,27,180,0,177,49,24,0,111,54,167,0,195,61,215,255,31,1,108,1,60,42,70,0,185,3,162,255,194,149,40,255,246,127,38,254,190,119,38,255,61,119,8,1,96,161,219,255,42,203,221,1,177,242,164,255,245,159,10,0,116,196,0,0,5,93,205,254,128,127,179,0,125,237,246,255,149,162,217,255,87,37,20,254,140,238,192,0,9,9,193,0,97,1,226,0,29,38,10,0,0,136,63,255,229,72,210,254,38,134,92,255,78,218,208,1,104,36,84,255,12,5,193,255,242,175,61,255,191,169,46,1,179,147,147,255,113,190,139,254,125,172,31,0,3,75,252,254,215,36,15,0,193,27,24,1,255,69,149,255,110,129,118,0,203,93,249,0,138,137,64,254,38,70,6,0,153,116,222,0,161,74,123,0,193,99,79,255,118,59,94,255,61,12,43,1,146,177,157,0,46,147,191,0,16,255,38,0,11,51,31,1,60,58,98,255,111,194,77,1,154,91,244,0,140,40,144,1,173,10,251,0,203,209,50,254,108,130,78,0,228,180,90,0,174,7,250,0,31,174,60,0,41,171,30,0,116,99,82,255,118,193,139,255,187,173,198,254,218,111,56,0,185,123,216,0,249,158,52,0,52,180,93,255,201,9,91,255,56,45,166,254,132,155,203,255,58,232,110,0,52,211,89,255,253,0,162,1,9,87,183,0,145,136,44,1,94,122,245,0,85,188,171,1,147,92,198,0,0,8,104,0,30,95,174,0,221,230,52,1,247,247,235,255,137,174,53,255,35,21,204,255,71,227,214,1,232,82,194,0,11,48,227,255,170,73,184,255,198,251,252,254,44,112,34,0,131,101,131,255,72,168,187,0,132,135,125,255,138,104,97,255,238,184,168,255,243,104,84,255,135,216,226,255,139,144,237,0,188,137,150,1,80,56,140,255,86,169,167,255,194,78,25,255,220,17,180,255,17,13,193,0,117,137,212,255,141,224,151,0,49,244,175,0,193,99,175,255,19,99,154,1,255,65,62,255,156,210,55,255,242,244,3,255,250,14,149,0,158,88,217,255,157,207,134,254,251,232,28,0,46,156,251,255,171,56,184,255,239,51,234,0,142,138,131,255,25,254,243,1,10,201,194,0,63,97,75,0,210,239,162,0,192,200,31,1,117,214,243,0,24,71,222,254,54,40,232,255,76,183,111,254,144,14,87,255,214,79,136,255,216,196,212,0,132,27,140,254,131,5,253,0,124,108,19,255,28,215,75,0,76,222,55,254,233,182,63,0,68,171,191,254,52,111,222,255,10,105,77,255,80,170,235,0,143,24,88,255,45,231,121,0,148,129,224,1,61,246,84,0,253,46,219,255,239,76,33,0,49,148,18,254,230,37,69,0,67,134,22,254,142,155,94,0,31,157,211,254,213,42,30,255,4,228,247,254,252,176,13,255,39,0,31,254,241,244,255,255,170,45,10,254,253,222,249,0,222,114,132,0,255,47,6,255,180,163,179,1,84,94,151,255,89,209,82,254,229,52,169,255,213,236,0,1,214,56,228,255,135,119,151,255,112,201,193,0,83,160,53,254,6,151,66,0,18,162,17,0,233,97,91,0,131,5,78,1,181,120,53,255,117,95,63,255,237,117,185,0,191,126,136,255,144,119,233,0,183,57,97,1,47,201,187,255,167,165,119,1,45,100,126,0,21,98,6,254,145,150,95,255,120,54,152,0,209,98,104,0,143,111,30,254,184,148,249,0,235,216,46,0,248,202,148,255,57,95,22,0,242,225,163,0,233,247,232,255,71,171,19,255,103,244,49,255,84,103,93,255,68,121,244,1,82,224,13,0,41,79,43,255,249,206,167,255,215,52,21,254,192,32,22,255,247,111,60,0,101,74,38,255,22,91,84,254,29,28,13,255,198,231,215,254,244,154,200,0,223,137,237,0,211,132,14,0,95,64,206,255,17,62,247,255,233,131,121,1,93,23,77,0,205,204,52,254,81,189,136,0,180,219,138,1,143,18,94,0,204,43,140,254,188,175,219,0,111,98,143,255,151,63,162,255,211,50,71,254,19,146,53,0,146,45,83,254,178,82,238,255,16,133,84,255,226,198,93,255,201,97,20,255,120,118,35,255,114,50,231,255,162,229,156,255,211,26,12,0,114,39,115,255,206,212,134,0,197,217,160,255,116,129,94,254,199,215,219,255,75,223,249,1,253,116,181,255,232,215,104,255,228,130,246,255,185,117,86,0,14,5,8,0,239,29,61,1,237,87,133,255,125,146,137,254,204,168,223,0,46,168,245,0,154,105,22,0,220,212,161,255,107,69,24,255,137,218,181,255,241,84,198,255,130,122,211,255,141,8,153,255,190,177,118,0,96,89,178,0,255,16,48,254,122,96,105,255,117,54,232,255,34,126,105,255,204,67,166,0,232,52,138,255,211,147,12,0,25,54,7,0,44,15,215,254,51,236,45,0,190,68,129,1,106,147,225,0,28,93,45,254,236,141,15,255,17,61,161,0,220,115,192,0,236,145,24,254,111,168,169,0,224,58,63,255,127,164,188,0,82,234,75,1,224,158,134,0,209,68,110,1,217,166,217,0,70,225,166,1,187,193,143,255,16,7,88,255,10,205,140,0,117,192,156,1,17,56,38,0,27,124,108,1,171,215,55,255,95,253,212,0,155,135,168,255,246,178,153,254,154,68,74,0,232,61,96,254,105,132,59,0,33,76,199,1,189,176,130,255,9,104,25,254,75,198,102,255,233,1,112,0,108,220,20,255,114,230,70,0,140,194,133,255,57,158,164,254,146,6,80,255,169,196,97,1,85,183,130,0,70,158,222,1,59,237,234,255,96,25,26,255,232,175,97,255,11,121,248,254,88,35,194,0,219,180,252,254,74,8,227,0,195,227,73,1,184,110,161,255,49,233,164,1,128,53,47,0,82,14,121,255,193,190,58,0,48,174,117,255,132,23,32,0,40,10,134,1,22,51,25,255,240,11,176,255,110,57,146,0,117,143,239,1,157,101,118,255,54,84,76,0,205,184,18,255,47,4,72,255,78,112,85,255,193,50,66,1,93,16,52,255,8,105,134,0,12,109,72,255,58,156,251,0,144,35,204,0,44,160,117,254,50,107,194,0,1,68,165,255,111,110,162,0,158,83,40,254,76,214,234,0,58,216,205,255,171,96,147,255,40,227,114,1,176,227,241,0,70,249,183,1,136,84,139,255,60,122,247,254,143,9,117,255,177,174,137,254,73,247,143,0,236,185,126,255,62,25,247,255,45,64,56,255,161,244,6,0,34,57,56,1,105,202,83,0,128,147,208,0,6,103,10,255,74,138,65,255,97,80,100,255,214,174,33,255,50,134,74,255,110,151,130,254,111,84,172,0,84,199,75,254,248,59,112,255,8,216,178,1,9,183,95,0,238,27,8,254,170,205,220,0,195,229,135,0,98,76,237,255,226,91,26,1,82,219,39,255,225,190,199,1,217,200,121,255,81,179,8,255,140,65,206,0,178,207,87,254,250,252,46,255,104,89,110,1,253,189,158,255,144,214,158,255,160,245,54,255,53,183,92,1,21,200,194,255,146,33,113,1,209,1,255,0,235,106,43,255,167,52,232,0,157,229,221,0,51,30,25,0,250,221,27,1,65,147,87,255,79,123,196,0,65,196,223,255,76,44,17,1,85,241,68,0,202,183,249,255,65,212,212,255,9,33,154,1,71,59,80,0,175,194,59,255,141,72,9,0,100,160,244,0,230,208,56,0,59,25,75,254,80,194,194,0,18,3,200,254,160,159,115,0,132,143,247,1,111,93,57,255,58,237,11,1,134,222,135,255,122,163,108,1,123,43,190,255,251,189,206,254,80,182,72,255,208,246,224,1,17,60,9,0,161,207,38,0,141,109,91,0,216,15,211,255,136,78,110,0,98,163,104,255,21,80,121,255,173,178,183,1,127,143,4,0,104,60,82,254,214,16,13,255,96,238,33,1,158,148,230,255,127,129,62,255,51,255,210,255,62,141,236,254,157,55,224,255,114,39,244,0,192,188,250,255,228,76,53,0,98,84,81,255,173,203,61,254,147,50,55,255,204,235,191,0,52,197,244,0,88,43,211,254,27,191,119,0,188,231,154,0,66,81,161,0,92,193,160,1,250,227,120,0,123,55,226,0,184,17,72,0,133,168,10,254,22,135,156,255,41,25,103,255,48,202,58,0,186,149,81,255,188,134,239,0,235,181,189,254,217,139,188,255,74,48,82,0,46,218,229,0,189,253,251,0,50,229,12,255,211,141,191,1,128,244,25,255,169,231,122,254,86,47,189,255,132,183,23,255,37,178,150,255,51,137,253,0,200,78,31,0,22,105,50,0,130,60,0,0,132,163,91,254,23,231,187,0,192,79,239,0,157,102,164,255,192,82,20,1,24,181,103,255,240,9,234,0,1,123,164,255,133,233,0,255,202,242,242,0,60,186,245,0,241,16,199,255,224,116,158,254,191,125,91,255,224,86,207,0,121,37,231,255,227,9,198,255,15,153,239,255,121,232,217,254,75,112,82,0,95,12,57,254,51,214,105,255,148,220,97,1,199,98,36,0,156,209,12,254,10,212,52,0,217,180,55,254,212,170,232,255,216,20,84,255,157,250,135,0,157,99,127,254,1,206,41,0,149,36,70,1,54,196,201,255,87,116,0,254,235,171,150,0,27,163,234,0,202,135,180,0,208,95,0,254,123,156,93,0,183,62,75,0,137,235,182,0,204,225,255,255,214,139,210,255,2,115,8,255,29,12,111,0,52,156,1,0,253,21,251,255,37,165,31,254,12,130,211,0,106,18,53,254,42,99,154,0,14,217,61,254,216,11,92,255,200,197,112,254,147,38,199,0,36,252,120,254,107,169,77,0,1,123,159,255,207,75,102,0,163,175,196,0,44,1,240,0,120,186,176,254,13,98,76,255,237,124,241,255,232,146,188,255,200,96,224,0,204,31,41,0,208,200,13,0,21,225,96,255,175,156,196,0,247,208,126,0,62,184,244,254,2,171,81,0,85,115,158,0,54,64,45,255,19,138,114,0,135,71,205,0,227,47,147,1,218,231,66,0,253,209,28,0,244,15,173,255,6,15,118,254,16,150,208,255,185,22,50,255,86,112,207,255,75,113,215,1,63,146,43,255,4,225,19,254,227,23,62,255,14,255,214,254,45,8,205,255,87,197,151,254,210,82,215,255,245,248,247,255,128,248,70,0,225,247,87,0,90,120,70,0,213,245,92,0,13,133,226,0,47,181,5,1,92,163,105,255,6,30,133,254,232,178,61,255,230,149,24,255,18,49,158,0,228,100,61,254,116,243,251,255,77,75,92,1,81,219,147,255,76,163,254,254,141,213,246,0,232,37,152,254,97,44,100,0,201,37,50,1,212,244,57,0,174,171,183,255,249,74,112,0,166,156,30,0,222,221,97,255,243,93,73,254,251,101,100,255,216,217,93,255,254,138,187,255,142,190,52,255,59,203,177,255,200,94,52,0,115,114,158,255,165,152,104,1,126,99,226,255,118,157,244,1,107,200,16,0,193,90,229,0,121,6,88,0,156,32,93,254,125,241,211,255,14,237,157,255,165,154,21,255,184,224,22,255,250,24,152,255,113,77,31,0,247,171,23,255,237,177,204,255,52,137,145,255,194,182,114,0,224,234,149,0,10,111,103,1,201,129,4,0,238,142,78,0,52,6,40,255,110,213,165,254,60,207,253,0,62,215,69,0,96,97,0,255,49,45,202,0,120,121,22,255,235,139,48,1,198,45,34,255,182,50,27,1,131,210,91,255,46,54,128,0,175,123,105,255,198,141,78,254,67,244,239,255,245,54,103,254,78,38,242,255,2,92,249,254,251,174,87,255,139,63,144,0,24,108,27,255,34,102,18,1,34,22,152,0,66,229,118,254,50,143,99,0,144,169,149,1,118,30,152,0,178,8,121,1,8,159,18,0,90,101,230,255,129,29,119,0,68,36,11,1,232,183,55,0,23,255,96,255,161,41,193,255,63,139,222,0,15,179,243,0,255,100,15,255,82,53,135,0,137,57,149,1,99,240,170,255,22,230,228,254,49,180,82,255,61,82,43,0,110,245,217,0,199,125,61,0,46,253,52,0,141,197,219,0,211,159,193,0,55,121,105,254,183,20,129,0,169,119,170,255,203,178,139,255,135,40,182,255,172,13,202,255,65,178,148,0,8,207,43,0,122,53,127,1,74,161,48,0,227,214,128,254,86,11,243,255,100,86,7,1,245,68,134,255,61,43,21,1,152,84,94,255,190,60,250,254,239,118,232,255,214,136,37,1,113,76,107,255,93,104,100,1,144,206,23,255,110,150,154,1,228,103,185,0,218,49,50,254,135,77,139,255,185,1,78,0,0,161,148,255,97,29,233,255,207,148,149,255,160,168,0,0,91,128,171,255,6,28,19,254,11,111,247,0,39,187,150,255,138,232,149,0,117,62,68,255,63,216,188,255,235,234,32,254,29,57,160,255,25,12,241,1,169,60,191,0,32,131,141,255,237,159,123,255,94,197,94,254,116,254,3,255,92,179,97,254,121,97,92,255,170,112,14,0,21,149,248,0,248,227,3,0,80,96,109,0,75,192,74,1,12,90,226,255,161,106,68,1,208,114,127,255,114,42,255,254,74,26,74,255,247,179,150,254,121,140,60,0,147,70,200,255,214,40,161,255,161,188,201,255,141,65,135,255,242,115,252,0,62,47,202,0,180,149,255,254,130,55,237,0,165,17,186,255,10,169,194,0,156,109,218,255,112,140,123,255,104,128,223,254,177,142,108,255,121,37,219,255,128,77,18,255,111,108,23,1,91,192,75,0,174,245,22,255,4,236,62,255,43,64,153,1,227,173,254,0,237,122,132,1,127,89,186,255,142,82,128,254,252,84,174,0,90,179,177,1,243,214,87,255,103,60,162,255,208,130,14,255,11,130,139,0,206,129,219,255,94,217,157,255,239,230,230,255,116,115,159,254,164,107,95,0,51,218,2,1,216,125,198,255,140,202,128,254,11,95,68,255,55,9,93,254,174,153,6,255,204,172,96,0,69,160,110,0,213,38,49,254,27,80,213,0,118,125,114,0,70,70,67,255,15,142,73,255,131,122,185,255,243,20,50,254,130,237,40,0,210,159,140,1,197,151,65,255,84,153,66,0,195,126,90,0,16,238,236,1,118,187,102,255,3,24,133,255,187,69,230,0,56,197,92,1,213,69,94,255,80,138,229,1,206,7,230,0,222,111,230,1,91,233,119,255,9,89,7,1,2,98,1,0,148,74,133,255,51,246,180,255,228,177,112,1,58,189,108,255,194,203,237,254,21,209,195,0,147,10,35,1,86,157,226,0,31,163,139,254,56,7,75,255,62,90,116,0,181,60,169,0,138,162,212,254,81,167,31,0,205,90,112,255,33,112,227,0,83,151,117,1,177,224,73,255,174,144,217,255,230,204,79,255,22,77,232,255,114,78,234,0,224,57,126,254,9,49,141,0,242,147,165,1,104,182,140,255,167,132,12,1,123,68,127,0,225,87,39,1,251,108,8,0,198,193,143,1,121,135,207,255,172,22,70,0,50,68,116,255,101,175,40,255,248,105,233,0,166,203,7,0,110,197,218,0,215,254,26,254,168,226,253,0,31,143,96,0,11,103,41,0,183,129,203,254,100,247,74,255,213,126,132,0,210,147,44,0,199,234,27,1,148,47,181,0,155,91,158,1,54,105,175,255,2,78,145,254,102,154,95,0,128,207,127,254,52,124,236,255,130,84,71,0,221,243,211,0,152,170,207,0,222,106,199,0,183,84,94,254,92,200,56,255,138,182,115,1,142,96,146,0,133,136,228,0,97,18,150,0,55,251,66,0,140,102,4,0,202,103,151,0,30,19,248,255,51,184,207,0,202,198,89,0,55,197,225,254,169,95,249,255,66,65,68,255,188,234,126,0,166,223,100,1,112,239,244,0,144,23,194,0,58,39,182,0,244,44,24,254,175,68,179,255,152,118,154,1,176,162,130,0,217,114,204,254,173,126,78,255,33,222,30,255,36,2,91,255,2,143,243,0,9,235,215,0,3,171,151,1,24,215,245,255,168,47,164,254,241,146,207,0,69,129,180,0,68,243,113,0,144,53,72,254,251,45,14,0,23,110,168,0,68,68,79,255,110,70,95,254,174,91,144,255,33,206,95,255,137,41,7,255,19,187,153,254,35,255,112,255,9,145,185,254,50,157,37,0,11,112,49,1,102,8,190,255,234,243,169,1,60,85,23,0,74,39,189,0,116,49,239,0,173,213,210,0,46,161,108,255,159,150,37,0,196,120,185,255,34,98,6,255,153,195,62,255,97,230,71,255,102,61,76,0,26,212,236,255,164,97,16,0,198,59,146,0,163,23,196,0,56,24,61,0,181,98,193,0,251,147,229,255,98,189,24,255,46,54,206,255,234,82,246,0,183,103,38,1,109,62,204,0,10,240,224,0,146,22,117,255,142,154,120,0,69,212,35,0,208,99,118,1,121,255,3,255,72,6,194,0,117,17,197,255,125,15,23,0,154,79,153,0,214,94,197,255,185,55,147,255,62,254,78,254,127,82,153,0,110,102,63,255,108,82,161,255,105,187,212,1,80,138,39,0,60,255,93,255,72,12,186,0,210,251,31,1,190,167,144,255,228,44,19,254,128,67,232,0,214,249,107,254,136,145,86,255,132,46,176,0,189,187,227,255,208,22,140,0,217,211,116,0,50,81,186,254,139,250,31,0,30,64,198,1,135,155,100,0,160,206,23,254,187,162,211,255,16,188,63,0,254,208,49,0,85,84,191,0,241,192,242,255,153,126,145,1,234,162,162,255,230,97,216,1,64,135,126,0,190,148,223,1,52,0,43,255,28,39,189,1,64,136,238,0,175,196,185,0,98,226,213,255,127,159,244,1,226,175,60,0,160,233,142,1,180,243,207,255,69,152,89,1,31,101,21,0,144,25,164,254,139,191,209,0,91,25,121,0,32,147,5,0,39,186,123,255,63,115,230,255,93,167,198,255,143,213,220,255,179,156,19,255,25,66,122,0,214,160,217,255,2,45,62,255,106,79,146,254,51,137,99,255,87,100,231,255,175,145,232,255,101,184,1,255,174,9,125,0,82,37,161,1,36,114,141,255,48,222,142,255,245,186,154,0,5,174,221,254,63,114,155,255,135,55,160,1,80,31,135,0,126,250,179,1,236,218,45,0,20,28,145,1,16,147,73,0,249,189,132,1,17,189,192,255,223,142,198,255,72,20,15,255,250,53,237,254,15,11,18,0,27,211,113,254,213,107,56,255,174,147,146,255,96,126,48,0,23,193,109,1,37,162,94,0,199,157,249,254,24,128,187,255,205,49,178,254,93,164,42,255,43,119,235,1,88,183,237,255,218,210,1,255,107,254,42,0,230,10,99,255,162,0,226,0,219,237,91,0,129,178,203,0,208,50,95,254,206,208,95,255,247,191,89,254,110,234,79,255,165,61,243,0,20,122,112,255,246,246,185,254,103,4,123,0,233,99,230,1,219,91,252,255,199,222,22,255,179,245,233,255,211,241,234,0,111,250,192,255,85,84,136,0,101,58,50,255,131,173,156,254,119,45,51,255,118,233,16,254,242,90,214,0,94,159,219,1,3,3,234,255,98,76,92,254,80,54,230,0,5,228,231,254,53,24,223,255,113,56,118,1,20,132,1,255,171,210,236,0,56,241,158,255,186,115,19,255,8,229,174,0,48,44,0,1,114,114,166,255,6,73,226,255,205,89,244,0,137,227,75,1,248,173,56,0,74,120,246,254,119,3,11,255,81,120,198,255,136,122,98,255,146,241,221,1,109,194,78,255,223,241,70,1,214,200,169,255,97,190,47,255,47,103,174,255,99,92,72,254,118,233,180,255,193,35,233,254,26,229,32,255,222,252,198,0,204,43,71,255,199,84,172,0,134,102,190,0,111,238,97,254,230,40,230,0,227,205,64,254,200,12,225,0,166,25,222,0,113,69,51,255,143,159,24,0,167,184,74,0,29,224,116,254,158,208,233,0,193,116,126,255,212,11,133,255,22,58,140,1,204,36,51,255,232,30,43,0,235,70,181,255,64,56,146,254,169,18,84,255,226,1,13,255,200,50,176,255,52,213,245,254,168,209,97,0,191,71,55,0,34,78,156,0,232,144,58,1,185,74,189,0,186,142,149,254,64,69,127,255,161,203,147,255,176,151,191,0,136,231,203,254,163,182,137,0,161,126,251,254,233,32,66,0,68,207,66,0,30,28,37,0,93,114,96,1,254,92,247,255,44,171,69,0,202,119,11,255,188,118,50,1,255,83,136,255,71,82,26,0,70,227,2,0,32,235,121,1,181,41,154,0,71,134,229,254,202,255,36,0,41,152,5,0,154,63,73,255,34,182,124,0,121,221,150,255,26,204,213,1,41,172,87,0,90,157,146,255,109,130,20,0,71,107,200,255,243,102,189,0,1,195,145,254,46,88,117,0,8,206,227,0,191,110,253,255,109,128,20,254,134,85,51,255,137,177,112,1,216,34,22,255,131,16,208,255,121,149,170,0,114,19,23,1,166,80,31,255,113,240,122,0,232,179,250,0,68,110,180,254,210,170,119,0,223,108,164,255,207,79,233,255,27,229,226,254,209,98,81,255,79,68,7,0,131,185,100,0,170,29,162,255,17,162,107,255,57,21,11,1,100,200,181,255,127,65,166,1,165,134,204,0,104,167,168,0,1,164,79,0,146,135,59,1,70,50,128,255,102,119,13,254,227,6,135,0,162,142,179,255,160,100,222,0,27,224,219,1,158,93,195,255,234,141,137,0,16,24,125,255,238,206,47,255,97,17,98,255,116,110,12,255,96,115,77,0,91,227,232,255,248,254,79,255,92,229,6,254,88,198,139,0,206,75,129,0,250,77,206,255,141,244,123,1,138,69,220,0,32,151,6,1,131,167,22,255,237,68,167,254,199,189,150,0,163,171,138,255,51,188,6,255,95,29,137,254,148,226,179,0,181,107,208,255,134,31,82,255,151,101,45,255,129,202,225,0,224,72,147,0,48,138,151,255,195,64,206,254,237,218,158,0,106,29,137,254,253,189,233,255,103,15,17,255,194,97,255,0,178,45,169,254,198,225,155,0,39,48,117,255,135,106,115,0,97,38,181,0,150,47,65,255,83,130,229,254,246,38,129,0,92,239,154,254,91,99,127,0,161,111,33,255,238,217,242,255,131,185,195,255,213,191,158,255,41,150,218,0,132,169,131,0,89,84,252,1,171,70,128,255,163,248,203,254,1,50,180,255,124,76,85,1,251,111,80,0,99,66,239,255,154,237,182,255,221,126,133,254,74,204,99,255,65,147,119,255,99,56,167,255,79,248,149,255,116,155,228,255,237,43,14,254,69,137,11,255,22,250,241,1,91,122,143,255,205,249,243,0,212,26,60,255,48,182,176,1,48,23,191,255,203,121,152,254,45,74,213,255,62,90,18,254,245,163,230,255,185,106,116,255,83,35,159,0,12,33,2,255,80,34,62,0,16,87,174,255,173,101,85,0,202,36,81,254,160,69,204,255,64,225,187,0,58,206,94,0,86,144,47,0,229,86,245,0,63,145,190,1,37,5,39,0,109,251,26,0,137,147,234,0,162,121,145,255,144,116,206,255,197,232,185,255,183,190,140,255,73,12,254,255,139,20,242,255,170,90,239,255,97,66,187,255,245,181,135,254,222,136,52,0,245,5,51,254,203,47,78,0,152,101,216,0,73,23,125,0,254,96,33,1,235,210,73,255,43,209,88,1,7,129,109,0,122,104,228,254,170,242,203,0,242,204,135,255,202,28,233,255,65,6,127,0,159,144,71,0,100,140,95,0,78,150,13,0,251,107,118,1,182,58,125,255,1,38,108,255,141,189,209,255,8,155,125,1,113,163,91,255,121,79,190,255,134,239,108,255,76,47,248,0,163,228,239,0,17,111,10,0,88,149,75,255,215,235,239,0,167,159,24,255,47,151,108,255,107,209,188,0,233,231,99,254,28,202,148,255,174,35,138,255,110,24,68,255,2,69,181,0,107,102,82,0,102,237,7,0,92,36,237,255,221,162,83,1,55,202,6,255,135,234,135,255,24,250,222,0,65,94,168,254,245,248,210,255,167,108,201,254,255,161,111,0,205,8,254,0,136,13,116,0,100,176,132,255,43,215,126,255,177,133,130,255,158,79,148,0,67,224,37,1,12,206,21,255,62,34,110,1,237,104,175,255,80,132,111,255,142,174,72,0,84,229,180,254,105,179,140,0,64,248,15,255,233,138,16,0,245,67,123,254,218,121,212,255,63,95,218,1,213,133,137,255,143,182,82,255,48,28,11,0,244,114,141,1,209,175,76,255,157,181,150,255,186,229,3,255,164,157,111,1,231,189,139,0,119,202,190,255,218,106,64,255,68,235,63,254,96,26,172,255,187,47,11,1,215,18,251,255,81,84,89,0,68,58,128,0,94,113,5,1,92,129,208,255,97,15,83,254,9,28,188,0,239,9,164,0,60,205,152,0,192,163,98,255,184,18,60,0,217,182,139,0,109,59,120,255,4,192,251,0,169,210,240,255,37,172,92,254,148,211,245,255,179,65,52,0,253,13,115,0,185,174,206,1,114,188,149,255,237,90,173,0,43,199,192,255,88,108,113,0,52,35,76,0,66,25,148,255,221,4,7,255,151,241,114,255,190,209,232,0,98,50,199,0,151,150,213,255,18,74,36,1,53,40,7,0,19,135,65,255,26,172,69,0,174,237,85,0,99,95,41,0,3,56,16,0,39,160,177,255,200,106,218,254,185,68,84,255,91,186,61,254,67,143,141,255,13,244,166,255,99,114,198,0,199,110,163,255,193,18,186,0,124,239,246,1,110,68,22,0,2,235,46,1,212,60,107,0,105,42,105,1,14,230,152,0,7,5,131,0,141,104,154,255,213,3,6,0,131,228,162,255,179,100,28,1,231,123,85,255,206,14,223,1,253,96,230,0,38,152,149,1,98,137,122,0,214,205,3,255,226,152,179,255,6,133,137,0,158,69,140,255,113,162,154,255,180,243,172,255,27,189,115,255,143,46,220,255,213,134,225,255,126,29,69,0,188,43,137,1,242,70,9,0,90,204,255,255,231,170,147,0,23,56,19,254,56,125,157,255,48,179,218,255,79,182,253,255,38,212,191,1,41,235,124,0,96,151,28,0,135,148,190,0,205,249,39,254,52,96,136,255,212,44,136,255,67,209,131,255,252,130,23,255,219,128,20,255,198,129,118,0,108,101,11,0,178,5,146,1,62,7,100,255,181,236,94,254,28,26,164,0,76,22,112,255,120,102,79,0,202,192,229,1,200,176,215,0,41,64,244,255,206,184,78,0,167,45,63,1,160,35,0,255,59,12,142,255,204,9,144,255,219,94,229,1,122,27,112,0,189,105,109,255,64,208,74,255,251,127,55,1,2,226,198,0,44,76,209,0,151,152,77,255,210,23,46,1,201,171,69,255,44,211,231,0,190,37,224,255,245,196,62,255,169,181,222,255,34,211,17,0,119,241,197,255,229,35,152,1,21,69,40,255,178,226,161,0,148,179,193,0,219,194,254,1,40,206,51,255,231,92,250,1,67,153,170,0,21,148,241,0,170,69,82,255,121,18,231,255,92,114,3,0,184,62,230,0,225,201,87,255,146,96,162,255,181,242,220,0,173,187,221,1,226,62,170,255,56,126,217,1,117,13,227,255,179,44,239,0,157,141,155,255,144,221,83,0,235,209,208,0,42,17,165,1,251,81,133,0,124,245,201,254,97,211,24,255,83,214,166,0,154,36,9,255,248,47,127,0,90,219,140,255,161,217,38,254,212,147,63,255,66,84,148,1,207,3,1,0,230,134,89,1,127,78,122,255,224,155,1,255,82,136,74,0,178,156,208,255,186,25,49,255,222,3,210,1,229,150,190,255,85,162,52,255,41,84,141,255,73,123,84,254,93,17,150,0,119,19,28,1,32,22,215,255,28,23,204,255,142,241,52,255,228,52,125,0,29,76,207,0,215,167,250,254,175,164,230,0,55,207,105,1,109,187,245,255,161,44,220,1,41,101,128,255,167,16,94,0,93,214,107,255,118,72,0,254,80,61,234,255,121,175,125,0,139,169,251,0,97,39,147,254,250,196,49,255,165,179,110,254,223,70,187,255,22,142,125,1,154,179,138,255,118,176,42,1,10,174,153,0,156,92,102,0,168,13,161,255,143,16,32,0,250,197,180,255,203,163,44,1,87,32,36,0,161,153,20,255,123,252,15,0,25,227,80,0,60,88,142,0,17,22,201,1,154,205,77,255,39,63,47,0,8,122,141,0,128,23,182,254,204,39,19,255,4,112,29,255,23,36,140,255,210,234,116,254,53,50,63,255,121,171,104,255,160,219,94,0,87,82,14,254,231,42,5,0,165,139,127,254,86,78,38,0,130,60,66,254,203,30,45,255,46,196,122,1,249,53,162,255,136,143,103,254,215,210,114,0,231,7,160,254,169,152,42,255,111,45,246,0,142,131,135,255,131,71,204,255,36,226,11,0,0,28,242,255,225,138,213,255,247,46,216,254,245,3,183,0,108,252,74,1,206,26,48,255,205,54,246,255,211,198,36,255,121,35,50,0,52,216,202,255,38,139,129,254,242,73,148,0,67,231,141,255,42,47,204,0,78,116,25,1,4,225,191,255,6,147,228,0,58,88,177,0,122,165,229,255,252,83,201,255,224,167,96,1,177,184,158,255,242,105,179,1,248,198,240,0,133,66,203,1,254,36,47,0,45,24,115,255,119,62,254,0,196,225,186,254,123,141,172,0,26,85,41,255,226,111,183,0,213,231,151,0,4,59,7,255,238,138,148,0,66,147,33,255,31,246,141,255,209,141,116,255,104,112,31,0,88,161,172,0,83,215,230,254,47,111,151,0,45,38,52,1,132,45,204,0,138,128,109,254,233,117,134,255,243,190,173,254,241,236,240,0,82,127,236,254,40,223,161,255,110,182,225,255,123,174,239,0,135,242,145,1,51,209,154,0,150,3,115,254,217,164,252,255,55,156,69,1,84,94,255,255,232,73,45,1,20,19,212,255,96,197,59,254,96,251,33,0,38,199,73,1,64,172,247,255,117,116,56,255,228,17,18,0,62,138,103,1,246,229,164,255,244,118,201,254,86,32,159,255,109,34,137,1,85,211,186,0,10,193,193,254,122,194,177,0,122,238,102,255,162,218,171,0,108,217,161,1,158,170,34,0,176,47,155,1,181,228,11,255,8,156,0,0,16,75,93,0,206,98,255,1,58,154,35,0,12,243,184,254,67,117,66,255,230,229,123,0,201,42,110,0,134,228,178,254,186,108,118,255,58,19,154,255,82,169,62,255,114,143,115,1,239,196,50,255,173,48,193,255,147,2,84,255,150,134,147,254,95,232,73,0,109,227,52,254,191,137,10,0,40,204,30,254,76,52,97,255,164,235,126,0,254,124,188,0,74,182,21,1,121,29,35,255,241,30,7,254,85,218,214,255,7,84,150,254,81,27,117,255,160,159,152,254,66,24,221,255,227,10,60,1,141,135,102,0,208,189,150,1,117,179,92,0,132,22,136,255,120,199,28,0,21,129,79,254,182,9,65,0,218,163,169,0,246,147,198,255,107,38,144,1,78,175,205,255,214,5,250,254,47,88,29,255,164,47,204,255,43,55,6,255,131,134,207,254,116,100,214,0,96,140,75,1,106,220,144,0,195,32,28,1,172,81,5,255,199,179,52,255,37,84,203,0,170,112,174,0,11,4,91,0,69,244,27,1,117,131,92,0,33,152,175,255,140,153,107,255,251,135,43,254,87,138,4,255,198,234,147,254,121,152,84,255,205,101,155,1,157,9,25,0,72,106,17,254,108,153,0,255,189,229,186,0,193,8,176,255,174,149,209,0,238,130,29,0,233,214,126,1,61,226,102,0,57,163,4,1,198,111,51,255,45,79,78,1,115,210,10,255,218,9,25,255,158,139,198,255,211,82,187,254,80,133,83,0,157,129,230,1,243,133,134,255,40,136,16,0,77,107,79,255,183,85,92,1,177,204,202,0,163,71,147,255,152,69,190,0,172,51,188,1,250,210,172,255,211,242,113,1,89,89,26,255,64,66,111,254,116,152,42,0,161,39,27,255,54,80,254,0,106,209,115,1,103,124,97,0,221,230,98,255,31,231,6,0,178,192,120,254,15,217,203,255,124,158,79,0,112,145,247,0,92,250,48,1,163,181,193,255,37,47,142,254,144,189,165,255,46,146,240,0,6,75,128,0,41,157,200,254,87,121,213,0,1,113,236,0,5,45,250,0,144,12,82,0,31,108,231,0,225,239,119,255,167,7,189,255,187,228,132,255,110,189,34,0,94,44,204,1,162,52,197,0,78,188,241,254,57,20,141,0,244,146,47,1,206,100,51,0,125,107,148,254,27,195,77,0,152,253,90,1,7,143,144,255,51,37,31,0,34,119,38,255,7,197,118,0,153,188,211,0,151,20,116,254,245,65,52,255,180,253,110,1,47,177,209,0,161,99,17,255,118,222,202,0,125,179,252,1,123,54,126,255,145,57,191,0,55,186,121,0,10,243,138,0,205,211,229,255,125,156,241,254,148,156,185,255,227,19,188,255,124,41,32,255,31,34,206,254,17,57,83,0,204,22,37,255,42,96,98,0,119,102,184,1,3,190,28,0,110,82,218,255,200,204,192,255,201,145,118,0,117,204,146,0,132,32,98,1,192,194,121,0,106,161,248,1,237,88,124,0,23,212,26,0,205,171,90,255,248,48,216,1,141,37,230,255,124,203,0,254,158,168,30,255,214,248,21,0,112,187,7,255], "i8", ALLOC_NONE, Runtime.GLOBAL_BASE+20480);
-/* memory initializer */ allocate([75,133,239,255,74,227,243,255,250,147,70,0,214,120,162,0,167,9,179,255,22,158,18,0,218,77,209,1,97,109,81,255,244,33,179,255,57,52,57,255,65,172,210,255,249,71,209,255,142,169,238,0,158,189,153,255,174,254,103,254,98,33,14,0,141,76,230,255,113,139,52,255,15,58,212,0,168,215,201,255,248,204,215,1,223,68,160,255,57,154,183,254,47,231,121,0,106,166,137,0,81,136,138,0,165,43,51,0,231,139,61,0,57,95,59,254,118,98,25,255,151,63,236,1,94,190,250,255,169,185,114,1,5,250,58,255,75,105,97,1,215,223,134,0,113,99,163,1,128,62,112,0,99,106,147,0,163,195,10,0,33,205,182,0,214,14,174,255,129,38,231,255,53,182,223,0,98,42,159,255,247,13,40,0,188,210,177,1,6,21,0,255,255,61,148,254,137,45,129,255,89,26,116,254,126,38,114,0,251,50,242,254,121,134,128,255,204,249,167,254,165,235,215,0,202,177,243,0,133,141,62,0,240,130,190,1,110,175,255,0,0,20,146,1,37,210,121,255,7,39,130,0,142,250,84,255,141,200,207,0,9,95,104,255,11,244,174,0,134,232,126,0,167,1,123,254,16,193,149,255,232,233,239,1,213,70,112,255,252,116,160,254,242,222,220,255,205,85,227,0,7,185,58,0,118,247,63,1,116,77,177,255,62,245,200,254,63,18,37,255,107,53,232,254,50,221,211,0,162,219,7,254,2,94,43,0,182,62,182,254,160,78,200,255,135,140,170,0,235,184,228,0,175,53,138,254,80,58,77,255,152,201,2,1,63,196,34,0,5,30,184,0,171,176,154,0,121,59,206,0,38,99,39,0,172,80,77,254,0,134,151,0,186,33,241,254,94,253,223,255,44,114,252,0,108,126,57,255,201,40,13,255,39,229,27,255,39,239,23,1,151,121,51,255,153,150,248,0,10,234,174,255,118,246,4,254,200,245,38,0,69,161,242,1,16,178,150,0,113,56,130,0,171,31,105,0,26,88,108,255,49,42,106,0,251,169,66,0,69,93,149,0,20,57,254,0,164,25,111,0,90,188,90,255,204,4,197,0,40,213,50,1,212,96,132,255,88,138,180,254,228,146,124,255,184,246,247,0,65,117,86,255,253,102,210,254,254,121,36,0,137,115,3,255,60,24,216,0,134,18,29,0,59,226,97,0,176,142,71,0,7,209,161,0,189,84,51,254,155,250,72,0,213,84,235,255,45,222,224,0,238,148,143,255,170,42,53,255,78,167,117,0,186,0,40,255,125,177,103,255,69,225,66,0,227,7,88,1,75,172,6,0,169,45,227,1,16,36,70,255,50,2,9,255,139,193,22,0,143,183,231,254,218,69,50,0,236,56,161,1,213,131,42,0,138,145,44,254,136,229,40,255,49,63,35,255,61,145,245,255,101,192,2,254,232,167,113,0,152,104,38,1,121,185,218,0,121,139,211,254,119,240,35,0,65,189,217,254,187,179,162,255,160,187,230,0,62,248,14,255,60,78,97,0,255,247,163,255,225,59,91,255,107,71,58,255,241,47,33,1,50,117,236,0,219,177,63,254,244,90,179,0,35,194,215,255,189,67,50,255,23,135,129,0,104,189,37,255,185,57,194,0,35,62,231,255,220,248,108,0,12,231,178,0,143,80,91,1,131,93,101,255,144,39,2,1,255,250,178,0,5,17,236,254,139,32,46,0,204,188,38,254,245,115,52,255,191,113,73,254,191,108,69,255,22,69,245,1,23,203,178,0,170,99,170,0,65,248,111,0,37,108,153,255,64,37,69,0,0,88,62,254,89,148,144,255,191,68,224,1,241,39,53,0,41,203,237,255,145,126,194,255,221,42,253,255,25,99,151,0,97,253,223,1,74,115,49,255,6,175,72,255,59,176,203,0,124,183,249,1,228,228,99,0,129,12,207,254,168,192,195,255,204,176,16,254,152,234,171,0,77,37,85,255,33,120,135,255,142,194,227,1,31,214,58,0,213,187,125,255,232,46,60,255,190,116,42,254,151,178,19,255,51,62,237,254,204,236,193,0,194,232,60,0,172,34,157,255,189,16,184,254,103,3,95,255,141,233,36,254,41,25,11,255,21,195,166,0,118,245,45,0,67,213,149,255,159,12,18,255,187,164,227,1,160,25,5,0,12,78,195,1,43,197,225,0,48,142,41,254,196,155,60,255,223,199,18,1,145,136,156,0,252,117,169,254,145,226,238,0,239,23,107,0,109,181,188,255,230,112,49,254,73,170,237,255,231,183,227,255,80,220,20,0,194,107,127,1,127,205,101,0,46,52,197,1,210,171,36,255,88,3,90,255,56,151,141,0,96,187,255,255,42,78,200,0,254,70,70,1,244,125,168,0,204,68,138,1,124,215,70,0,102,66,200,254,17,52,228,0,117,220,143,254,203,248,123,0,56,18,174,255,186,151,164,255,51,232,208,1,160,228,43,255,249,29,25,1,68,190,63,0,8,201,188,243,103,230,9,106,59,167,202,132,133,174,103,187,43,248,148,254,114,243,110,60,241,54,29,95,58,245,79,165,209,130,230,173,127,82,14,81,31,108,62,43,140,104,5,155,107,189,65,251,171,217,131,31,121,33,126,19,25,205,224,91,34,174,40,215,152,47,138,66,205,101,239,35,145,68,55,113,47,59,77,236,207,251,192,181,188,219,137,129,165,219,181,233,56,181,72,243,91,194,86,57,25,208,5,182,241,17,241,89,155,79,25,175,164,130,63,146,24,129,109,218,213,94,28,171,66,2,3,163,152,170,7,216,190,111,112,69,1,91,131,18,140,178,228,78,190,133,49,36,226,180,255,213,195,125,12,85,111,137,123,242,116,93,190,114,177,150,22,59,254,177,222,128,53,18,199,37,167,6,220,155,148,38,105,207,116,241,155,193,210,74,241,158,193,105,155,228,227,37,79,56,134,71,190,239,181,213,140,139,198,157,193,15,101,156,172,119,204,161,12,36,117,2,43,89,111,44,233,45,131,228,166,110,170,132,116,74,212,251,65,189,220,169,176,92,181,83,17,131,218,136,249,118,171,223,102,238,82,81,62,152,16,50,180,45,109,198,49,168,63,33,251,152,200,39,3,176,228,14,239,190,199,127,89,191,194,143,168,61,243,11,224,198,37,167,10,147,71,145,167,213,111,130,3,224,81,99,202,6,112,110,14,10,103,41,41,20,252,47,210,70,133,10,183,39,38,201,38,92,56,33,27,46,237,42,196,90,252,109,44,77,223,179,149,157,19,13,56,83,222,99,175,139,84,115,10,101,168,178,119,60,187,10,106,118,230,174,237,71,46,201,194,129,59,53,130,20,133,44,114,146,100,3,241,76,161,232,191,162,1,48,66,188,75,102,26,168,145,151,248,208,112,139,75,194,48,190,84,6,163,81,108,199,24,82,239,214,25,232,146,209,16,169,101,85,36,6,153,214,42,32,113,87,133,53,14,244,184,209,187,50,112,160,106,16,200,208,210,184,22,193,164,25,83,171,65,81,8,108,55,30,153,235,142,223,76,119,72,39,168,72,155,225,181,188,176,52,99,90,201,197,179,12,28,57,203,138,65,227,74,170,216,78,115,227,99,119,79,202,156,91,163,184,178,214,243,111,46,104,252,178,239,93,238,130,143,116,96,47,23,67,111,99,165,120,114,171,240,161,20,120,200,132,236,57,100,26,8,2,199,140,40,30,99,35,250,255,190,144,233,189,130,222,235,108,80,164,21,121,198,178,247,163,249,190,43,83,114,227,242,120,113,198,156,97,38,234,206,62,39,202,7,194,192,33,199,184,134,209,30,235,224,205,214,125,218,234,120,209,110,238,127,79,125,245,186,111,23,114,170,103,240,6,166,152,200,162,197,125,99,10,174,13,249,190,4,152,63,17,27,71,28,19,53,11,113,27,132,125,4,35,245,119,219,40,147,36,199,64,123,171,202,50,188,190,201,21,10,190,158,60,76,13,16,156,196,103,29,67,182,66,62,203,190,212,197,76,42,126,101,252,156,41,127,89,236,250,214,58,171,111,203,95,23,88,71,74,140,25,68,108,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "i8", ALLOC_NONE, Runtime.GLOBAL_BASE+30720);
+/* memory initializer */ allocate([8,201,188,243,103,230,9,106,59,167,202,132,133,174,103,187,43,248,148,254,114,243,110,60,241,54,29,95,58,245,79,165,209,130,230,173,127,82,14,81,31,108,62,43,140,104,5,155,107,189,65,251,171,217,131,31,121,33,126,19,25,205,224,91,34,174,40,215,152,47,138,66,205,101,239,35,145,68,55,113,47,59,77,236,207,251,192,181,188,219,137,129,165,219,181,233,56,181,72,243,91,194,86,57,25,208,5,182,241,17,241,89,155,79,25,175,164,130,63,146,24,129,109,218,213,94,28,171,66,2,3,163,152,170,7,216,190,111,112,69,1,91,131,18,140,178,228,78,190,133,49,36,226,180,255,213,195,125,12,85,111,137,123,242,116,93,190,114,177,150,22,59,254,177,222,128,53,18,199,37,167,6,220,155,148,38,105,207,116,241,155,193,210,74,241,158,193,105,155,228,227,37,79,56,134,71,190,239,181,213,140,139,198,157,193,15,101,156,172,119,204,161,12,36,117,2,43,89,111,44,233,45,131,228,166,110,170,132,116,74,212,251,65,189,220,169,176,92,181,83,17,131,218,136,249,118,171,223,102,238,82,81,62,152,16,50,180,45,109,198,49,168,63,33,251,152,200,39,3,176,228,14,239,190,199,127,89,191,194,143,168,61,243,11,224,198,37,167,10,147,71,145,167,213,111,130,3,224,81,99,202,6,112,110,14,10,103,41,41,20,252,47,210,70,133,10,183,39,38,201,38,92,56,33,27,46,237,42,196,90,252,109,44,77,223,179,149,157,19,13,56,83,222,99,175,139,84,115,10,101,168,178,119,60,187,10,106,118,230,174,237,71,46,201,194,129,59,53,130,20,133,44,114,146,100,3,241,76,161,232,191,162,1,48,66,188,75,102,26,168,145,151,248,208,112,139,75,194,48,190,84,6,163,81,108,199,24,82,239,214,25,232,146,209,16,169,101,85,36,6,153,214,42,32,113,87,133,53,14,244,184,209,187,50,112,160,106,16,200,208,210,184,22,193,164,25,83,171,65,81,8,108,55,30,153,235,142,223,76,119,72,39,168,72,155,225,181,188,176,52,99,90,201,197,179,12,28,57,203,138,65,227,74,170,216,78,115,227,99,119,79,202,156,91,163,184,178,214,243,111,46,104,252,178,239,93,238,130,143,116,96,47,23,67,111,99,165,120,114,171,240,161,20,120,200,132,236,57,100,26,8,2,199,140,40,30,99,35,250,255,190,144,233,189,130,222,235,108,80,164,21,121,198,178,247,163,249,190,43,83,114,227,242,120,113,198,156,97,38,234,206,62,39,202,7,194,192,33,199,184,134,209,30,235,224,205,214,125,218,234,120,209,110,238,127,79,125,245,186,111,23,114,170,103,240,6,166,152,200,162,197,125,99,10,174,13,249,190,4,152,63,17,27,71,28,19,53,11,113,27,132,125,4,35,245,119,219,40,147,36,199,64,123,171,202,50,188,190,201,21,10,190,158,60,76,13,16,156,196,103,29,67,182,66,62,203,190,212,197,76,42,126,101,252,156,41,127,89,236,250,214,58,171,111,203,95,23,88,71,74,140,25,68,108,133,59,140,1,189,241,36,255,248,37,195,1,96,220,55,0,183,76,62,255,195,66,61,0,50,76,164,1,225,164,76,255,76,61,163,255,117,62,31,0,81,145,64,255,118,65,14,0,162,115,214,255,6,138,46,0,124,230,244,255,10,138,143,0,52,26,194,0,184,244,76,0,129,143,41,1,190,244,19,255,123,170,122,255,98,129,68,0,121,213,147,0,86,101,30,255,161,103,155,0,140,89,67,255,239,229,190,1,67,11,181,0,198,240,137,254,238,69,188,255,67,151,238,0,19,42,108,255,229,85,113,1,50,68,135,255,17,106,9,0,50,103,1,255,80,1,168,1,35,152,30,255,16,168,185,1,56,89,232,255,101,210,252,0,41,250,71,0,204,170,79,255,14,46,239,255,80,77,239,0,189,214,75,255,17,141,249,0,38,80,76,255,190,85,117,0,86,228,170,0,156,216,208,1,195,207,164,255,150,66,76,255,175,225,16,255,141,80,98,1,76,219,242,0,198,162,114,0,46,218,152,0,155,43,241,254,155,160,104,255,51,187,165,0,2,17,175,0,66,84,160,1,247,58,30,0,35,65,53,254,69,236,191,0,45,134,245,1,163,123,221,0,32,110,20,255,52,23,165,0,186,214,71,0,233,176,96,0,242,239,54,1,57,89,138,0,83,0,84,255,136,160,100,0,92,142,120,254,104,124,190,0,181,177,62,255,250,41,85,0,152,130,42,1,96,252,246,0,151,151,63,254,239,133,62,0,32,56,156,0,45,167,189,255,142,133,179,1,131,86,211,0,187,179,150,254,250,170,14,255,210,163,78,0,37,52,151,0,99,77,26,0,238,156,213,255,213,192,209,1,73,46,84,0,20,65,41,1,54,206,79,0,201,131,146,254,170,111,24,255,177,33,50,254,171,38,203,255,78,247,116,0,209,221,153,0,133,128,178,1,58,44,25,0,201,39,59,1,189,19,252,0,49,229,210,1,117,187,117,0,181,179,184,1,0,114,219,0,48,94,147,0,245,41,56,0,125,13,204,254,244,173,119,0,44,221,32,254,84,234,20,0,249,160,198,1,236,126,234,255,47,99,168,254,170,226,153,255,102,179,216,0,226,141,122,255,122,66,153,254,182,245,134,0,227,228,25,1,214,57,235,255,216,173,56,255,181,231,210,0,119,128,157,255,129,95,136,255,110,126,51,0,2,169,183,255,7,130,98,254,69,176,94,255,116,4,227,1,217,242,145,255,202,173,31,1,105,1,39,255,46,175,69,0,228,47,58,255,215,224,69,254,207,56,69,255,16,254,139,255,23,207,212,255,202,20,126,255,95,213,96,255,9,176,33,0,200,5,207,255,241,42,128,254,35,33,192,255,248,229,196,1,129,17,120,0,251,103,151,255,7,52,112,255,140,56,66,255,40,226,245,255,217,70,37,254,172,214,9,255,72,67,134,1,146,192,214,255,44,38,112,0,68,184,75,255,206,90,251,0,149,235,141,0,181,170,58,0,116,244,239,0,92,157,2,0,102,173,98,0,233,137,96,1,127,49,203,0,5,155,148,0,23,148,9,255,211,122,12,0,34,134,26,255,219,204,136,0,134,8,41,255,224,83,43,254,85,25,247,0,109,127,0,254,169,136,48,0,238,119,219,255,231,173,213,0,206,18,254,254,8,186,7,255,126,9,7,1,111,42,72,0,111,52,236,254,96,63,141,0,147,191,127,254,205,78,192,255,14,106,237,1,187,219,76,0,175,243,187,254,105,89,173,0,85,25,89,1,162,243,148,0,2,118,209,254,33,158,9,0,139,163,46,255,93,70,40,0,108,42,142,254,111,252,142,255,155,223,144,0,51,229,167,255,73,252,155,255,94,116,12,255,152,160,218,255,156,238,37,255,179,234,207,255,197,0,179,255,154,164,141,0,225,196,104,0,10,35,25,254,209,212,242,255,97,253,222,254,184,101,229,0,222,18,127,1,164,136,135,255,30,207,140,254,146,97,243,0,129,192,26,254,201,84,33,255,111,10,78,255,147,81,178,255,4,4,24,0,161,238,215,255,6,141,33,0,53,215,14,255,41,181,208,255,231,139,157,0,179,203,221,255,255,185,113,0,189,226,172,255,113,66,214,255,202,62,45,255,102,64,8,255,78,174,16,254,133,117,68,255,182,120,89,255,133,114,211,0,189,110,21,255,15,10,106,0,41,192,1,0,152,232,121,255,188,60,160,255,153,113,206,255,0,183,226,254,180,13,72,255,176,160,14,254,211,201,134,255,158,24,143,0,127,105,53,0,96,12,189,0,167,215,251,255,159,76,128,254,106,101,225,255,30,252,4,0,146,12,174,0,89,241,178,254,10,229,166,255,123,221,42,254,30,20,212,0,82,128,3,0,48,209,243,0,119,121,64,255,50,227,156,255,0,110,197,1,103,27,144,0,133,59,140,1,189,241,36,255,248,37,195,1,96,220,55,0,183,76,62,255,195,66,61,0,50,76,164,1,225,164,76,255,76,61,163,255,117,62,31,0,81,145,64,255,118,65,14,0,162,115,214,255,6,138,46,0,124,230,244,255,10,138,143,0,52,26,194,0,184,244,76,0,129,143,41,1,190,244,19,255,123,170,122,255,98,129,68,0,121,213,147,0,86,101,30,255,161,103,155,0,140,89,67,255,239,229,190,1,67,11,181,0,198,240,137,254,238,69,188,255,234,113,60,255,37,255,57,255,69,178,182,254,128,208,179,0,118,26,125,254,3,7,214,255,241,50,77,255,85,203,197,255,211,135,250,255,25,48,100,255,187,213,180,254,17,88,105,0,83,209,158,1,5,115,98,0,4,174,60,254,171,55,110,255,217,181,17,255,20,188,170,0,146,156,102,254,87,214,174,255,114,122,155,1,233,44,170,0,127,8,239,1,214,236,234,0,175,5,219,0,49,106,61,255,6,66,208,255,2,106,110,255,81,234,19,255,215,107,192,255,67,151,238,0,19,42,108,255,229,85,113,1,50,68,135,255,17,106,9,0,50,103,1,255,80,1,168,1,35,152,30,255,16,168,185,1,56,89,232,255,101,210,252,0,41,250,71,0,204,170,79,255,14,46,239,255,80,77,239,0,189,214,75,255,17,141,249,0,38,80,76,255,190,85,117,0,86,228,170,0,156,216,208,1,195,207,164,255,150,66,76,255,175,225,16,255,141,80,98,1,76,219,242,0,198,162,114,0,46,218,152,0,155,43,241,254,155,160,104,255,178,9,252,254,100,110,212,0,14,5,167,0,233,239,163,255,28,151,157,1,101,146,10,255,254,158,70,254,71,249,228,0,88,30,50,0,68,58,160,255,191,24,104,1,129,66,129,255,192,50,85,255,8,179,138,255,38,250,201,0,115,80,160,0,131,230,113,0,125,88,147,0,90,68,199,0,253,76,158,0,28,255,118,0,113,250,254,0,66,75,46,0,230,218,43,0,229,120,186,1,148,68,43,0,136,124,238,1,187,107,197,255,84,53,246,255,51,116,254,255,51,187,165,0,2,17,175,0,66,84,160,1,247,58,30,0,35,65,53,254,69,236,191,0,45,134,245,1,163,123,221,0,32,110,20,255,52,23,165,0,186,214,71,0,233,176,96,0,242,239,54,1,57,89,138,0,83,0,84,255,136,160,100,0,92,142,120,254,104,124,190,0,181,177,62,255,250,41,85,0,152,130,42,1,96,252,246,0,151,151,63,254,239,133,62,0,32,56,156,0,45,167,189,255,142,133,179,1,131,86,211,0,187,179,150,254,250,170,14,255,68,113,21,255,222,186,59,255,66,7,241,1,69,6,72,0,86,156,108,254,55,167,89,0,109,52,219,254,13,176,23,255,196,44,106,255,239,149,71,255,164,140,125,255,159,173,1,0,51,41,231,0,145,62,33,0,138,111,93,1,185,83,69,0,144,115,46,0,97,151,16,255,24,228,26,0,49,217,226,0,113,75,234,254,193,153,12,255,182,48,96,255,14,13,26,0,128,195,249,254,69,193,59,0,132,37,81,254,125,106,60,0,214,240,169,1,164,227,66,0,210,163,78,0,37,52,151,0,99,77,26,0,238,156,213,255,213,192,209,1,73,46,84,0,20,65,41,1,54,206,79,0,201,131,146,254,170,111,24,255,177,33,50,254,171,38,203,255,78,247,116,0,209,221,153,0,133,128,178,1,58,44,25,0,201,39,59,1,189,19,252,0,49,229,210,1,117,187,117,0,181,179,184,1,0,114,219,0,48,94,147,0,245,41,56,0,125,13,204,254,244,173,119,0,44,221,32,254,84,234,20,0,249,160,198,1,236,126,234,255,143,62,221,0,129,89,214,255,55,139,5,254,68,20,191,255,14,204,178,1,35,195,217,0,47,51,206,1,38,246,165,0,206,27,6,254,158,87,36,0,217,52,146,255,125,123,215,255,85,60,31,255,171,13,7,0,218,245,88,254,252,35,60,0,55,214,160,255,133,101,56,0,224,32,19,254,147,64,234,0,26,145,162,1,114,118,125,0,248,252,250,0,101,94,196,255,198,141,226,254,51,42,182,0,135,12,9,254,109,172,210,255,197,236,194,1,241,65,154,0,48,156,47,255,153,67,55,255,218,165,34,254,74,180,179,0,218,66,71,1,88,122,99,0,212,181,219,255,92,42,231,255,239,0,154,0,245,77,183,255,94,81,170,1,18,213,216,0,171,93,71,0,52,94,248,0,18,151,161,254,197,209,66,255,174,244,15,254,162,48,183,0,49,61,240,254,182,93,195,0,199,228,6,1,200,5,17,255,137,45,237,255,108,148,4,0,90,79,237,255,39,63,77,255,53,82,207,1,142,22,118,255,101,232,18,1,92,26,67,0,5,200,88,255,33,168,138,255,149,225,72,0,2,209,27,255,44,245,168,1,220,237,17,255,30,211,105,254,141,238,221,0,128,80,245,254,111,254,14,0,222,95,190,1,223,9,241,0,146,76,212,255,108,205,104,255,63,117,153,0,144,69,48,0,35,228,111,0,192,33,193,255,112,214,190,254,115,152,151,0,23,102,88,0,51,74,248,0,226,199,143,254,204,162,101,255,208,97,189,1,245,104,18,0,230,246,30,255,23,148,69,0,110,88,52,254,226,181,89,255,208,47,90,254,114,161,80,255,33,116,248,0,179,152,87,255,69,144,177,1,88,238,26,255,58,32,113,1,1,77,69,0,59,121,52,255,152,238,83,0,52,8,193,0,231,39,233,255,199,34,138,0,222,68,173,0,91,57,242,254,220,210,127,255,192,7,246,254,151,35,187,0,195,236,165,0,111,93,206,0,212,247,133,1,154,133,209,255,155,231,10,0,64,78,38,0,122,249,100,1,30,19,97,255,62,91,249,1,248,133,77,0,197,63,168,254,116,10,82,0,184,236,113,254,212,203,194,255,61,100,252,254,36,5,202,255,119,91,153,255,129,79,29,0,103,103,171,254,237,215,111,255,216,53,69,0,239,240,23,0,194,149,221,255,38,225,222,0,232,255,180,254,118,82,133,255,57,209,177,1,139,232,133,0,158,176,46,254,194,115,46,0,88,247,229,1,28,103,191,0,221,222,175,254,149,235,44,0,151,228,25,254,218,105,103,0,142,85,210,0,149,129,190,255,213,65,94,254,117,134,224,255,82,198,117,0,157,221,220,0,163,101,36,0,197,114,37,0,104,172,166,254,11,182,0,0,81,72,188,255,97,188,16,255,69,6,10,0,199,147,145,255,8,9,115,1,65,214,175,255,217,173,209,0,80,127,166,0,247,229,4,254,167,183,124,255,90,28,204,254,175,59,240,255,11,41,248,1,108,40,51,255,144,177,195,254,150,250,126,0,138,91,65,1,120,60,222,255,245,193,239,0,29,214,189,255,128,2,25,0,80,154,162,0,77,220,107,1,234,205,74,255,54,166,103,255,116,72,9,0,228,94,47,255,30,200,25,255,35,214,89,255,61,176,140,255,83,226,163,255,75,130,172,0,128,38,17,0,95,137,152,255,215,124,159,1,79,93,0,0,148,82,157,254,195,130,251,255,40,202,76,255,251,126,224,0,157,99,62,254,207,7,225,255,96,68,195,0,140,186,157,255,131,19,231,255,42,128,254,0,52,219,61,254,102,203,72,0,141,7,11,255,186,164,213,0,31,122,119,0,133,242,145,0,208,252,232,255,91,213,182,255,143,4,250,254,249,215,74,0,165,30,111,1,171,9,223,0,229,123,34,1,92,130,26,255,77,155,45,1,195,139,28,255,59,224,78,0,136,17,247,0,108,121,32,0,79,250,189,255,96,227,252,254,38,241,62,0,62,174,125,255,155,111,93,255,10,230,206,1,97,197,40,255,0,49,57,254,65,250,13,0,18,251,150,255,220,109,210,255,5,174,166,254,44,129,189,0,235,35,147,255,37,247,141,255,72,141,4,255,103,107,255,0,247,90,4,0,53,44,42,0,2,30,240,0,4,59,63,0,88,78,36,0,113,167,180,0,190,71,193,255,199,158,164,255,58,8,172,0,77,33,12,0,65,63,3,0,153,77,33,255,172,254,102,1,228,221,4,255,87,30,254,1,146,41,86,255,138,204,239,254,108,141,17,255,187,242,135,0,210,208,127,0,68,45,14,254,73,96,62,0,81,60,24,255,170,6,36,255,3,249,26,0,35,213,109,0,22,129,54,255,21,35,225,255,234,61,56,255,58,217,6,0,143,124,88,0,236,126,66,0,209,38,183,255,34,238,6,255,174,145,102,0,95,22,211,0,196,15,153,254,46,84,232,255,117,34,146,1,231,250,74,255,27,134,100,1,92,187,195,255,170,198,112,0,120,28,42,0,209,70,67,0,29,81,31,0,29,168,100,1,169,173,160,0,107,35,117,0,62,96,59,255,81,12,69,1,135,239,190,255,220,252,18,0,163,220,58,255,137,137,188,255,83,102,109,0,96,6,76,0,234,222,210,255,185,174,205,1,60,158,213,255,13,241,214,0,172,129,140,0,93,104,242,0,192,156,251,0,43,117,30,0,225,81,158,0,127,232,218,0,226,28,203,0,233,27,151,255,117,43,5,255,242,14,47,255,33,20,6,0,137,251,44,254,27,31,245,255,183,214,125,254,40,121,149,0,186,158,213,255,89,8,227,0,69,88,0,254,203,135,225,0,201,174,203,0,147,71,184,0,18,121,41,254,94,5,78,0,224,214,240,254,36,5,180,0,251,135,231,1,163,138,212,0,210,249,116,254,88,129,187,0,19,8,49,254,62,14,144,255,159,76,211,0,214,51,82,0,109,117,228,254,103,223,203,255,75,252,15,1,154,71,220,255,23,13,91,1,141,168,96,255,181,182,133,0,250,51,55,0,234,234,212,254,175,63,158,0,39,240,52,1,158,189,36,255,213,40,85,1,32,180,247,255,19,102,26,1,84,24,97,255,69,21,222,0,148,139,122,255,220,213,235,1,232,203,255,0,121,57,147,0,227,7,154,0,53,22,147,1,72,1,225,0,82,134,48,254,83,60,157,255,145,72,169,0,34,103,239,0,198,233,47,0,116,19,4,255,184,106,9,255,183,129,83,0,36,176,230,1,34,103,72,0,219,162,134,0,245,42,158,0,32,149,96,254,165,44,144,0,202,239,72,254,215,150,5,0,42,66,36,1,132,215,175,0,86,174,86,255,26,197,156,255,49,232,135,254,103,182,82,0,253,128,176,1,153,178,122,0,245,250,10,0,236,24,178,0,137,106,132,0,40,29,41,0,50,30,152,255,124,105,38,0,230,191,75,0,143,43,170,0,44,131,20,255,44,13,23,255,237,255,155,1,159,109,100,255,112,181,24,255,104,220,108,0,55,211,131,0,99,12,213,255,152,151,145,255,238,5,159,0,97,155,8,0,33,108,81,0,1,3,103,0,62,109,34,255,250,155,180,0,32,71,195,255,38,70,145,1,159,95,245,0,69,229,101,1,136,28,240,0,79,224,25,0,78,110,121,255,248,168,124,0,187,128,247,0,2,147,235,254,79,11,132,0,70,58,12,1,181,8,163,255,79,137,133,255,37,170,11,255,141,243,85,255,176,231,215,255,204,150,164,255,239,215,39,255,46,87,156,254,8,163,88,255,172,34,232,0,66,44,102,255,27,54,41,254,236,99,87,255,41,123,169,1,52,114,43,0,117,134,40,0,155,134,26,0,231,207,91,254,35,132,38,255,19,102,125,254,36,227,133,255,118,3,113,255,29,13,124,0,152,96,74,1,88,146,206,255,167,191,220,254,162,18,88,255,182,100,23,0,31,117,52,0,81,46,106,1,12,2,7,0,69,80,201,1,209,246,172,0,12,48,141,1,224,211,88,0,116,226,159,0,122,98,130,0,65,236,234,1,225,226,9,255,207,226,123,1,89,214,59,0,112,135,88,1,90,244,203,255,49,11,38,1,129,108,186,0,89,112,15,1,101,46,204,255,127,204,45,254,79,255,221,255,51,73,18,255,127,42,101,255,241,21,202,0,160,227,7,0,105,50,236,0,79,52,197,255,104,202,208,1,180,15,16,0,101,197,78,255,98,77,203,0,41,185,241,1,35,193,124,0,35,155,23,255,207,53,192,0,11,125,163,1,249,158,185,255,4,131,48,0,21,93,111,255,61,121,231,1,69,200,36,255,185,48,185,255,111,238,21,255,39,50,25,255,99,215,163,255,87,212,30,255,164,147,5,255,128,6,35,1,108,223,110,255,194,76,178,0,74,101,180,0,243,47,48,0,174,25,43,255,82,173,253,1,54,114,192,255,40,55,91,0,215,108,176,255,11,56,7,0,224,233,76,0,209,98,202,254,242,25,125,0,44,193,93,254,203,8,177,0,135,176,19,0,112,71,213,255,206,59,176,1,4,67,26,0,14,143,213,254,42,55,208,255,60,67,120,0,193,21,163,0,99,164,115,0,10,20,118,0,156,212,222,254,160,7,217,255,114,245,76,1,117,59,123,0,176,194,86,254,213,15,176,0,78,206,207,254,213,129,59,0,233,251,22,1,96,55,152,255,236,255,15,255,197,89,84,255,93,149,133,0,174,160,113,0,234,99,169,255,152,116,88,0,144,164,83,255,95,29,198,255,34,47,15,255,99,120,134,255,5,236,193,0,249,247,126,255,147,187,30,0,50,230,117,255,108,217,219,255,163,81,166,255,72,25,169,254,155,121,79,255,28,155,89,254,7,126,17,0,147,65,33,1,47,234,253,0,26,51,18,0,105,83,199,255,163,196,230,0,113,248,164,0,226,254,218,0,189,209,203,255,164,247,222,254,255,35,165,0,4,188,243,1,127,179,71,0,37,237,254,255,100,186,240,0,5,57,71,254,103,72,73,255,244,18,81,254,229,210,132,255,238,6,180,255,11,229,174,255,227,221,192,1,17,49,28,0,163,215,196,254,9,118,4,255,51,240,71,0,113,129,109,255,76,240,231,0,188,177,127,0,125,71,44,1,26,175,243,0,94,169,25,254,27,230,29,0,15,139,119,1,168,170,186,255,172,197,76,255,252,75,188,0,137,124,196,0,72,22,96,255,45,151,249,1,220,145,100,0,64,192,159,255,120,239,226,0,129,178,146,0,0,192,125,0,235,138,234,0,183,157,146,0,83,199,192,255,184,172,72,255,73,225,128,0,77,6,250,255,186,65,67,0,104,246,207,0,188,32,138,255,218,24,242,0,67,138,81,254,237,129,121,255,20,207,150,1,41,199,16,255,6,20,128,0,159,118,5,0,181,16,143,255,220,38,15,0,23,64,147,254,73,26,13,0,87,228,57,1,204,124,128,0,43,24,223,0,219,99,199,0,22,75,20,255,19,27,126,0,157,62,215,0,110,29,230,0,179,167,255,1,54,252,190,0,221,204,182,254,179,158,65,255,81,157,3,0,194,218,159,0,170,223,0,0,224,11,32,255,38,197,98,0,168,164,37,0,23,88,7,1,164,186,110,0,96,36,134,0,234,242,229,0,250,121,19,0,242,254,112,255,3,47,94,1,9,239,6,255,81,134,153,254,214,253,168,255,67,124,224,0,245,95,74,0,28,30,44,254,1,109,220,255,178,89,89,0,252,36,76,0,24,198,46,255,76,77,111,0,134,234,136,255,39,94,29,0,185,72,234,255,70,68,135,255,231,102,7,254,77,231,140,0,167,47,58,1,148,97,118,255,16,27,225,1,166,206,143,255,110,178,214,255,180,131,162,0,143,141,225,1,13,218,78,255,114,153,33,1,98,104,204,0,175,114,117,1,167,206,75,0,202,196,83,1,58,64,67,0,138,47,111,1,196,247,128,255,137,224,224,254,158,112,207,0,154,100,255,1,134,37,107,0,198,128,79,255,127,209,155,255,163,254,185,254,60,14,243,0,31,219,112,254,29,217,65,0,200,13,116,254,123,60,196,255,224,59,184,254,242,89,196,0,123,16,75,254,149,16,206,0,69,254,48,1,231,116,223,255,209,160,65,1,200,80,98,0,37,194,184,254,148,63,34,0,139,240,65,255,217,144,132,255,56,38,45,254,199,120,210,0,108,177,166,255,160,222,4,0,220,126,119,254,165,107,160,255,82,220,248,1,241,175,136,0,144,141,23,255,169,138,84,0,160,137,78,255,226,118,80,255,52,27,132,255,63,96,139,255,152,250,39,0,188,155,15,0,232,51,150,254,40,15,232,255,240,229,9,255,137,175,27,255,75,73,97,1,218,212,11,0,135,5,162,1,107,185,213,0,2,249,107,255,40,242,70,0,219,200,25,0,25,157,13,0,67,82,80,255,196,249,23,255,145,20,149,0,50,72,146,0,94,76,148,1,24,251,65,0,31,192,23,0,184,212,201,255,123,233,162,1,247,173,72,0,162,87,219,254,126,134,89,0,159,11,12,254,166,105,29,0,73,27,228,1,113,120,183,255,66,163,109,1,212,143,11,255,159,231,168,1,255,128,90,0,57,14,58,254,89,52,10,255,253,8,163,1,0,145,210,255,10,129,85,1,46,181,27,0,103,136,160,254,126,188,209,255,34,35,111,0,215,219,24,255,212,11,214,254,101,5,118,0,232,197,133,255,223,167,109,255,237,80,86,255,70,139,94,0,158,193,191,1,155,15,51,255,15,190,115,0,78,135,207,255,249,10,27,1,181,125,233,0,95,172,13,254,170,213,161,255,39,236,138,255,95,93,87,255,190,128,95,0,125,15,206,0,166,150,159,0,227,15,158,255,206,158,120,255,42,141,128,0,101,178,120,1,156,109,131,0,218,14,44,254,247,168,206,255,212,112,28,0,112,17,228,255,90,16,37,1,197,222,108,0,254,207,83,255,9,90,243,255,243,244,172,0,26,88,115,255,205,116,122,0,191,230,193,0,180,100,11,1,217,37,96,255,154,78,156,0,235,234,31,255,206,178,178,255,149,192,251,0,182,250,135,0,246,22,105,0,124,193,109,255,2,210,149,255,169,17,170,0,0,96,110,255,117,9,8,1,50,123,40,255,193,189,99,0,34,227,160,0,48,80,70,254,211,51,236,0,45,122,245,254,44,174,8,0,173,37,233,255,158,65,171,0,122,69,215,255,90,80,2,255,131,106,96,254,227,114,135,0,205,49,119,254,176,62,64,255,82,51,17,255,241,20,243,255,130,13,8,254,128,217,243,255,162,27,1,254,90,118,241,0,246,198,246,255,55,16,118,255,200,159,157,0,163,17,1,0,140,107,121,0,85,161,118,255,38,0,149,0,156,47,238,0,9,166,166,1,75,98,181,255,50,74,25,0,66,15,47,0,139,225,159,0,76,3,142,255,14,238,184,0,11,207,53,255,183,192,186,1,171,32,174,255,191,76,221,1,247,170,219,0,25,172,50,254,217,9,233,0,203,126,68,255,183,92,48,0,127,167,183,1,65,49,254,0,16,63,127,1,254,21,170,255,59,224,127,254,22,48,63,255,27,78,130,254,40,195,29,0,250,132,112,254,35,203,144,0,104,169,168,0,207,253,30,255,104,40,38,254,94,228,88,0,206,16,128,255,212,55,122,255,223,22,234,0,223,197,127,0,253,181,181,1,145,102,118,0,236,153,36,255,212,217,72,255,20,38,24,254,138,62,62,0,152,140,4,0,230,220,99,255,1,21,212,255,148,201,231,0,244,123,9,254,0,171,210,0,51,58,37,255,1,255,14,255,244,183,145,254,0,242,166,0,22,74,132,0,121,216,41,0,95,195,114,254,133,24,151,255,156,226,231,255,247,5,77,255,246,148,115,254,225,92,81,255,222,80,246,254,170,123,89,255,74,199,141,0,29,20,8,255,138,136,70,255,93,75,92,0,221,147,49,254,52,126,226,0,229,124,23,0,46,9,181,0,205,64,52,1,131,254,28,0,151,158,212,0,131,64,78,0,206,25,171,0,0,230,139,0,191,253,110,254,103,247,167,0,64,40,40,1,42,165,241,255,59,75,228,254,124,243,189,255,196,92,178,255,130,140,86,255,141,89,56,1,147,198,5,255,203,248,158,254,144,162,141,0,11,172,226,0,130,42,21,255,1,167,143,255,144,36,36,255,48,88,164,254,168,170,220,0,98,71,214,0,91,208,79,0,159,76,201,1,166,42,214,255,69,255,0,255,6,128,125,255,190,1,140,0,146,83,218,255,215,238,72,1,122,127,53,0,189,116,165,255,84,8,66,255,214,3,208,255,213,110,133,0,195,168,44,1,158,231,69,0,162,64,200,254,91,58,104,0,182,58,187,254,249,228,136,0,203,134,76,254,99,221,233,0,75,254,214,254,80,69,154,0,64,152,248,254,236,136,202,255,157,105,153,254,149,175,20,0,22,35,19,255,124,121,233,0,186,250,198,254,132,229,139,0,137,80,174,255,165,125,68,0,144,202,148,254,235,239,248,0,135,184,118,0,101,94,17,255,122,72,70,254,69,130,146,0,127,222,248,1,69,127,118,255,30,82,215,254,188,74,19,255,229,167,194,254,117,25,66,255,65,234,56,254,213,22,156,0,151,59,93,254,45,28,27,255,186,126,164,255,32,6,239,0,127,114,99,1,219,52,2,255,99,96,166,254,62,190,126,255,108,222,168,1,75,226,174,0,230,226,199,0,60,117,218,255,252,248,20,1,214,188,204,0,31,194,134,254,123,69,192,255,169,173,36,254,55,98,91,0,223,42,102,254,137,1,102,0,157,90,25,0,239,122,64,255,252,6,233,0,7,54,20,255,82,116,174,0,135,37,54,255,15,186,125,0,227,112,175,255,100,180,225,255,42,237,244,255,244,173,226,254,248,18,33,0,171,99,150,255,74,235,50,255,117,82,32,254,106,168,237,0,207,109,208,1,228,9,186,0,135,60,169,254,179,92,143,0,244,170,104,255,235,45,124,255,70,99,186,0,117,137,183,0,224,31,215,0,40,9,100,0,26,16,95,1,68,217,87,0,8,151,20,255,26,100,58,255,176,165,203,1,52,118,70,0,7,32,254,254,244,254,245,255,167,144,194,255,125,113,23,255,176,121,181,0,136,84,209,0,138,6,30,255,89,48,28,0,33,155,14,255,25,240,154,0,141,205,109,1,70,115,62,255,20,40,107,254,138,154,199,255,94,223,226,255,157,171,38,0,163,177,25,254,45,118,3,255,14,222,23,1,209,190,81,255,118,123,232,1,13,213,101,255,123,55,123,254,27,246,165,0,50,99,76,255,140,214,32,255,97,65,67,255,24,12,28,0,174,86,78,1,64,247,96,0,160,135,67,0,66,55,243,255,147,204,96,255,26,6,33,255,98,51,83,1,153,213,208,255,2,184,54,255,25,218,11,0,49,67,246,254,18,149,72,255,13,25,72,0,42,79,214,0,42,4,38,1,27,139,144,255,149,187,23,0,18,164,132,0,245,84,184,254,120,198,104,255,126,218,96,0,56,117,234,255,13,29,214,254,68,47,10,255,167,154,132,254,152,38,198,0,66,178,89,255,200,46,171,255,13,99,83,255,210,187,253,255,170,45,42,1,138,209,124,0,214,162,141,0,12,230,156,0,102,36,112,254,3,147,67,0,52,215,123,255,233,171,54,255,98,137,62,0,247,218,39,255,231,218,236,0,247,191,127,0,195,146,84,0,165,176,92,255,19,212,94,255,17,74,227,0,88,40,153,1,198,147,1,255,206,67,245,254,240,3,218,255,61,141,213,255,97,183,106,0,195,232,235,254,95,86,154,0,209,48,205,254,118,209,241,255,240,120,223,1,213,29,159,0,163,127,147,255,13,218,93,0,85,24,68,254,70,20,80,255,189,5,140,1,82,97,254,255,99,99,191,255,132,84,133,255,107,218,116,255,112,122,46,0,105,17,32,0,194,160,63,255,68,222,39,1,216,253,92,0,177,105,205,255,149,201,195,0,42,225,11,255,40,162,115,0,9,7,81,0,165,218,219,0,180,22,0,254,29,146,252,255,146,207,225,1,180,135,96,0,31,163,112,0,177,11,219,255,133,12,193,254,43,78,50,0,65,113,121,1,59,217,6,255,110,94,24,1,112,172,111,0,7,15,96,0,36,85,123,0,71,150,21,255,208,73,188,0,192,11,167,1,213,245,34,0,9,230,92,0,162,142,39,255,215,90,27,0,98,97,89,0,94,79,211,0,90,157,240,0,95,220,126,1,102,176,226,0,36,30,224,254,35,31,127,0,231,232,115,1,85,83,130,0,210,73,245,255,47,143,114,255,68,65,197,0,59,72,62,255,183,133,173,254,93,121,118,255,59,177,81,255,234,69,173,255,205,128,177,0,220,244,51,0,26,244,209,1,73,222,77,255,163,8,96,254,150,149,211,0,158,254,203,1,54,127,139,0,161,224,59,0,4,109,22,255,222,42,45,255,208,146,102,255,236,142,187,0,50,205,245,255,10,74,89,254,48,79,142,0,222,76,130,255,30,166,63,0,236,12,13,255,49,184,244,0,187,113,102,0,218,101,253,0,153,57,182,254,32,150,42,0,25,198,146,1,237,241,56,0,140,68,5,0,91,164,172,255,78,145,186,254,67,52,205,0,219,207,129,1,109,115,17,0,54,143,58,1,21,248,120,255,179,255,30,0,193,236,66,255,1,255,7,255,253,192,48,255,19,69,217,1,3,214,0,255,64,101,146,1,223,125,35,255,235,73,179,255,249,167,226,0,225,175,10,1,97,162,58,0,106,112,171,1,84,172,5,255,133,140,178,255,134,245,142,0,97,90,125,255,186,203,185,255,223,77,23,255,192,92,106,0,15,198,115,255,217,152,248,0,171,178,120,255,228,134,53,0,176,54,193,1,250,251,53,0,213,10,100,1,34,199,106,0,151,31,244,254,172,224,87,255,14,237,23,255,253,85,26,255,127,39,116,255,172,104,100,0,251,14,70,255,212,208,138,255,253,211,250,0,176,49,165,0,15,76,123,255,37,218,160,255,92,135,16,1,10,126,114,255,70,5,224,255,247,249,141,0,68,20,60,1,241,210,189,255,195,217,187,1,151,3,113,0,151,92,174,0,231,62,178,255,219,183,225,0,23,23,33,255,205,181,80,0,57,184,248,255,67,180,1,255,90,123,93,255,39,0,162,255,96,248,52,255,84,66,140,0,34,127,228,255,194,138,7,1,166,110,188,0,21,17,155,1,154,190,198,255,214,80,59,255,18,7,143,0,72,29,226,1,199,217,249,0,232,161,71,1,149,190,201,0,217,175,95,254,113,147,67,255,138,143,199,255,127,204,1,0,29,182,83,1,206,230,155,255,186,204,60,0,10,125,85,255,232,96,25,255,255,89,247,255,213,254,175,1,232,193,81,0,28,43,156,254,12,69,8,0,147,24,248,0,18,198,49,0,134,60,35,0,118,246,18,255,49,88,254,254,228,21,186,255,182,65,112,1,219,22,1,255,22,126,52,255,189,53,49,255,112,25,143,0,38,127,55,255,226,101,163,254,208,133,61,255,137,69,174,1,190,118,145,255,60,98,219,255,217,13,245,255,250,136,10,0,84,254,226,0,201,31,125,1,240,51,251,255,31,131,130,255,2,138,50,255,215,215,177,1,223,12,238,255,252,149,56,255,124,91,68,255,72,126,170,254,119,255,100,0,130,135,232,255,14,79,178,0,250,131,197,0,138,198,208,0,121,216,139,254,119,18,36,255,29,193,122,0,16,42,45,255,213,240,235,1,230,190,169,255,198,35,228,254,110,173,72,0,214,221,241,255,56,148,135,0,192,117,78,254,141,93,207,255,143,65,149,0,21,18,98,255,95,44,244,1,106,191,77,0,254,85,8,254,214,110,176,255,73,173,19,254,160,196,199,255,237,90,144,0,193,172,113,255,200,155,136,254,228,90,221,0,137,49,74,1,164,221,215,255,209,189,5,255,105,236,55,255,42,31,129,1,193,255,236,0,46,217,60,0,138,88,187,255,226,82,236,255,81,69,151,255,142,190,16,1,13,134,8,0,127,122,48,255,81,64,156,0,171,243,139,0,237,35,246,0,122,143,193,254,212,122,146,0,95,41,255,1,87,132,77,0,4,212,31,0,17,31,78,0,39,45,173,254,24,142,217,255,95,9,6,255,227,83,6,0,98,59,130,254,62,30,33,0,8,115,211,1,162,97,128,255,7,184,23,254,116,28,168,255,248,138,151,255,98,244,240,0,186,118,130,0,114,248,235,255,105,173,200,1,160,124,71,255,94,36,164,1,175,65,146,255,238,241,170,254,202,198,197,0,228,71,138,254,45,246,109,255,194,52,158,0,133,187,176,0,83,252,154,254,89,189,221,255,170,73,252,0,148,58,125,0,36,68,51,254,42,69,177,255,168,76,86,255,38,100,204,255,38,53,35,0,175,19,97,0,225,238,253,255,81,81,135,0,210,27,255,254,235,73,107,0,8,207,115,0,82,127,136,0,84,99,21,254,207,19,136,0,100,164,101,0,80,208,77,255,132,207,237,255,15,3,15,255,33,166,110,0,156,95,85,255,37,185,111,1,150,106,35,255,166,151,76,0,114,87,135,255,159,194,64,0,12,122,31,255,232,7,101,254,173,119,98,0,154,71,220,254,191,57,53,255,168,232,160,255,224,32,99,255,218,156,165,0,151,153,163,0,217,13,148,1,197,113,89,0,149,28,161,254,207,23,30,0,105,132,227,255,54,230,94,255,133,173,204,255,92,183,157,255,88,144,252,254,102,33,90,0,159,97,3,0,181,218,155,255,240,114,119,0,106,214,53,255,165,190,115,1,152,91,225,255,88,106,44,255,208,61,113,0,151,52,124,0,191,27,156,255,110,54,236,1,14,30,166,255,39,127,207,1,229,199,28,0,188,228,188,254,100,157,235,0,246,218,183,1,107,22,193,255,206,160,95,0,76,239,147,0,207,161,117,0,51,166,2,255,52,117,10,254,73,56,227,255,152,193,225,0,132,94,136,255,101,191,209,0,32,107,229,255,198,43,180,1,100,210,118,0,114,67,153,255,23,88,26,255,89,154,92,1,220,120,140,255,144,114,207,255,252,115,250,255,34,206,72,0,138,133,127,255,8,178,124,1,87,75,97,0,15,229,92,254,240,67,131,255,118,123,227,254,146,120,104,255,145,213,255,1,129,187,70,255,219,119,54,0,1,19,173,0,45,150,148,1,248,83,72,0,203,233,169,1,142,107,56,0,247,249,38,1,45,242,80,255,30,233,103,0,96,82,70,0,23,201,111,0,81,39,30,255,161,183,78,255,194,234,33,255,68,227,140,254,216,206,116,0,70,27,235,255,104,144,79,0,164,230,93,254,214,135,156,0,154,187,242,254,188,20,131,255,36,109,174,0,159,112,241,0,5,110,149,1,36,165,218,0,166,29,19,1,178,46,73,0,93,43,32,254,248,189,237,0,102,155,141,0,201,93,195,255,241,139,253,255,15,111,98,255,108,65,163,254,155,79,190,255,73,174,193,254,246,40,48,255,107,88,11,254,202,97,85,255,253,204,18,255,113,242,66,0,110,160,194,254,208,18,186,0,81,21,60,0,188,104,167,255,124,166,97,254,210,133,142,0,56,242,137,254,41,111,130,0,111,151,58,1,111,213,141,255,183,172,241,255,38,6,196,255,185,7,123,255,46,11,246,0,245,105,119,1,15,2,161,255,8,206,45,255,18,202,74,255,83,124,115,1,212,141,157,0,83,8,209,254,139,15,232,255,172,54,173,254,50,247,132,0,214,189,213,0,144,184,105,0,223,254,248,0,255,147,240,255,23,188,72,0,7,51,54,0,188,25,180,254,220,180,0,255,83,160,20,0,163,189,243,255,58,209,194,255,87,73,60,0,106,24,49,0,245,249,220,0,22,173,167,0,118,11,195,255,19,126,237,0,110,159,37,255,59,82,47,0,180,187,86,0,188,148,208,1,100,37,133,255,7,112,193,0,129,188,156,255,84,106,129,255,133,225,202,0,14,236,111,255,40,20,101,0,172,172,49,254,51,54,74,255,251,185,184,255,93,155,224,255,180,249,224,1,230,178,146,0,72,57,54,254,178,62,184,0,119,205,72,0,185,239,253,255,61,15,218,0,196,67,56,255,234,32,171,1,46,219,228,0,208,108,234,255,20,63,232,255,165,53,199,1,133,228,5,255,52,205,107,0,74,238,140,255,150,156,219,254,239,172,178,255,251,189,223,254,32,142,211,255,218,15,138,1,241,196,80,0,28,36,98,254,22,234,199,0,61,237,220,255,246,57,37,0,142,17,142,255,157,62,26,0,43,238,95,254,3,217,6,255,213,25,240,1,39,220,174,255,154,205,48,254,19,13,192,255,244,34,54,254,140,16,155,0,240,181,5,254,155,193,60,0,166,128,4,255,36,145,56,255,150,240,219,0,120,51,145,0,82,153,42,1,140,236,146,0,107,92,248,1,189,10,3,0,63,136,242,0,211,39,24,0,19,202,161,1,173,27,186,255,210,204,239,254,41,209,162,255,182,254,159,255,172,116,52,0,195,103,222,254,205,69,59,0,53,22,41,1,218,48,194,0,80,210,242,0,210,188,207,0,187,161,161,254,216,17,1,0,136,225,113,0,250,184,63,0,223,30,98,254,77,168,162,0,59,53,175,0,19,201,10,255,139,224,194,0,147,193,154,255,212,189,12,254,1,200,174,255,50,133,113,1,94,179,90,0,173,182,135,0,94,177,113,0,43,89,215,255,136,252,106,255,123,134,83,254,5,245,66,255,82,49,39,1,220,2,224,0,97,129,177,0,77,59,89,0,61,29,155,1,203,171,220,255,92,78,139,0,145,33,181,255,169,24,141,1,55,150,179,0,139,60,80,255,218,39,97,0,2,147,107,255,60,248,72,0,173,230,47,1,6,83,182,255,16,105,162,254,137,212,81,255,180,184,134,1,39,222,164,255,221,105,251,1,239,112,125,0,63,7,97,0,63,104,227,255,148,58,12,0,90,60,224,255,84,212,252,0,79,215,168,0,248,221,199,1,115,121,1,0,36,172,120,0,32,162,187,255,57,107,49,255,147,42,21,0,106,198,43,1,57,74,87,0,126,203,81,255,129,135,195,0,140,31,177,0,221,139,194,0,3,222,215,0,131,68,231,0,177,86,178,254,124,151,180,0,184,124,38,1,70,163,17,0,249,251,181,1,42,55,227,0,226,161,44,0,23,236,110,0,51,149,142,1,93,5,236,0,218,183,106,254,67,24,77,0,40,245,209,255,222,121,153,0,165,57,30,0,83,125,60,0,70,38,82,1,229,6,188,0,109,222,157,255,55,118,63,255,205,151,186,0,227,33,149,255,254,176,246,1,227,177,227,0,34,106,163,254,176,43,79,0,106,95,78,1,185,241,122,255,185,14,61,0,36,1,202,0,13,178,162,255,247,11,132,0,161,230,92,1,65,1,185,255,212,50,165,1,141,146,64,255,158,242,218,0,21,164,125,0,213,139,122,1,67,71,87,0,203,158,178,1,151,92,43,0,152,111,5,255,39,3,239,255,217,255,250,255,176,63,71,255,74,245,77,1,250,174,18,255,34,49,227,255,246,46,251,255,154,35,48,1,125,157,61,255,106,36,78,255,97,236,153,0,136,187,120,255,113,134,171,255,19,213,217,254,216,94,209,255,252,5,61,0,94,3,202,0,3,26,183,255,64,191,43,255,30,23,21,0,129,141,77,255,102,120,7,1,194,76,140,0,188,175,52,255,17,81,148,0,232,86,55,1,225,48,172,0,134,42,42,255,238,50,47,0,169,18,254,0,20,147,87,255,14,195,239,255,69,247,23,0,238,229,128,255,177,49,112,0,168,98,251,255,121,71,248,0,243,8,145,254,246,227,153,255,219,169,177,254,251,139,165,255,12,163,185,255,164,40,171,255,153,159,27,254,243,109,91,255,222,24,112,1,18,214,231,0,107,157,181,254,195,147,0,255,194,99,104,255,89,140,190,255,177,66,126,254,106,185,66,0,49,218,31,0,252,174,158,0,188,79,230,1,238,41,224,0,212,234,8,1,136,11,181,0,166,117,83,255,68,195,94,0,46,132,201,0,240,152,88,0,164,57,69,254,160,224,42,255,59,215,67,255,119,195,141,255,36,180,121,254,207,47,8,255,174,210,223,0,101,197,68,255,255,82,141,1,250,137,233,0,97,86,133,1,16,80,69,0,132,131,159,0,116,93,100,0,45,141,139,0,152,172,157,255,90,43,91,0,71,153,46,0,39,16,112,255,217,136,97,255,220,198,25,254,177,53,49,0,222,88,134,255,128,15,60,0,207,192,169,255,192,116,209,255,106,78,211,1,200,213,183,255,7,12,122,254,222,203,60,255,33,110,199,254,251,106,117,0,228,225,4,1,120,58,7,255,221,193,84,254,112,133,27,0,189,200,201,255,139,135,150,0,234,55,176,255,61,50,65,0,152,108,169,255,220,85,1,255,112,135,227,0,162,26,186,0,207,96,185,254,244,136,107,0,93,153,50,1,198,97,151,0,110,11,86,255,143,117,174,255,115,212,200,0,5,202,183,0,237,164,10,254,185,239,62,0,236,120,18,254,98,123,99,255,168,201,194,254,46,234,214,0,191,133,49,255,99,169,119,0,190,187,35,1,115,21,45,255,249,131,72,0,112,6,123,255,214,49,181,254,166,233,34,0,92,197,102,254,253,228,205,255,3,59,201,1,42,98,46,0,219,37,35,255,169,195,38,0,94,124,193,1,156,43,223,0,95,72,133,254,120,206,191,0,122,197,239,255,177,187,79,255,254,46,2,1,250,167,190,0,84,129,19,0,203,113,166,255,249,31,189,254,72,157,202,255,208,71,73,255,207,24,72,0,10,16,18,1,210,81,76,255,88,208,192,255,126,243,107,255,238,141,120,255,199,121,234,255,137,12,59,255,36,220,123,255,148,179,60,254,240,12,29,0,66,0,97,1,36,30,38,255,115,1,93,255,96,103,231,255], "i8", ALLOC_NONE, Runtime.GLOBAL_BASE);
+/* memory initializer */ allocate([197,158,59,1,192,164,240,0,202,202,57,255,24,174,48,0,89,77,155,1,42,76,215,0,244,151,233,0,23,48,81,0,239,127,52,254,227,130,37,255,248,116,93,1,124,132,118,0,173,254,192,1,6,235,83,255,110,175,231,1,251,28,182,0,129,249,93,254,84,184,128,0,76,181,62,0,175,128,186,0,100,53,136,254,109,29,226,0,221,233,58,1,20,99,74,0,0,22,160,0,134,13,21,0,9,52,55,255,17,89,140,0,175,34,59,0,84,165,119,255,224,226,234,255,7,72,166,255,123,115,255,1,18,214,246,0,250,7,71,1,217,220,185,0,212,35,76,255,38,125,175,0,189,97,210,0,114,238,44,255,41,188,169,254,45,186,154,0,81,92,22,0,132,160,193,0,121,208,98,255,13,81,44,255,203,156,82,0,71,58,21,255,208,114,191,254,50,38,147,0,154,216,195,0,101,25,18,0,60,250,215,255,233,132,235,255,103,175,142,1,16,14,92,0,141,31,110,254,238,241,45,255,153,217,239,1,97,168,47,255,249,85,16,1,28,175,62,255,57,254,54,0,222,231,126,0,166,45,117,254,18,189,96,255,228,76,50,0,200,244,94,0,198,152,120,1,68,34,69,255,12,65,160,254,101,19,90,0,167,197,120,255,68,54,185,255,41,218,188,0,113,168,48,0,88,105,189,1,26,82,32,255,185,93,164,1,228,240,237,255,66,182,53,0,171,197,92,255,107,9,233,1,199,120,144,255,78,49,10,255,109,170,105,255,90,4,31,255,28,244,113,255,74,58,11,0,62,220,246,255,121,154,200,254,144,210,178,255,126,57,129,1,43,250,14,255,101,111,28,1,47,86,241,255,61,70,150,255,53,73,5,255,30,26,158,0,209,26,86,0,138,237,74,0,164,95,188,0,142,60,29,254,162,116,248,255,187,175,160,0,151,18,16,0,209,111,65,254,203,134,39,255,88,108,49,255,131,26,71,255,221,27,215,254,104,105,93,255,31,236,31,254,135,0,211,255,143,127,110,1,212,73,229,0,233,67,167,254,195,1,208,255,132,17,221,255,51,217,90,0,67,235,50,255,223,210,143,0,179,53,130,1,233,106,198,0,217,173,220,255,112,229,24,255,175,154,93,254,71,203,246,255,48,66,133,255,3,136,230,255,23,221,113,254,235,111,213,0,170,120,95,254,251,221,2,0,45,130,158,254,105,94,217,255,242,52,180,254,213,68,45,255,104,38,28,0,244,158,76,0,161,200,96,255,207,53,13,255,187,67,148,0,170,54,248,0,119,162,178,255,83,20,11,0,42,42,192,1,146,159,163,255,183,232,111,0,77,229,21,255,71,53,143,0,27,76,34,0,246,136,47,255,219,39,182,255,92,224,201,1,19,142,14,255,69,182,241,255,163,118,245,0,9,109,106,1,170,181,247,255,78,47,238,255,84,210,176,255,213,107,139,0,39,38,11,0,72,21,150,0,72,130,69,0,205,77,155,254,142,133,21,0,71,111,172,254,226,42,59,255,179,0,215,1,33,128,241,0,234,252,13,1,184,79,8,0,110,30,73,255,246,141,189,0,170,207,218,1,74,154,69,255,138,246,49,255,155,32,100,0,125,74,105,255,90,85,61,255,35,229,177,255,62,125,193,255,153,86,188,1,73,120,212,0,209,123,246,254,135,209,38,255,151,58,44,1,92,69,214,255,14,12,88,255,252,153,166,255,253,207,112,255,60,78,83,255,227,124,110,0,180,96,252,255,53,117,33,254,164,220,82,255,41,1,27,255,38,164,166,255,164,99,169,254,61,144,70,255,192,166,18,0,107,250,66,0,197,65,50,0,1,179,18,255,255,104,1,255,43,153,35,255,80,111,168,0,110,175,168,0,41,105,45,255,219,14,205,255,164,233,140,254,43,1,118,0,233,67,195,0,178,82,159,255,138,87,122,255,212,238,90,255,144,35,124,254,25,140,164,0,251,215,44,254,133,70,107,255,101,227,80,254,92,169,55,0,215,42,49,0,114,180,85,255,33,232,27,1,172,213,25,0,62,176,123,254,32,133,24,255,225,191,62,0,93,70,153,0,181,42,104,1,22,191,224,255,200,200,140,255,249,234,37,0,149,57,141,0,195,56,208,255,254,130,70,255,32,173,240,255,29,220,199,0,110,100,115,255,132,229,249,0,228,233,223,255,37,216,209,254,178,177,209,255,183,45,165,254,224,97,114,0,137,97,168,255,225,222,172,0,165,13,49,1,210,235,204,255,252,4,28,254,70,160,151,0,232,190,52,254,83,248,93,255,62,215,77,1,175,175,179,255,160,50,66,0,121,48,208,0,63,169,209,255,0,210,200,0,224,187,44,1,73,162,82,0,9,176,143,255,19,76,193,255,29,59,167,1,24,43,154,0,28,190,190,0,141,188,129,0,232,235,203,255,234,0,109,255,54,65,159,0,60,88,232,255,121,253,150,254,252,233,131,255,198,110,41,1,83,77,71,255,200,22,59,254,106,253,242,255,21,12,207,255,237,66,189,0,90,198,202,1,225,172,127,0,53,22,202,0,56,230,132,0,1,86,183,0,109,190,42,0,243,68,174,1,109,228,154,0,200,177,122,1,35,160,183,255,177,48,85,255,90,218,169,255,248,152,78,0,202,254,110,0,6,52,43,0,142,98,65,255,63,145,22,0,70,106,93,0,232,138,107,1,110,179,61,255,211,129,218,1,242,209,92,0,35,90,217,1,182,143,106,255,116,101,217,255,114,250,221,255,173,204,6,0,60,150,163,0,73,172,44,255,239,110,80,255,237,76,153,254,161,140,249,0,149,232,229,0,133,31,40,255,174,164,119,0,113,51,214,0,129,228,2,254,64,34,243,0,107,227,244,255,174,106,200,255,84,153,70,1,50,35,16,0,250,74,216,254,236,189,66,255,153,249,13,0,230,178,4,255,221,41,238,0,118,227,121,255,94,87,140,254,254,119,92,0,73,239,246,254,117,87,128,0,19,211,145,255,177,46,252,0,229,91,246,1,69,128,247,255,202,77,54,1,8,11,9,255,153,96,166,0,217,214,173,255,134,192,2,1,0,207,0,0,189,174,107,1,140,134,100,0,158,193,243,1,182,102,171,0,235,154,51,0,142,5,123,255,60,168,89,1,217,14,92,255,19,214,5,1,211,167,254,0,44,6,202,254,120,18,236,255,15,113,184,255,184,223,139,0,40,177,119,254,182,123,90,255,176,165,176,0,247,77,194,0,27,234,120,0,231,0,214,255,59,39,30,0,125,99,145,255,150,68,68,1,141,222,248,0,153,123,210,255,110,127,152,255,229,33,214,1,135,221,197,0,137,97,2,0,12,143,204,255,81,41,188,0,115,79,130,255,94,3,132,0,152,175,187,255,124,141,10,255,126,192,179,255,11,103,198,0,149,6,45,0,219,85,187,1,230,18,178,255,72,182,152,0,3,198,184,255,128,112,224,1,97,161,230,0,254,99,38,255,58,159,197,0,151,66,219,0,59,69,143,255,185,112,249,0,119,136,47,255,123,130,132,0,168,71,95,255,113,176,40,1,232,185,173,0,207,93,117,1,68,157,108,255,102,5,147,254,49,97,33,0,89,65,111,254,247,30,163,255,124,217,221,1,102,250,216,0,198,174,75,254,57,55,18,0,227,5,236,1,229,213,173,0,201,109,218,1,49,233,239,0,30,55,158,1,25,178,106,0,155,111,188,1,94,126,140,0,215,31,238,1,77,240,16,0,213,242,25,1,38,71,168,0,205,186,93,254,49,211,140,255,219,0,180,255,134,118,165,0,160,147,134,255,110,186,35,255,198,243,42,0,243,146,119,0,134,235,163,1,4,241,135,255,193,46,193,254,103,180,79,255,225,4,184,254,242,118,130,0,146,135,176,1,234,111,30,0,69,66,213,254,41,96,123,0,121,94,42,255,178,191,195,255,46,130,42,0,117,84,8,255,233,49,214,254,238,122,109,0,6,71,89,1,236,211,123,0,244,13,48,254,119,148,14,0,114,28,86,255,75,237,25,255,145,229,16,254,129,100,53,255,134,150,120,254,168,157,50,0,23,72,104,255,224,49,14,0,255,123,22,255,151,185,151,255,170,80,184,1,134,182,20,0,41,100,101,1,153,33,16,0,76,154,111,1,86,206,234,255,192,160,164,254,165,123,93,255,1,216,164,254,67,17,175,255,169,11,59,255,158,41,61,255,73,188,14,255,195,6,137,255,22,147,29,255,20,103,3,255,246,130,227,255,122,40,128,0,226,47,24,254,35,36,32,0,152,186,183,255,69,202,20,0,195,133,195,0,222,51,247,0,169,171,94,1,183,0,160,255,64,205,18,1,156,83,15,255,197,58,249,254,251,89,110,255,50,10,88,254,51,43,216,0,98,242,198,1,245,151,113,0,171,236,194,1,197,31,199,255,229,81,38,1,41,59,20,0,253,104,230,0,152,93,14,255,246,242,146,254,214,169,240,255,240,102,108,254,160,167,236,0,154,218,188,0,150,233,202,255,27,19,250,1,2,71,133,255,175,12,63,1,145,183,198,0,104,120,115,255,130,251,247,0,17,212,167,255,62,123,132,255,247,100,189,0,155,223,152,0,143,197,33,0,155,59,44,255,150,93,240,1,127,3,87,255,95,71,207,1,167,85,1,255,188,152,116,255,10,23,23,0,137,195,93,1,54,98,97,0,240,0,168,255,148,188,127,0,134,107,151,0,76,253,171,0,90,132,192,0,146,22,54,0,224,66,54,254,230,186,229,255,39,182,196,0,148,251,130,255,65,131,108,254,128,1,160,0,169,49,167,254,199,254,148,255,251,6,131,0,187,254,129,255,85,82,62,0,178,23,58,255,254,132,5,0,164,213,39,0,134,252,146,254,37,53,81,255,155,134,82,0,205,167,238,255,94,45,180,255,132,40,161,0,254,111,112,1,54,75,217,0,179,230,221,1,235,94,191,255,23,243,48,1,202,145,203,255,39,118,42,255,117,141,253,0,254,0,222,0,43,251,50,0,54,169,234,1,80,68,208,0,148,203,243,254,145,7,135,0,6,254,0,0,252,185,127,0,98,8,129,255,38,35,72,255,211,36,220,1,40,26,89,0,168,64,197,254,3,222,239,255,2,83,215,254,180,159,105,0,58,115,194,0,186,116,106,255,229,247,219,255,129,118,193,0,202,174,183,1,166,161,72,0,201,107,147,254,237,136,74,0,233,230,106,1,105,111,168,0,64,224,30,1,1,229,3,0,102,151,175,255,194,238,228,255,254,250,212,0,187,237,121,0,67,251,96,1,197,30,11,0,183,95,204,0,205,89,138,0,64,221,37,1,255,223,30,255,178,48,211,255,241,200,90,255,167,209,96,255,57,130,221,0,46,114,200,255,61,184,66,0,55,182,24,254,110,182,33,0,171,190,232,255,114,94,31,0,18,221,8,0,47,231,254,0,255,112,83,0,118,15,215,255,173,25,40,254,192,193,31,255,238,21,146,255,171,193,118,255,101,234,53,254,131,212,112,0,89,192,107,1,8,208,27,0,181,217,15,255,231,149,232,0,140,236,126,0,144,9,199,255,12,79,181,254,147,182,202,255,19,109,182,255,49,212,225,0,74,163,203,0,175,233,148,0,26,112,51,0,193,193,9,255,15,135,249,0,150,227,130,0,204,0,219,1,24,242,205,0,238,208,117,255,22,244,112,0,26,229,34,0,37,80,188,255,38,45,206,254,240,90,225,255,29,3,47,255,42,224,76,0,186,243,167,0,32,132,15,255,5,51,125,0,139,135,24,0,6,241,219,0,172,229,133,255,246,214,50,0,231,11,207,255,191,126,83,1,180,163,170,255,245,56,24,1,178,164,211,255,3,16,202,1,98,57,118,255,141,131,89,254,33,51,24,0,243,149,91,255,253,52,14,0,35,169,67,254,49,30,88,255,179,27,36,255,165,140,183,0,58,189,151,0,88,31,0,0,75,169,66,0,66,101,199,255,24,216,199,1,121,196,26,255,14,79,203,254,240,226,81,255,94,28,10,255,83,193,240,255,204,193,131,255,94,15,86,0,218,40,157,0,51,193,209,0,0,242,177,0,102,185,247,0,158,109,116,0,38,135,91,0,223,175,149,0,220,66,1,255,86,60,232,0,25,96,37,255,225,122,162,1,215,187,168,255,158,157,46,0,56,171,162,0,232,240,101,1,122,22,9,0,51,9,21,255,53,25,238,255,217,30,232,254,125,169,148,0,13,232,102,0,148,9,37,0,165,97,141,1,228,131,41,0,222,15,243,255,254,18,17,0,6,60,237,1,106,3,113,0,59,132,189,0,92,112,30,0,105,208,213,0,48,84,179,255,187,121,231,254,27,216,109,255,162,221,107,254,73,239,195,255,250,31,57,255,149,135,89,255,185,23,115,1,3,163,157,255,18,112,250,0,25,57,187,255,161,96,164,0,47,16,243,0,12,141,251,254,67,234,184,255,41,18,161,0,175,6,96,255,160,172,52,254,24,176,183,255,198,193,85,1,124,121,137,255,151,50,114,255,220,203,60,255,207,239,5,1,0,38,107,255,55,238,94,254,70,152,94,0,213,220,77,1,120,17,69,255,85,164,190,255,203,234,81,0,38,49,37,254,61,144,124,0,137,78,49,254,168,247,48,0,95,164,252,0,105,169,135,0,253,228,134,0,64,166,75,0,81,73,20,255,207,210,10,0,234,106,150,255,94,34,90,255,254,159,57,254,220,133,99,0,139,147,180,254,24,23,185,0,41,57,30,255,189,97,76,0,65,187,223,255,224,172,37,255,34,62,95,1,231,144,240,0,77,106,126,254,64,152,91,0,29,98,155,0,226,251,53,255,234,211,5,255,144,203,222,255,164,176,221,254,5,231,24,0,179,122,205,0,36,1,134,255,125,70,151,254,97,228,252,0,172,129,23,254,48,90,209,255,150,224,82,1,84,134,30,0,241,196,46,0,103,113,234,255,46,101,121,254,40,124,250,255,135,45,242,254,9,249,168,255,140,108,131,255,143,163,171,0,50,173,199,255,88,222,142,255,200,95,158,0,142,192,163,255,7,117,135,0,111,124,22,0,236,12,65,254,68,38,65,255,227,174,254,0,244,245,38,0,240,50,208,255,161,63,250,0,60,209,239,0,122,35,19,0,14,33,230,254,2,159,113,0,106,20,127,255,228,205,96,0,137,210,174,254,180,212,144,255,89,98,154,1,34,88,139,0,167,162,112,1,65,110,197,0,241,37,169,0,66,56,131,255,10,201,83,254,133,253,187,255,177,112,45,254,196,251,0,0,196,250,151,255,238,232,214,255,150,209,205,0,28,240,118,0,71,76,83,1,236,99,91,0,42,250,131,1,96,18,64,255,118,222,35,0,113,214,203,255,122,119,184,255,66,19,36,0,204,64,249,0,146,89,139,0,134,62,135,1,104,233,101,0,188,84,26,0,49,249,129,0,208,214,75,255,207,130,77,255,115,175,235,0,171,2,137,255,175,145,186,1,55,245,135,255,154,86,181,1,100,58,246,255,109,199,60,255,82,204,134,255,215,49,230,1,140,229,192,255,222,193,251,255,81,136,15,255,179,149,162,255,23,39,29,255,7,95,75,254,191,81,222,0,241,81,90,255,107,49,201,255,244,211,157,0,222,140,149,255,65,219,56,254,189,246,90,255,178,59,157,1,48,219,52,0,98,34,215,0,28,17,187,255,175,169,24,0,92,79,161,255,236,200,194,1,147,143,234,0,229,225,7,1,197,168,14,0,235,51,53,1,253,120,174,0,197,6,168,255,202,117,171,0,163,21,206,0,114,85,90,255,15,41,10,255,194,19,99,0,65,55,216,254,162,146,116,0,50,206,212,255,64,146,29,255,158,158,131,1,100,165,130,255,172,23,129,255,125,53,9,255,15,193,18,1,26,49,11,255,181,174,201,1,135,201,14,255,100,19,149,0,219,98,79,0,42,99,143,254,96,0,48,255,197,249,83,254,104,149,79,255,235,110,136,254,82,128,44,255,65,41,36,254,88,211,10,0,187,121,187,0,98,134,199,0,171,188,179,254,210,11,238,255,66,123,130,254,52,234,61,0,48,113,23,254,6,86,120,255,119,178,245,0,87,129,201,0,242,141,209,0,202,114,85,0,148,22,161,0,103,195,48,0,25,49,171,255,138,67,130,0,182,73,122,254,148,24,130,0,211,229,154,0,32,155,158,0,84,105,61,0,177,194,9,255,166,89,86,1,54,83,187,0,249,40,117,255,109,3,215,255,53,146,44,1,63,47,179,0,194,216,3,254,14,84,136,0,136,177,13,255,72,243,186,255,117,17,125,255,211,58,211,255,93,79,223,0,90,88,245,255,139,209,111,255,70,222,47,0,10,246,79,255,198,217,178,0,227,225,11,1,78,126,179,255,62,43,126,0,103,148,35,0,129,8,165,254,245,240,148,0,61,51,142,0,81,208,134,0,15,137,115,255,211,119,236,255,159,245,248,255,2,134,136,255,230,139,58,1,160,164,254,0,114,85,141,255,49,166,182,255,144,70,84,1,85,182,7,0,46,53,93,0,9,166,161,255,55,162,178,255,45,184,188,0,146,28,44,254,169,90,49,0,120,178,241,1,14,123,127,255,7,241,199,1,189,66,50,255,198,143,101,254,189,243,135,255,141,24,24,254,75,97,87,0,118,251,154,1,237,54,156,0,171,146,207,255,131,196,246,255,136,64,113,1,151,232,57,0,240,218,115,0,49,61,27,255,64,129,73,1,252,169,27,255,40,132,10,1,90,201,193,255,252,121,240,1,186,206,41,0,43,198,97,0,145,100,183,0,204,216,80,254,172,150,65,0,249,229,196,254,104,123,73,255,77,104,96,254,130,180,8,0,104,123,57,0,220,202,229,255,102,249,211,0,86,14,232,255,182,78,209,0,239,225,164,0,106,13,32,255,120,73,17,255,134,67,233,0,83,254,181,0,183,236,112,1,48,64,131,255,241,216,243,255,65,193,226,0,206,241,100,254,100,134,166,255,237,202,197,0,55,13,81,0,32,124,102,255,40,228,177,0,118,181,31,1,231,160,134,255,119,187,202,0,0,142,60,255,128,38,189,255,166,201,150,0,207,120,26,1,54,184,172,0,12,242,204,254,133,66,230,0,34,38,31,1,184,112,80,0,32,51,165,254,191,243,55,0,58,73,146,254,155,167,205,255,100,104,152,255,197,254,207,255,173,19,247,0,238,10,202,0,239,151,242,0,94,59,39,255,240,29,102,255,10,92,154,255,229,84,219,255,161,129,80,0,208,90,204,1,240,219,174,255,158,102,145,1,53,178,76,255,52,108,168,1,83,222,107,0,211,36,109,0,118,58,56,0,8,29,22,0,237,160,199,0,170,209,157,0,137,71,47,0,143,86,32,0,198,242,2,0,212,48,136,1,92,172,186,0,230,151,105,1,96,191,229,0,138,80,191,254,240,216,130,255,98,43,6,254,168,196,49,0,253,18,91,1,144,73,121,0,61,146,39,1,63,104,24,255,184,165,112,254,126,235,98,0,80,213,98,255,123,60,87,255,82,140,245,1,223,120,173,255,15,198,134,1,206,60,239,0,231,234,92,255,33,238,19,255,165,113,142,1,176,119,38,0,160,43,166,254,239,91,105,0,107,61,194,1,25,4,68,0,15,139,51,0,164,132,106,255,34,116,46,254,168,95,197,0,137,212,23,0,72,156,58,0,137,112,69,254,150,105,154,255,236,201,157,0,23,212,154,255,136,82,227,254,226,59,221,255,95,149,192,0,81,118,52,255,33,43,215,1,14,147,75,255,89,156,121,254,14,18,79,0,147,208,139,1,151,218,62,255,156,88,8,1,210,184,98,255,20,175,123,255,102,83,229,0,220,65,116,1,150,250,4,255,92,142,220,255,34,247,66,255,204,225,179,254,151,81,151,0,71,40,236,255,138,63,62,0,6,79,240,255,183,185,181,0,118,50,27,0,63,227,192,0,123,99,58,1,50,224,155,255,17,225,223,254,220,224,77,255,14,44,123,1,141,128,175,0,248,212,200,0,150,59,183,255,147,97,29,0,150,204,181,0,253,37,71,0,145,85,119,0,154,200,186,0,2,128,249,255,83,24,124,0,14,87,143,0,168,51,245,1,124,151,231,255,208,240,197,1,124,190,185,0,48,58,246,0,20,233,232,0,125,18,98,255,13,254,31,255,245,177,130,255,108,142,35,0,171,125,242,254,140,12,34,255,165,161,162,0,206,205,101,0,247,25,34,1,100,145,57,0,39,70,57,0,118,204,203,255,242,0,162,0,165,244,30,0,198,116,226,0,128,111,153,255,140,54,182,1,60,122,15,255,155,58,57,1,54,50,198,0,171,211,29,255,107,138,167,255,173,107,199,255,109,161,193,0,89,72,242,255,206,115,89,255,250,254,142,254,177,202,94,255,81,89,50,0,7,105,66,255,25,254,255,254,203,64,23,255,79,222,108,255,39,249,75,0,241,124,50,0,239,152,133,0,221,241,105,0,147,151,98,0,213,161,121,254,242,49,137,0,233,37,249,254,42,183,27,0,184,119,230,255,217,32,163,255,208,251,228,1,137,62,131,255,79,64,9,254,94,48,113,0,17,138,50,254,193,255,22,0,247,18,197,1,67,55,104,0,16,205,95,255,48,37,66,0,55,156,63,1,64,82,74,255,200,53,71,254,239,67,125,0,26,224,222,0,223,137,93,255,30,224,202,255,9,220,132,0,198,38,235,1,102,141,86,0,60,43,81,1,136,28,26,0,233,36,8,254,207,242,148,0,164,162,63,0,51,46,224,255,114,48,79,255,9,175,226,0,222,3,193,255,47,160,232,255,255,93,105,254,14,42,230,0,26,138,82,1,208,43,244,0,27,39,38,255,98,208,127,255,64,149,182,255,5,250,209,0,187,60,28,254,49,25,218,255,169,116,205,255,119,18,120,0,156,116,147,255,132,53,109,255,13,10,202,0,110,83,167,0,157,219,137,255,6,3,130,255,50,167,30,255,60,159,47,255,129,128,157,254,94,3,189,0,3,166,68,0,83,223,215,0,150,90,194,1,15,168,65,0,227,83,51,255,205,171,66,255,54,187,60,1,152,102,45,255,119,154,225,0,240,247,136,0,100,197,178,255,139,71,223,255,204,82,16,1,41,206,42,255,156,192,221,255,216,123,244,255,218,218,185,255,187,186,239,255,252,172,160,255,195,52,22,0,144,174,181,254,187,100,115,255,211,78,176,255,27,7,193,0,147,213,104,255,90,201,10,255,80,123,66,1,22,33,186,0,1,7,99,254,30,206,10,0,229,234,5,0,53,30,210,0,138,8,220,254,71,55,167,0,72,225,86,1,118,190,188,0,254,193,101,1,171,249,172,255,94,158,183,254,93,2,108,255,176,93,76,255,73,99,79,255,74,64,129,254,246,46,65,0,99,241,127,254,246,151,102,255,44,53,208,254,59,102,234,0,154,175,164,255,88,242,32,0,111,38,1,0,255,182,190,255,115,176,15,254,169,60,129,0,122,237,241,0,90,76,63,0,62,74,120,255,122,195,110,0,119,4,178,0,222,242,210,0,130,33,46,254,156,40,41,0,167,146,112,1,49,163,111,255,121,176,235,0,76,207,14,255,3,25,198,1,41,235,213,0,85,36,214,1,49,92,109,255,200,24,30,254,168,236,195,0,145,39,124,1,236,195,149,0,90,36,184,255,67,85,170,255,38,35,26,254,131,124,68,255,239,155,35,255,54,201,164,0,196,22,117,255,49,15,205,0,24,224,29,1,126,113,144,0,117,21,182,0,203,159,141,0,223,135,77,0,176,230,176,255,190,229,215,255,99,37,181,255,51,21,138,255,25,189,89,255,49,48,165,254,152,45,247,0,170,108,222,0,80,202,5,0,27,69,103,254,204,22,129,255,180,252,62,254,210,1,91,255,146,110,254,255,219,162,28,0,223,252,213,1,59,8,33,0,206,16,244,0,129,211,48,0,107,160,208,0,112,59,209,0,109,77,216,254,34,21,185,255,246,99,56,255,179,139,19,255,185,29,50,255,84,89,19,0,74,250,98,255,225,42,200,255,192,217,205,255,210,16,167,0,99,132,95,1,43,230,57,0,254,11,203,255,99,188,63,255,119,193,251,254,80,105,54,0,232,181,189,1,183,69,112,255,208,171,165,255,47,109,180,255,123,83,165,0,146,162,52,255,154,11,4,255,151,227,90,255,146,137,97,254,61,233,41,255,94,42,55,255,108,164,236,0,152,68,254,0,10,140,131,255,10,106,79,254,243,158,137,0,67,178,66,254,177,123,198,255,15,62,34,0,197,88,42,255,149,95,177,255,152,0,198,255,149,254,113,255,225,90,163,255,125,217,247,0,18,17,224,0,128,66,120,254,192,25,9,255,50,221,205,0,49,212,70,0,233,255,164,0,2,209,9,0,221,52,219,254,172,224,244,255,94,56,206,1,242,179,2,255,31,91,164,1,230,46,138,255,189,230,220,0,57,47,61,255,111,11,157,0,177,91,152,0,28,230,98,0,97,87,126,0,198,89,145,255,167,79,107,0,249,77,160,1,29,233,230,255,150,21,86,254,60,11,193,0,151,37,36,254,185,150,243,255,228,212,83,1,172,151,180,0,201,169,155,0,244,60,234,0,142,235,4,1,67,218,60,0,192,113,75,1,116,243,207,255,65,172,155,0,81,30,156,255,80,72,33,254,18,231,109,255,142,107,21,254,125,26,132,255,176,16,59,255,150,201,58,0,206,169,201,0,208,121,226,0,40,172,14,255,150,61,94,255,56,57,156,255,141,60,145,255,45,108,149,255,238,145,155,255,209,85,31,254,192,12,210,0,99,98,93,254,152,16,151,0,225,185,220,0,141,235,44,255,160,172,21,254,71,26,31,255,13,64,93,254,28,56,198,0,177,62,248,1,182,8,241,0,166,101,148,255,78,81,133,255,129,222,215,1,188,169,129,255,232,7,97,0,49,112,60,255,217,229,251,0,119,108,138,0,39,19,123,254,131,49,235,0,132,84,145,0,130,230,148,255,25,74,187,0,5,245,54,255,185,219,241,1,18,194,228,255,241,202,102,0,105,113,202,0,155,235,79,0,21,9,178,255,156,1,239,0,200,148,61,0,115,247,210,255,49,221,135,0,58,189,8,1,35,46,9,0,81,65,5,255,52,158,185,255,125,116,46,255,74,140,13,255,210,92,172,254,147,23,71,0,217,224,253,254,115,108,180,255,145,58,48,254,219,177,24,255,156,255,60,1,154,147,242,0,253,134,87,0,53,75,229,0,48,195,222,255,31,175,50,255,156,210,120,255,208,35,222,255,18,248,179,1,2,10,101,255,157,194,248,255,158,204,101,255,104,254,197,255,79,62,4,0,178,172,101,1,96,146,251,255,65,10,156,0,2,137,165,255,116,4,231,0,242,215,1,0,19,35,29,255,43,161,79,0,59,149,246,1,251,66,176,0,200,33,3,255,80,110,142,255,195,161,17,1,228,56,66,255,123,47,145,254,132,4,164,0,67,174,172,0,25,253,114,0,87,97,87,1,250,220,84,0,96,91,200,255,37,125,59,0,19,65,118,0,161,52,241,255,237,172,6,255,176,191,255,255,1,65,130,254,223,190,230,0,101,253,231,255,146,35,109,0,250,29,77,1,49,0,19,0,123,90,155,1,22,86,32,255,218,213,65,0,111,93,127,0,60,93,169,255,8,127,182,0,17,186,14,254,253,137,246,255,213,25,48,254,76,238,0,255,248,92,70,255,99,224,139,0,184,9,255,1,7,164,208,0,205,131,198,1,87,214,199,0,130,214,95,0,221,149,222,0,23,38,171,254,197,110,213,0,43,115,140,254,215,177,118,0,96,52,66,1,117,158,237,0,14,64,182,255,46,63,174,255,158,95,190,255,225,205,177,255,43,5,142,255,172,99,212,255,244,187,147,0,29,51,153,255,228,116,24,254,30,101,207,0,19,246,150,255,134,231,5,0,125,134,226,1,77,65,98,0,236,130,33,255,5,110,62,0,69,108,127,255,7,113,22,0,145,20,83,254,194,161,231,255,131,181,60,0,217,209,177,255,229,148,212,254,3,131,184,0,117,177,187,1,28,14,31,255,176,102,80,0,50,84,151,255,125,31,54,255,21,157,133,255,19,179,139,1,224,232,26,0,34,117,170,255,167,252,171,255,73,141,206,254,129,250,35,0,72,79,236,1,220,229,20,255,41,202,173,255,99,76,238,255,198,22,224,255,108,198,195,255,36,141,96,1,236,158,59,255,106,100,87,0,110,226,2,0,227,234,222,0,154,93,119,255,74,112,164,255,67,91,2,255,21,145,33,255,102,214,137,255,175,230,103,254,163,246,166,0,93,247,116,254,167,224,28,255,220,2,57,1,171,206,84,0,123,228,17,255,27,120,119,0,119,11,147,1,180,47,225,255,104,200,185,254,165,2,114,0,77,78,212,0,45,154,177,255,24,196,121,254,82,157,182,0,90,16,190,1,12,147,197,0,95,239,152,255,11,235,71,0,86,146,119,255,172,134,214,0,60,131,196,0,161,225,129,0,31,130,120,254,95,200,51,0,105,231,210,255,58,9,148,255,43,168,221,255,124,237,142,0,198,211,50,254,46,245,103,0,164,248,84,0,152,70,208,255,180,117,177,0,70,79,185,0,243,74,32,0,149,156,207,0,197,196,161,1,245,53,239,0,15,93,246,254,139,240,49,255,196,88,36,255,162,38,123,0,128,200,157,1,174,76,103,255,173,169,34,254,216,1,171,255,114,51,17,0,136,228,194,0,110,150,56,254,106,246,159,0,19,184,79,255,150,77,240,255,155,80,162,0,0,53,169,255,29,151,86,0,68,94,16,0,92,7,110,254,98,117,149,255,249,77,230,255,253,10,140,0,214,124,92,254,35,118,235,0,89,48,57,1,22,53,166,0,184,144,61,255,179,255,194,0,214,248,61,254,59,110,246,0,121,21,81,254,166,3,228,0,106,64,26,255,69,232,134,255,242,220,53,254,46,220,85,0,113,149,247,255,97,179,103,255,190,127,11,0,135,209,182,0,95,52,129,1,170,144,206,255,122,200,204,255,168,100,146,0,60,144,149,254,70,60,40,0,122,52,177,255,246,211,101,255,174,237,8,0,7,51,120,0,19,31,173,0,126,239,156,255,143,189,203,0,196,128,88,255,233,133,226,255,30,125,173,255,201,108,50,0,123,100,59,255,254,163,3,1,221,148,181,255,214,136,57,254,222,180,137,255,207,88,54,255,28,33,251,255,67,214,52,1,210,208,100,0,81,170,94,0,145,40,53,0,224,111,231,254,35,28,244,255,226,199,195,254,238,17,230,0,217,217,164,254,169,157,221,0,218,46,162,1,199,207,163,255,108,115,162,1,14,96,187,255,118,60,76,0,184,159,152,0,209,231,71,254,42,164,186,255,186,153,51,254,221,171,182,255,162,142,173,0,235,47,193,0,7,139,16,1,95,164,64,255,16,221,166,0,219,197,16,0,132,29,44,255,100,69,117,255,60,235,88,254,40,81,173,0,71,190,61,255,187,88,157,0,231,11,23,0,237,117,164,0,225,168,223,255,154,114,116,255,163,152,242,1,24,32,170,0,125,98,113,254,168,19,76,0,17,157,220,254,155,52,5,0,19,111,161,255,71,90,252,255,173,110,240,0,10,198,121,255,253,255,240,255,66,123,210,0,221,194,215,254,121,163,17,255,225,7,99,0,190,49,182,0,115,9,133,1,232,26,138,255,213,68,132,0,44,119,122,255,179,98,51,0,149,90,106,0,71,50,230,255,10,153,118,255,177,70,25,0,165,87,205,0,55,138,234,0,238,30,97,0,113,155,207,0,98,153,127,0,34,107,219,254,117,114,172,255,76,180,255,254,242,57,179,255,221,34,172,254,56,162,49,255,83,3,255,255,113,221,189,255,188,25,228,254,16,88,89,255,71,28,198,254,22,17,149,255,243,121,254,255,107,202,99,255,9,206,14,1,220,47,153,0,107,137,39,1,97,49,194,255,149,51,197,254,186,58,11,255,107,43,232,1,200,6,14,255,181,133,65,254,221,228,171,255,123,62,231,1,227,234,179,255,34,189,212,254,244,187,249,0,190,13,80,1,130,89,1,0,223,133,173,0,9,222,198,255,66,127,74,0,167,216,93,255,155,168,198,1,66,145,0,0,68,102,46,1,172,90,154,0,216,128,75,255,160,40,51,0,158,17,27,1,124,240,49,0,236,202,176,255,151,124,192,255,38,193,190,0,95,182,61,0,163,147,124,255,255,165,51,255,28,40,17,254,215,96,78,0,86,145,218,254,31,36,202,255,86,9,5,0,111,41,200,255,237,108,97,0,57,62,44,0,117,184,15,1,45,241,116,0,152,1,220,255,157,165,188,0,250,15,131,1,60,44,125,255,65,220,251,255,75,50,184,0,53,90,128,255,231,80,194,255,136,129,127,1,21,18,187,255,45,58,161,255,71,147,34,0,174,249,11,254,35,141,29,0,239,68,177,255,115,110,58,0,238,190,177,1,87,245,166,255,190,49,247,255,146,83,184,255,173,14,39,255,146,215,104,0,142,223,120,0,149,200,155,255,212,207,145,1,16,181,217,0,173,32,87,255,255,35,181,0,119,223,161,1,200,223,94,255,70,6,186,255,192,67,85,255,50,169,152,0,144,26,123,255,56,243,179,254,20,68,136,0,39,140,188,254,253,208,5,255,200,115,135,1,43,172,229,255,156,104,187,0,151,251,167,0,52,135,23,0,151,153,72,0,147,197,107,254,148,158,5,255,238,143,206,0,126,153,137,255,88,152,197,254,7,68,167,0,252,159,165,255,239,78,54,255,24,63,55,255,38,222,94,0,237,183,12,255,206,204,210,0,19,39,246,254,30,74,231,0,135,108,29,1,179,115,0,0,117,118,116,1,132,6,252,255,145,129,161,1,105,67,141,0,82,37,226,255,238,226,228,255,204,214,129,254,162,123,100,255,185,121,234,0,45,108,231,0,66,8,56,255,132,136,128,0,172,224,66,254,175,157,188,0,230,223,226,254,242,219,69,0,184,14,119,1,82,162,56,0,114,123,20,0,162,103,85,255,49,239,99,254,156,135,215,0,111,255,167,254,39,196,214,0,144,38,79,1,249,168,125,0,155,97,156,255,23,52,219,255,150,22,144,0,44,149,165,255,40,127,183,0,196,77,233,255,118,129,210,255,170,135,230,255,214,119,198,0,233,240,35,0,253,52,7,255,117,102,48,255,21,204,154,255,179,136,177,255,23,2,3,1,149,130,89,255,252,17,159,1,70,60,26,0,144,107,17,0,180,190,60,255,56,182,59,255,110,71,54,255,198,18,129,255,149,224,87,255,223,21,152,255,138,22,182,255,250,156,205,0,236,45,208,255,79,148,242,1,101,70,209,0,103,78,174,0,101,144,172,255,152,136,237,1,191,194,136,0,113,80,125,1,152,4,141,0,155,150,53,255,196,116,245,0,239,114,73,254,19,82,17,255,124,125,234,255,40,52,191,0,42,210,158,255,155,132,165,0,178,5,42,1,64,92,40,255,36,85,77,255,178,228,118,0,137,66,96,254,115,226,66,0,110,240,69,254,151,111,80,0,167,174,236,255,227,108,107,255,188,242,65,255,183,81,255,0,57,206,181,255,47,34,181,255,213,240,158,1,71,75,95,0,156,40,24,255,102,210,81,0,171,199,228,255,154,34,41,0,227,175,75,0,21,239,195,0,138,229,95,1,76,192,49,0,117,123,87,1,227,225,130,0,125,62,63,255,2,198,171,0,254,36,13,254,145,186,206,0,148,255,244,255,35,0,166,0,30,150,219,1,92,228,212,0,92,198,60,254,62,133,200,255,201,41,59,0,125,238,109,255,180,163,238,1,140,122,82,0,9,22,88,255,197,157,47,255,153,94,57,0,88,30,182,0,84,161,85,0,178,146,124,0,166,166,7,255,21,208,223,0,156,182,242,0,155,121,185,0,83,156,174,254,154,16,118,255,186,83,232,1,223,58,121,255,29,23,88,0,35,125,127,255,170,5,149,254,164,12,130,255,155,196,29,0,161,96,136,0,7,35,29,1,162,37,251,0,3,46,242,255,0,217,188,0,57,174,226,1,206,233,2,0,57,187,136,254,123,189,9,255,201,117,127,255,186,36,204,0,231,25,216,0,80,78,105,0,19,134,129,255,148,203,68,0,141,81,125,254,248,165,200,255,214,144,135,0,151,55,166,255,38,235,91,0,21,46,154,0,223,254,150,255,35,153,180,255,125,176,29,1,43,98,30,255,216,122,230,255,233,160,12,0,57,185,12,254,240,113,7,255,5,9,16,254,26,91,108,0,109,198,203,0,8,147,40,0,129,134,228,255,124,186,40,255,114,98,132,254,166,132,23,0,99,69,44,0,9,242,238,255,184,53,59,0,132,129,102,255,52,32,243,254,147,223,200,255,123,83,179,254,135,144,201,255,141,37,56,1,151,60,227,255,90,73,156,1,203,172,187,0,80,151,47,255,94,137,231,255,36,191,59,255,225,209,181,255,74,215,213,254,6,118,179,255,153,54,193,1,50,0,231,0,104,157,72,1,140,227,154,255,182,226,16,254,96,225,92,255,115,20,170,254,6,250,78,0,248,75,173,255,53,89,6,255,0,180,118,0,72,173,1,0,64,8,206,1,174,133,223,0,185,62,133,255,214,11,98,0,197,31,208,0,171,167,244,255,22,231,181,1,150,218,185,0,247,169,97,1,165,139,247,255,47,120,149,1,103,248,51,0,60,69,28,254,25,179,196,0,124,7,218,254,58,107,81,0,184,233,156,255,252,74,36,0,118,188,67,0,141,95,53,255,222,94,165,254,46,61,53,0,206,59,115,255,47,236,250,255,74,5,32,1,129,154,238,255,106,32,226,0,121,187,61,255,3,166,241,254,67,170,172,255,29,216,178,255,23,201,252,0,253,110,243,0,200,125,57,0,109,192,96,255,52,115,238,0,38,121,243,255,201,56,33,0,194,118,130,0,75,96,25,255,170,30,230,254,39,63,253,0,36,45,250,255,251,1,239,0,160,212,92,1,45,209,237,0,243,33,87,254,237,84,201,255,212,18,157,254,212,99,127,255,217,98,16,254,139,172,239,0,168,201,130,255,143,193,169,255,238,151,193,1,215,104,41,0,239,61,165,254,2,3,242,0,22,203,177,254,177,204,22,0,149,129,213,254,31,11,41,255,0,159,121,254,160,25,114,255,162,80,200,0,157,151,11,0,154,134,78,1,216,54,252,0,48,103,133,0,105,220,197,0,253,168,77,254,53,179,23,0,24,121,240,1,255,46,96,255,107,60,135,254,98,205,249,255,63,249,119,255,120,59,211,255,114,180,55,254,91,85,237,0,149,212,77,1,56,73,49,0,86,198,150,0,93,209,160,0,69,205,182,255,244,90,43,0,20,36,176,0,122,116,221,0,51,167,39,1,231,1,63,255,13,197,134,0,3,209,34,255,135,59,202,0,167,100,78,0,47,223,76,0,185,60,62,0,178,166,123,1,132,12,161,255,61,174,43,0,195,69,144,0,127,47,191,1,34,44,78,0,57,234,52,1,255,22,40,255,246,94,146,0,83,228,128,0,60,78,224,255,0,96,210,255,153,175,236,0,159,21,73,0,180,115,196,254,131,225,106,0,255,167,134,0,159,8,112,255,120,68,194,255,176,196,198,255,118,48,168,255,93,169,1,0,112,200,102,1,74,24,254,0,19,141,4,254,142,62,63,0,131,179,187,255,77,156,155,255,119,86,164,0,170,208,146,255,208,133,154,255,148,155,58,255,162,120,232,254,252,213,155,0,241,13,42,0,94,50,131,0,179,170,112,0,140,83,151,255,55,119,84,1,140,35,239,255,153,45,67,1,236,175,39,0,54,151,103,255,158,42,65,255,196,239,135,254,86,53,203,0,149,97,47,254,216,35,17,255,70,3,70,1,103,36,90,255,40,26,173,0,184,48,13,0,163,219,217,255,81,6,1,255,221,170,108,254,233,208,93,0,100,201,249,254,86,36,35,255,209,154,30,1,227,201,251,255,2,189,167,254,100,57,3,0,13,128,41,0,197,100,75,0,150,204,235,255,145,174,59,0,120,248,149,255,85,55,225,0,114,210,53,254,199,204,119,0,14,247,74,1,63,251,129,0,67,104,151,1,135,130,80,0,79,89,55,255,117,230,157,255,25,96,143,0,213,145,5,0,69,241,120,1,149,243,95,255,114,42,20,0,131,72,2,0,154,53,20,255,73,62,109,0,196,102,152,0,41,12,204,255,122,38,11,1,250,10,145,0,207,125,148,0,246,244,222,255,41,32,85,1,112,213,126,0,162,249,86,1,71,198,127,255,81,9,21,1,98,39,4,255,204,71,45,1,75,111,137,0,234,59,231,0,32,48,95,255,204,31,114,1,29,196,181,255,51,241,167,254,93,109,142,0,104,144,45,0,235,12,181,255,52,112,164,0,76,254,202,255,174,14,162,0,61,235,147,255,43,64,185,254,233,125,217,0,243,88,167,254,74,49,8,0,156,204,66,0,124,214,123,0,38,221,118,1,146,112,236,0,114,98,177,0,151,89,199,0,87,197,112,0,185,149,161,0,44,96,165,0,248,179,20,255,188,219,216,254,40,62,13,0,243,142,141,0,229,227,206,255,172,202,35,255,117,176,225,255,82,110,38,1,42,245,14,255,20,83,97,0,49,171,10,0,242,119,120,0,25,232,61,0,212,240,147,255,4,115,56,255,145,17,239,254,202,17,251,255,249,18,245,255,99,117,239,0,184,4,179,255,246,237,51,255,37,239,137,255,166,112,166,255,81,188,33,255,185,250,142,255,54,187,173,0,208,112,201,0,246,43,228,1,104,184,88,255,212,52,196,255,51,117,108,255,254,117,155,0,46,91,15,255,87,14,144,255,87,227,204,0,83,26,83,1,159,76,227,0,159,27,213,1,24,151,108,0,117,144,179,254,137,209,82,0,38,159,10,0,115,133,201,0,223,182,156,1,110,196,93,255,57,60,233,0,5,167,105,255,154,197,164,0,96,34,186,255,147,133,37,1,220,99,190,0,1,167,84,255,20,145,171,0,194,197,251,254,95,78,133,255,252,248,243,255,225,93,131,255,187,134,196,255,216,153,170,0,20,118,158,254,140,1,118,0,86,158,15,1,45,211,41,255,147,1,100,254,113,116,76,255,211,127,108,1,103,15,48,0,193,16,102,1,69,51,95,255,107,128,157,0,137,171,233,0,90,124,144,1,106,161,182,0,175,76,236,1,200,141,172,255,163,58,104,0,233,180,52,255,240,253,14,255,162,113,254,255,38,239,138,254,52,46,166,0,241,101,33,254,131,186,156,0,111,208,62,255,124,94,160,255,31,172,254,0,112,174,56,255,188,99,27,255,67,138,251,0,125,58,128,1,156,152,174,255,178,12,247,255,252,84,158,0,82,197,14,254,172,200,83,255,37,39,46,1,106,207,167,0,24,189,34,0,131,178,144,0,206,213,4,0,161,226,210,0,72,51,105,255,97,45,187,255,78,184,223,255,176,29,251,0,79,160,86,255,116,37,178,0,82,77,213,1,82,84,141,255,226,101,212,1,175,88,199,255,245,94,247,1,172,118,109,255,166,185,190,0,131,181,120,0,87,254,93,255,134,240,73,255,32,245,143,255,139,162,103,255,179,98,18,254,217,204,112,0,147,223,120,255,53,10,243,0,166,140,150,0,125,80,200,255,14,109,219,255,91,218,1,255,252,252,47,254,109,156,116,255,115,49,127,1,204,87,211,255,148,202,217,255,26,85,249,255,14,245,134,1,76,89,169,255,242,45,230,0,59,98,172,255,114,73,132,254,78,155,49,255,158,126,84,0,49,175,43,255,16,182,84,255,157,103,35,0,104,193,109,255,67,221,154,0,201,172,1,254,8,162,88,0,165,1,29,255,125,155,229,255,30,154,220,1,103,239,92,0,220,1,109,255,202,198,1,0,94,2,142,1,36,54,44,0,235,226,158,255,170,251,214,255,185,77,9,0,97,74,242,0,219,163,149,255,240,35,118,255,223,114,88,254,192,199,3,0,106,37,24,255,201,161,118,255,97,89,99,1,224,58,103,255,101,199,147,254,222,60,99,0,234,25,59,1,52,135,27,0,102,3,91,254,168,216,235,0,229,232,136,0,104,60,129,0,46,168,238,0,39,191,67,0,75,163,47,0,143,97,98,255,56,216,168,1,168,233,252,255,35,111,22,255,92,84,43,0,26,200,87,1,91,253,152,0,202,56,70,0,142,8,77,0,80,10,175,1,252,199,76,0,22,110,82,255,129,1,194,0,11,128,61,1,87,14,145,255,253,222,190,1,15,72,174,0,85,163,86,254,58,99,44,255,45,24,188,254,26,205,15,0,19,229,210,254,248,67,195,0,99,71,184,0,154,199,37,255,151,243,121,255,38,51,75,255,201,85,130,254,44,65,250,0,57,147,243,254,146,43,59,255,89,28,53,0,33,84,24,255,179,51,18,254,189,70,83,0,11,156,179,1,98,134,119,0,158,111,111,0,119,154,73,255,200,63,140,254,45,13,13,255,154,192,2,254,81,72,42,0,46,160,185,254,44,112,6,0,146,215,149,1,26,176,104,0,68,28,87,1,236,50,153,255,179,128,250,254,206,193,191,255,166,92,137,254,53,40,239,0,210,1,204,254,168,173,35,0,141,243,45,1,36,50,109,255,15,242,194,255,227,159,122,255,176,175,202,254,70,57,72,0,40,223,56,0,208,162,58,255,183,98,93,0,15,111,12,0,30,8,76,255,132,127,246,255,45,242,103,0,69,181,15,255,10,209,30,0,3,179,121,0,241,232,218,1,123,199,88,255,2,210,202,1,188,130,81,255,94,101,208,1,103,36,45], "i8", ALLOC_NONE, Runtime.GLOBAL_BASE+10240);
+/* memory initializer */ allocate([76,193,24,1,95,26,241,255,165,162,187,0,36,114,140,0,202,66,5,255,37,56,147,0,152,11,243,1,127,85,232,255,250,135,212,1,185,177,113,0,90,220,75,255,69,248,146,0,50,111,50,0,92,22,80,0,244,36,115,254,163,100,82,255,25,193,6,1,127,61,36,0,253,67,30,254,65,236,170,255,161,17,215,254,63,175,140,0,55,127,4,0,79,112,233,0,109,160,40,0,143,83,7,255,65,26,238,255,217,169,140,255,78,94,189,255,0,147,190,255,147,71,186,254,106,77,127,255,233,157,233,1,135,87,237,255,208,13,236,1,155,109,36,255,180,100,218,0,180,163,18,0,190,110,9,1,17,63,123,255,179,136,180,255,165,123,123,255,144,188,81,254,71,240,108,255,25,112,11,255,227,218,51,255,167,50,234,255,114,79,108,255,31,19,115,255,183,240,99,0,227,87,143,255,72,217,248,255,102,169,95,1,129,149,149,0,238,133,12,1,227,204,35,0,208,115,26,1,102,8,234,0,112,88,143,1,144,249,14,0,240,158,172,254,100,112,119,0,194,141,153,254,40,56,83,255,121,176,46,0,42,53,76,255,158,191,154,0,91,209,92,0,173,13,16,1,5,72,226,255,204,254,149,0,80,184,207,0,100,9,122,254,118,101,171,255,252,203,0,254,160,207,54,0,56,72,249,1,56,140,13,255,10,64,107,254,91,101,52,255,225,181,248,1,139,255,132,0,230,145,17,0,233,56,23,0,119,1,241,255,213,169,151,255,99,99,9,254,185,15,191,255,173,103,109,1,174,13,251,255,178,88,7,254,27,59,68,255,10,33,2,255,248,97,59,0,26,30,146,1,176,147,10,0,95,121,207,1,188,88,24,0,185,94,254,254,115,55,201,0,24,50,70,0,120,53,6,0,142,66,146,0,228,226,249,255,104,192,222,1,173,68,219,0,162,184,36,255,143,102,137,255,157,11,23,0,125,45,98,0,235,93,225,254,56,112,160,255,70,116,243,1,153,249,55,255,129,39,17,1,241,80,244,0,87,69,21,1,94,228,73,255,78,66,65,255,194,227,231,0,61,146,87,255,173,155,23,255,112,116,219,254,216,38,11,255,131,186,133,0,94,212,187,0,100,47,91,0,204,254,175,255,222,18,215,254,173,68,108,255,227,228,79,255,38,221,213,0,163,227,150,254,31,190,18,0,160,179,11,1,10,90,94,255,220,174,88,0,163,211,229,255,199,136,52,0,130,95,221,255,140,188,231,254,139,113,128,255,117,171,236,254,49,220,20,255,59,20,171,255,228,109,188,0,20,225,32,254,195,16,174,0,227,254,136,1,135,39,105,0,150,77,206,255,210,238,226,0,55,212,132,254,239,57,124,0,170,194,93,255,249,16,247,255,24,151,62,255,10,151,10,0,79,139,178,255,120,242,202,0,26,219,213,0,62,125,35,255,144,2,108,255,230,33,83,255,81,45,216,1,224,62,17,0,214,217,125,0,98,153,153,255,179,176,106,254,131,93,138,255,109,62,36,255,178,121,32,255,120,252,70,0,220,248,37,0,204,88,103,1,128,220,251,255,236,227,7,1,106,49,198,255,60,56,107,0,99,114,238,0,220,204,94,1,73,187,1,0,89,154,34,0,78,217,165,255,14,195,249,255,9,230,253,255,205,135,245,0,26,252,7,255,84,205,27,1,134,2,112,0,37,158,32,0,231,91,237,255,191,170,204,255,152,7,222,0,109,192,49,0,193,166,146,255,232,19,181,255,105,142,52,255,103,16,27,1,253,200,165,0,195,217,4,255,52,189,144,255,123,155,160,254,87,130,54,255,78,120,61,255,14,56,41,0,25,41,125,255,87,168,245,0,214,165,70,0,212,169,6,255,219,211,194,254,72,93,164,255,197,33,103,255,43,142,141,0,131,225,172,0,244,105,28,0,68,68,225,0,136,84,13,255,130,57,40,254,139,77,56,0,84,150,53,0,54,95,157,0,144,13,177,254,95,115,186,0,117,23,118,255,244,166,241,255,11,186,135,0,178,106,203,255,97,218,93,0,43,253,45,0,164,152,4,0,139,118,239,0,96,1,24,254,235,153,211,255,168,110,20,255,50,239,176,0,114,41,232,0,193,250,53,0,254,160,111,254,136,122,41,255,97,108,67,0,215,152,23,255,140,209,212,0,42,189,163,0,202,42,50,255,106,106,189,255,190,68,217,255,233,58,117,0,229,220,243,1,197,3,4,0,37,120,54,254,4,156,134,255,36,61,171,254,165,136,100,255,212,232,14,0,90,174,10,0,216,198,65,255,12,3,64,0,116,113,115,255,248,103,8,0,231,125,18,255,160,28,197,0,30,184,35,1,223,73,249,255,123,20,46,254,135,56,37,255,173,13,229,1,119,161,34,255,245,61,73,0,205,125,112,0,137,104,134,0,217,246,30,255,237,142,143,0,65,159,102,255,108,164,190,0,219,117,173,255,34,37,120,254,200,69,80,0,31,124,218,254,74,27,160,255,186,154,199,255,71,199,252,0,104,81,159,1,17,200,39,0,211,61,192,1,26,238,91,0,148,217,12,0,59,91,213,255,11,81,183,255,129,230,122,255,114,203,145,1,119,180,66,255,72,138,180,0,224,149,106,0,119,82,104,255,208,140,43,0,98,9,182,255,205,101,134,255,18,101,38,0,95,197,166,255,203,241,147,0,62,208,145,255,133,246,251,0,2,169,14,0,13,247,184,0,142,7,254,0,36,200,23,255,88,205,223,0,91,129,52,255,21,186,30,0,143,228,210,1,247,234,248,255,230,69,31,254,176,186,135,255,238,205,52,1,139,79,43,0,17,176,217,254,32,243,67,0,242,111,233,0,44,35,9,255,227,114,81,1,4,71,12,255,38,105,191,0,7,117,50,255,81,79,16,0,63,68,65,255,157,36,110,255,77,241,3,255,226,45,251,1,142,25,206,0,120,123,209,1,28,254,238,255,5,128,126,255,91,222,215,255,162,15,191,0,86,240,73,0,135,185,81,254,44,241,163,0,212,219,210,255,112,162,155,0,207,101,118,0,168,72,56,255,196,5,52,0,72,172,242,255,126,22,157,255,146,96,59,255,162,121,152,254,140,16,95,0,195,254,200,254,82,150,162,0,119,43,145,254,204,172,78,255,166,224,159,0,104,19,237,255,245,126,208,255,226,59,213,0,117,217,197,0,152,72,237,0,220,31,23,254,14,90,231,255,188,212,64,1,60,101,246,255,85,24,86,0,1,177,109,0,146,83,32,1,75,182,192,0,119,241,224,0,185,237,27,255,184,101,82,1,235,37,77,255,253,134,19,0,232,246,122,0,60,106,179,0,195,11,12,0,109,66,235,1,125,113,59,0,61,40,164,0,175,104,240,0,2,47,187,255,50,12,141,0,194,139,181,255,135,250,104,0,97,92,222,255,217,149,201,255,203,241,118,255,79,151,67,0,122,142,218,255,149,245,239,0,138,42,200,254,80,37,97,255,124,112,167,255,36,138,87,255,130,29,147,255,241,87,78,255,204,97,19,1,177,209,22,255,247,227,127,254,99,119,83,255,212,25,198,1,16,179,179,0,145,77,172,254,89,153,14,255,218,189,167,0,107,233,59,255,35,33,243,254,44,112,112,255,161,127,79,1,204,175,10,0,40,21,138,254,104,116,228,0,199,95,137,255,133,190,168,255,146,165,234,1,183,99,39,0,183,220,54,254,255,222,133,0,162,219,121,254,63,239,6,0,225,102,54,255,251,18,246,0,4,34,129,1,135,36,131,0,206,50,59,1,15,97,183,0,171,216,135,255,101,152,43,255,150,251,91,0,38,145,95,0,34,204,38,254,178,140,83,255,25,129,243,255,76,144,37,0,106,36,26,254,118,144,172,255,68,186,229,255,107,161,213,255,46,163,68,255,149,170,253,0,187,17,15,0,218,160,165,255,171,35,246,1,96,13,19,0,165,203,117,0,214,107,192,255,244,123,177,1,100,3,104,0,178,242,97,255,251,76,130,255,211,77,42,1,250,79,70,255,63,244,80,1,105,101,246,0,61,136,58,1,238,91,213,0,14,59,98,255,167,84,77,0,17,132,46,254,57,175,197,255,185,62,184,0,76,64,207,0,172,175,208,254,175,74,37,0,138,27,211,254,148,125,194,0,10,89,81,0,168,203,101,255,43,213,209,1,235,245,54,0,30,35,226,255,9,126,70,0,226,125,94,254,156,117,20,255,57,248,112,1,230,48,64,255,164,92,166,1,224,214,230,255,36,120,143,0,55,8,43,255,251,1,245,1,106,98,165,0,74,107,106,254,53,4,54,255,90,178,150,1,3,120,123,255,244,5,89,1,114,250,61,255,254,153,82,1,77,15,17,0,57,238,90,1,95,223,230,0,236,52,47,254,103,148,164,255,121,207,36,1,18,16,185,255,75,20,74,0,187,11,101,0,46,48,129,255,22,239,210,255,77,236,129,255,111,77,204,255,61,72,97,255,199,217,251,255,42,215,204,0,133,145,201,255,57,230,146,1,235,100,198,0,146,73,35,254,108,198,20,255,182,79,210,255,82,103,136,0,246,108,176,0,34,17,60,255,19,74,114,254,168,170,78,255,157,239,20,255,149,41,168,0,58,121,28,0,79,179,134,255,231,121,135,255,174,209,98,255,243,122,190,0,171,166,205,0,212,116,48,0,29,108,66,255,162,222,182,1,14,119,21,0,213,39,249,255,254,223,228,255,183,165,198,0,133,190,48,0,124,208,109,255,119,175,85,255,9,209,121,1,48,171,189,255,195,71,134,1,136,219,51,255,182,91,141,254,49,159,72,0,35,118,245,255,112,186,227,255,59,137,31,0,137,44,163,0,114,103,60,254,8,213,150,0,162,10,113,255,194,104,72,0,220,131,116,255,178,79,92,0,203,250,213,254,93,193,189,255,130,255,34,254,212,188,151,0,136,17,20,255,20,101,83,255,212,206,166,0,229,238,73,255,151,74,3,255,168,87,215,0,155,188,133,255,166,129,73,0,240,79,133,255,178,211,81,255,203,72,163,254,193,168,165,0,14,164,199,254,30,255,204,0,65,72,91,1,166,74,102,255,200,42,0,255,194,113,227,255,66,23,208,0,229,216,100,255,24,239,26,0,10,233,62,255,123,10,178,1,26,36,174,255,119,219,199,1,45,163,190,0,16,168,42,0,166,57,198,255,28,26,26,0,126,165,231,0,251,108,100,255,61,229,121,255,58,118,138,0,76,207,17,0,13,34,112,254,89,16,168,0,37,208,105,255,35,201,215,255,40,106,101,254,6,239,114,0,40,103,226,254,246,127,110,255,63,167,58,0,132,240,142,0,5,158,88,255,129,73,158,255,94,89,146,0,230,54,146,0,8,45,173,0,79,169,1,0,115,186,247,0,84,64,131,0,67,224,253,255,207,189,64,0,154,28,81,1,45,184,54,255,87,212,224,255,0,96,73,255,129,33,235,1,52,66,80,255,251,174,155,255,4,179,37,0,234,164,93,254,93,175,253,0,198,69,87,255,224,106,46,0,99,29,210,0,62,188,114,255,44,234,8,0,169,175,247,255,23,109,137,255,229,182,39,0,192,165,94,254,245,101,217,0,191,88,96,0,196,94,99,255,106,238,11,254,53,126,243,0,94,1,101,255,46,147,2,0,201,124,124,255,141,12,218,0,13,166,157,1,48,251,237,255,155,250,124,255,106,148,146,255,182,13,202,0,28,61,167,0,217,152,8,254,220,130,45,255,200,230,255,1,55,65,87,255,93,191,97,254,114,251,14,0,32,105,92,1,26,207,141,0,24,207,13,254,21,50,48,255,186,148,116,255,211,43,225,0,37,34,162,254,164,210,42,255,68,23,96,255,182,214,8,255,245,117,137,255,66,195,50,0,75,12,83,254,80,140,164,0,9,165,36,1,228,110,227,0,241,17,90,1,25,52,212,0,6,223,12,255,139,243,57,0,12,113,75,1,246,183,191,255,213,191,69,255,230,15,142,0,1,195,196,255,138,171,47,255,64,63,106,1,16,169,214,255,207,174,56,1,88,73,133,255,182,133,140,0,177,14,25,255,147,184,53,255,10,227,161,255,120,216,244,255,73,77,233,0,157,238,139,1,59,65,233,0,70,251,216,1,41,184,153,255,32,203,112,0,146,147,253,0,87,101,109,1,44,82,133,255,244,150,53,255,94,152,232,255,59,93,39,255,88,147,220,255,78,81,13,1,32,47,252,255,160,19,114,255,93,107,39,255,118,16,211,1,185,119,209,255,227,219,127,254,88,105,236,255,162,110,23,255,36,166,110,255,91,236,221,255,66,234,116,0,111,19,244,254,10,233,26,0,32,183,6,254,2,191,242,0,218,156,53,254,41,60,70,255,168,236,111,0,121,185,126,255,238,142,207,255,55,126,52,0,220,129,208,254,80,204,164,255,67,23,144,254,218,40,108,255,127,202,164,0,203,33,3,255,2,158,0,0,37,96,188,255,192,49,74,0,109,4,0,0,111,167,10,254,91,218,135,255,203,66,173,255,150,194,226,0,201,253,6,255,174,102,121,0,205,191,110,0,53,194,4,0,81,40,45,254,35,102,143,255,12,108,198,255,16,27,232,255,252,71,186,1,176,110,114,0,142,3,117,1,113,77,142,0,19,156,197,1,92,47,252,0,53,232,22,1,54,18,235,0,46,35,189,255,236,212,129,0,2,96,208,254,200,238,199,255,59,175,164,255,146,43,231,0,194,217,52,255,3,223,12,0,138,54,178,254,85,235,207,0,232,207,34,0,49,52,50,255,166,113,89,255,10,45,216,255,62,173,28,0,111,165,246,0,118,115,91,255,128,84,60,0,167,144,203,0,87,13,243,0,22,30,228,1,177,113,146,255,129,170,230,254,252,153,129,255,145,225,43,0,70,231,5,255,122,105,126,254,86,246,148,255,110,37,154,254,209,3,91,0,68,145,62,0,228,16,165,255,55,221,249,254,178,210,91,0,83,146,226,254,69,146,186,0,93,210,104,254,16,25,173,0,231,186,38,0,189,122,140,255,251,13,112,255,105,110,93,0,251,72,170,0,192,23,223,255,24,3,202,1,225,93,228,0,153,147,199,254,109,170,22,0,248,101,246,255,178,124,12,255,178,254,102,254,55,4,65,0,125,214,180,0,183,96,147,0,45,117,23,254,132,191,249,0,143,176,203,254,136,183,54,255,146,234,177,0,146,101,86,255,44,123,143,1,33,209,152,0,192,90,41,254,83,15,125,255,213,172,82,0,215,169,144,0,16,13,34,0,32,209,100,255,84,18,249,1,197,17,236,255,217,186,230,0,49,160,176,255,111,118,97,255,237,104,235,0,79,59,92,254,69,249,11,255,35,172,74,1,19,118,68,0,222,124,165,255,180,66,35,255,86,174,246,0,43,74,111,255,126,144,86,255,228,234,91,0,242,213,24,254,69,44,235,255,220,180,35,0,8,248,7,255,102,47,92,255,240,205,102,255,113,230,171,1,31,185,201,255,194,246,70,255,122,17,187,0,134,70,199,255,149,3,150,255,117,63,103,0,65,104,123,255,212,54,19,1,6,141,88,0,83,134,243,255,136,53,103,0,169,27,180,0,177,49,24,0,111,54,167,0,195,61,215,255,31,1,108,1,60,42,70,0,185,3,162,255,194,149,40,255,246,127,38,254,190,119,38,255,61,119,8,1,96,161,219,255,42,203,221,1,177,242,164,255,245,159,10,0,116,196,0,0,5,93,205,254,128,127,179,0,125,237,246,255,149,162,217,255,87,37,20,254,140,238,192,0,9,9,193,0,97,1,226,0,29,38,10,0,0,136,63,255,229,72,210,254,38,134,92,255,78,218,208,1,104,36,84,255,12,5,193,255,242,175,61,255,191,169,46,1,179,147,147,255,113,190,139,254,125,172,31,0,3,75,252,254,215,36,15,0,193,27,24,1,255,69,149,255,110,129,118,0,203,93,249,0,138,137,64,254,38,70,6,0,153,116,222,0,161,74,123,0,193,99,79,255,118,59,94,255,61,12,43,1,146,177,157,0,46,147,191,0,16,255,38,0,11,51,31,1,60,58,98,255,111,194,77,1,154,91,244,0,140,40,144,1,173,10,251,0,203,209,50,254,108,130,78,0,228,180,90,0,174,7,250,0,31,174,60,0,41,171,30,0,116,99,82,255,118,193,139,255,187,173,198,254,218,111,56,0,185,123,216,0,249,158,52,0,52,180,93,255,201,9,91,255,56,45,166,254,132,155,203,255,58,232,110,0,52,211,89,255,253,0,162,1,9,87,183,0,145,136,44,1,94,122,245,0,85,188,171,1,147,92,198,0,0,8,104,0,30,95,174,0,221,230,52,1,247,247,235,255,137,174,53,255,35,21,204,255,71,227,214,1,232,82,194,0,11,48,227,255,170,73,184,255,198,251,252,254,44,112,34,0,131,101,131,255,72,168,187,0,132,135,125,255,138,104,97,255,238,184,168,255,243,104,84,255,135,216,226,255,139,144,237,0,188,137,150,1,80,56,140,255,86,169,167,255,194,78,25,255,220,17,180,255,17,13,193,0,117,137,212,255,141,224,151,0,49,244,175,0,193,99,175,255,19,99,154,1,255,65,62,255,156,210,55,255,242,244,3,255,250,14,149,0,158,88,217,255,157,207,134,254,251,232,28,0,46,156,251,255,171,56,184,255,239,51,234,0,142,138,131,255,25,254,243,1,10,201,194,0,63,97,75,0,210,239,162,0,192,200,31,1,117,214,243,0,24,71,222,254,54,40,232,255,76,183,111,254,144,14,87,255,214,79,136,255,216,196,212,0,132,27,140,254,131,5,253,0,124,108,19,255,28,215,75,0,76,222,55,254,233,182,63,0,68,171,191,254,52,111,222,255,10,105,77,255,80,170,235,0,143,24,88,255,45,231,121,0,148,129,224,1,61,246,84,0,253,46,219,255,239,76,33,0,49,148,18,254,230,37,69,0,67,134,22,254,142,155,94,0,31,157,211,254,213,42,30,255,4,228,247,254,252,176,13,255,39,0,31,254,241,244,255,255,170,45,10,254,253,222,249,0,222,114,132,0,255,47,6,255,180,163,179,1,84,94,151,255,89,209,82,254,229,52,169,255,213,236,0,1,214,56,228,255,135,119,151,255,112,201,193,0,83,160,53,254,6,151,66,0,18,162,17,0,233,97,91,0,131,5,78,1,181,120,53,255,117,95,63,255,237,117,185,0,191,126,136,255,144,119,233,0,183,57,97,1,47,201,187,255,167,165,119,1,45,100,126,0,21,98,6,254,145,150,95,255,120,54,152,0,209,98,104,0,143,111,30,254,184,148,249,0,235,216,46,0,248,202,148,255,57,95,22,0,242,225,163,0,233,247,232,255,71,171,19,255,103,244,49,255,84,103,93,255,68,121,244,1,82,224,13,0,41,79,43,255,249,206,167,255,215,52,21,254,192,32,22,255,247,111,60,0,101,74,38,255,22,91,84,254,29,28,13,255,198,231,215,254,244,154,200,0,223,137,237,0,211,132,14,0,95,64,206,255,17,62,247,255,233,131,121,1,93,23,77,0,205,204,52,254,81,189,136,0,180,219,138,1,143,18,94,0,204,43,140,254,188,175,219,0,111,98,143,255,151,63,162,255,211,50,71,254,19,146,53,0,146,45,83,254,178,82,238,255,16,133,84,255,226,198,93,255,201,97,20,255,120,118,35,255,114,50,231,255,162,229,156,255,211,26,12,0,114,39,115,255,206,212,134,0,197,217,160,255,116,129,94,254,199,215,219,255,75,223,249,1,253,116,181,255,232,215,104,255,228,130,246,255,185,117,86,0,14,5,8,0,239,29,61,1,237,87,133,255,125,146,137,254,204,168,223,0,46,168,245,0,154,105,22,0,220,212,161,255,107,69,24,255,137,218,181,255,241,84,198,255,130,122,211,255,141,8,153,255,190,177,118,0,96,89,178,0,255,16,48,254,122,96,105,255,117,54,232,255,34,126,105,255,204,67,166,0,232,52,138,255,211,147,12,0,25,54,7,0,44,15,215,254,51,236,45,0,190,68,129,1,106,147,225,0,28,93,45,254,236,141,15,255,17,61,161,0,220,115,192,0,236,145,24,254,111,168,169,0,224,58,63,255,127,164,188,0,82,234,75,1,224,158,134,0,209,68,110,1,217,166,217,0,70,225,166,1,187,193,143,255,16,7,88,255,10,205,140,0,117,192,156,1,17,56,38,0,27,124,108,1,171,215,55,255,95,253,212,0,155,135,168,255,246,178,153,254,154,68,74,0,232,61,96,254,105,132,59,0,33,76,199,1,189,176,130,255,9,104,25,254,75,198,102,255,233,1,112,0,108,220,20,255,114,230,70,0,140,194,133,255,57,158,164,254,146,6,80,255,169,196,97,1,85,183,130,0,70,158,222,1,59,237,234,255,96,25,26,255,232,175,97,255,11,121,248,254,88,35,194,0,219,180,252,254,74,8,227,0,195,227,73,1,184,110,161,255,49,233,164,1,128,53,47,0,82,14,121,255,193,190,58,0,48,174,117,255,132,23,32,0,40,10,134,1,22,51,25,255,240,11,176,255,110,57,146,0,117,143,239,1,157,101,118,255,54,84,76,0,205,184,18,255,47,4,72,255,78,112,85,255,193,50,66,1,93,16,52,255,8,105,134,0,12,109,72,255,58,156,251,0,144,35,204,0,44,160,117,254,50,107,194,0,1,68,165,255,111,110,162,0,158,83,40,254,76,214,234,0,58,216,205,255,171,96,147,255,40,227,114,1,176,227,241,0,70,249,183,1,136,84,139,255,60,122,247,254,143,9,117,255,177,174,137,254,73,247,143,0,236,185,126,255,62,25,247,255,45,64,56,255,161,244,6,0,34,57,56,1,105,202,83,0,128,147,208,0,6,103,10,255,74,138,65,255,97,80,100,255,214,174,33,255,50,134,74,255,110,151,130,254,111,84,172,0,84,199,75,254,248,59,112,255,8,216,178,1,9,183,95,0,238,27,8,254,170,205,220,0,195,229,135,0,98,76,237,255,226,91,26,1,82,219,39,255,225,190,199,1,217,200,121,255,81,179,8,255,140,65,206,0,178,207,87,254,250,252,46,255,104,89,110,1,253,189,158,255,144,214,158,255,160,245,54,255,53,183,92,1,21,200,194,255,146,33,113,1,209,1,255,0,235,106,43,255,167,52,232,0,157,229,221,0,51,30,25,0,250,221,27,1,65,147,87,255,79,123,196,0,65,196,223,255,76,44,17,1,85,241,68,0,202,183,249,255,65,212,212,255,9,33,154,1,71,59,80,0,175,194,59,255,141,72,9,0,100,160,244,0,230,208,56,0,59,25,75,254,80,194,194,0,18,3,200,254,160,159,115,0,132,143,247,1,111,93,57,255,58,237,11,1,134,222,135,255,122,163,108,1,123,43,190,255,251,189,206,254,80,182,72,255,208,246,224,1,17,60,9,0,161,207,38,0,141,109,91,0,216,15,211,255,136,78,110,0,98,163,104,255,21,80,121,255,173,178,183,1,127,143,4,0,104,60,82,254,214,16,13,255,96,238,33,1,158,148,230,255,127,129,62,255,51,255,210,255,62,141,236,254,157,55,224,255,114,39,244,0,192,188,250,255,228,76,53,0,98,84,81,255,173,203,61,254,147,50,55,255,204,235,191,0,52,197,244,0,88,43,211,254,27,191,119,0,188,231,154,0,66,81,161,0,92,193,160,1,250,227,120,0,123,55,226,0,184,17,72,0,133,168,10,254,22,135,156,255,41,25,103,255,48,202,58,0,186,149,81,255,188,134,239,0,235,181,189,254,217,139,188,255,74,48,82,0,46,218,229,0,189,253,251,0,50,229,12,255,211,141,191,1,128,244,25,255,169,231,122,254,86,47,189,255,132,183,23,255,37,178,150,255,51,137,253,0,200,78,31,0,22,105,50,0,130,60,0,0,132,163,91,254,23,231,187,0,192,79,239,0,157,102,164,255,192,82,20,1,24,181,103,255,240,9,234,0,1,123,164,255,133,233,0,255,202,242,242,0,60,186,245,0,241,16,199,255,224,116,158,254,191,125,91,255,224,86,207,0,121,37,231,255,227,9,198,255,15,153,239,255,121,232,217,254,75,112,82,0,95,12,57,254,51,214,105,255,148,220,97,1,199,98,36,0,156,209,12,254,10,212,52,0,217,180,55,254,212,170,232,255,216,20,84,255,157,250,135,0,157,99,127,254,1,206,41,0,149,36,70,1,54,196,201,255,87,116,0,254,235,171,150,0,27,163,234,0,202,135,180,0,208,95,0,254,123,156,93,0,183,62,75,0,137,235,182,0,204,225,255,255,214,139,210,255,2,115,8,255,29,12,111,0,52,156,1,0,253,21,251,255,37,165,31,254,12,130,211,0,106,18,53,254,42,99,154,0,14,217,61,254,216,11,92,255,200,197,112,254,147,38,199,0,36,252,120,254,107,169,77,0,1,123,159,255,207,75,102,0,163,175,196,0,44,1,240,0,120,186,176,254,13,98,76,255,237,124,241,255,232,146,188,255,200,96,224,0,204,31,41,0,208,200,13,0,21,225,96,255,175,156,196,0,247,208,126,0,62,184,244,254,2,171,81,0,85,115,158,0,54,64,45,255,19,138,114,0,135,71,205,0,227,47,147,1,218,231,66,0,253,209,28,0,244,15,173,255,6,15,118,254,16,150,208,255,185,22,50,255,86,112,207,255,75,113,215,1,63,146,43,255,4,225,19,254,227,23,62,255,14,255,214,254,45,8,205,255,87,197,151,254,210,82,215,255,245,248,247,255,128,248,70,0,225,247,87,0,90,120,70,0,213,245,92,0,13,133,226,0,47,181,5,1,92,163,105,255,6,30,133,254,232,178,61,255,230,149,24,255,18,49,158,0,228,100,61,254,116,243,251,255,77,75,92,1,81,219,147,255,76,163,254,254,141,213,246,0,232,37,152,254,97,44,100,0,201,37,50,1,212,244,57,0,174,171,183,255,249,74,112,0,166,156,30,0,222,221,97,255,243,93,73,254,251,101,100,255,216,217,93,255,254,138,187,255,142,190,52,255,59,203,177,255,200,94,52,0,115,114,158,255,165,152,104,1,126,99,226,255,118,157,244,1,107,200,16,0,193,90,229,0,121,6,88,0,156,32,93,254,125,241,211,255,14,237,157,255,165,154,21,255,184,224,22,255,250,24,152,255,113,77,31,0,247,171,23,255,237,177,204,255,52,137,145,255,194,182,114,0,224,234,149,0,10,111,103,1,201,129,4,0,238,142,78,0,52,6,40,255,110,213,165,254,60,207,253,0,62,215,69,0,96,97,0,255,49,45,202,0,120,121,22,255,235,139,48,1,198,45,34,255,182,50,27,1,131,210,91,255,46,54,128,0,175,123,105,255,198,141,78,254,67,244,239,255,245,54,103,254,78,38,242,255,2,92,249,254,251,174,87,255,139,63,144,0,24,108,27,255,34,102,18,1,34,22,152,0,66,229,118,254,50,143,99,0,144,169,149,1,118,30,152,0,178,8,121,1,8,159,18,0,90,101,230,255,129,29,119,0,68,36,11,1,232,183,55,0,23,255,96,255,161,41,193,255,63,139,222,0,15,179,243,0,255,100,15,255,82,53,135,0,137,57,149,1,99,240,170,255,22,230,228,254,49,180,82,255,61,82,43,0,110,245,217,0,199,125,61,0,46,253,52,0,141,197,219,0,211,159,193,0,55,121,105,254,183,20,129,0,169,119,170,255,203,178,139,255,135,40,182,255,172,13,202,255,65,178,148,0,8,207,43,0,122,53,127,1,74,161,48,0,227,214,128,254,86,11,243,255,100,86,7,1,245,68,134,255,61,43,21,1,152,84,94,255,190,60,250,254,239,118,232,255,214,136,37,1,113,76,107,255,93,104,100,1,144,206,23,255,110,150,154,1,228,103,185,0,218,49,50,254,135,77,139,255,185,1,78,0,0,161,148,255,97,29,233,255,207,148,149,255,160,168,0,0,91,128,171,255,6,28,19,254,11,111,247,0,39,187,150,255,138,232,149,0,117,62,68,255,63,216,188,255,235,234,32,254,29,57,160,255,25,12,241,1,169,60,191,0,32,131,141,255,237,159,123,255,94,197,94,254,116,254,3,255,92,179,97,254,121,97,92,255,170,112,14,0,21,149,248,0,248,227,3,0,80,96,109,0,75,192,74,1,12,90,226,255,161,106,68,1,208,114,127,255,114,42,255,254,74,26,74,255,247,179,150,254,121,140,60,0,147,70,200,255,214,40,161,255,161,188,201,255,141,65,135,255,242,115,252,0,62,47,202,0,180,149,255,254,130,55,237,0,165,17,186,255,10,169,194,0,156,109,218,255,112,140,123,255,104,128,223,254,177,142,108,255,121,37,219,255,128,77,18,255,111,108,23,1,91,192,75,0,174,245,22,255,4,236,62,255,43,64,153,1,227,173,254,0,237,122,132,1,127,89,186,255,142,82,128,254,252,84,174,0,90,179,177,1,243,214,87,255,103,60,162,255,208,130,14,255,11,130,139,0,206,129,219,255,94,217,157,255,239,230,230,255,116,115,159,254,164,107,95,0,51,218,2,1,216,125,198,255,140,202,128,254,11,95,68,255,55,9,93,254,174,153,6,255,204,172,96,0,69,160,110,0,213,38,49,254,27,80,213,0,118,125,114,0,70,70,67,255,15,142,73,255,131,122,185,255,243,20,50,254,130,237,40,0,210,159,140,1,197,151,65,255,84,153,66,0,195,126,90,0,16,238,236,1,118,187,102,255,3,24,133,255,187,69,230,0,56,197,92,1,213,69,94,255,80,138,229,1,206,7,230,0,222,111,230,1,91,233,119,255,9,89,7,1,2,98,1,0,148,74,133,255,51,246,180,255,228,177,112,1,58,189,108,255,194,203,237,254,21,209,195,0,147,10,35,1,86,157,226,0,31,163,139,254,56,7,75,255,62,90,116,0,181,60,169,0,138,162,212,254,81,167,31,0,205,90,112,255,33,112,227,0,83,151,117,1,177,224,73,255,174,144,217,255,230,204,79,255,22,77,232,255,114,78,234,0,224,57,126,254,9,49,141,0,242,147,165,1,104,182,140,255,167,132,12,1,123,68,127,0,225,87,39,1,251,108,8,0,198,193,143,1,121,135,207,255,172,22,70,0,50,68,116,255,101,175,40,255,248,105,233,0,166,203,7,0,110,197,218,0,215,254,26,254,168,226,253,0,31,143,96,0,11,103,41,0,183,129,203,254,100,247,74,255,213,126,132,0,210,147,44,0,199,234,27,1,148,47,181,0,155,91,158,1,54,105,175,255,2,78,145,254,102,154,95,0,128,207,127,254,52,124,236,255,130,84,71,0,221,243,211,0,152,170,207,0,222,106,199,0,183,84,94,254,92,200,56,255,138,182,115,1,142,96,146,0,133,136,228,0,97,18,150,0,55,251,66,0,140,102,4,0,202,103,151,0,30,19,248,255,51,184,207,0,202,198,89,0,55,197,225,254,169,95,249,255,66,65,68,255,188,234,126,0,166,223,100,1,112,239,244,0,144,23,194,0,58,39,182,0,244,44,24,254,175,68,179,255,152,118,154,1,176,162,130,0,217,114,204,254,173,126,78,255,33,222,30,255,36,2,91,255,2,143,243,0,9,235,215,0,3,171,151,1,24,215,245,255,168,47,164,254,241,146,207,0,69,129,180,0,68,243,113,0,144,53,72,254,251,45,14,0,23,110,168,0,68,68,79,255,110,70,95,254,174,91,144,255,33,206,95,255,137,41,7,255,19,187,153,254,35,255,112,255,9,145,185,254,50,157,37,0,11,112,49,1,102,8,190,255,234,243,169,1,60,85,23,0,74,39,189,0,116,49,239,0,173,213,210,0,46,161,108,255,159,150,37,0,196,120,185,255,34,98,6,255,153,195,62,255,97,230,71,255,102,61,76,0,26,212,236,255,164,97,16,0,198,59,146,0,163,23,196,0,56,24,61,0,181,98,193,0,251,147,229,255,98,189,24,255,46,54,206,255,234,82,246,0,183,103,38,1,109,62,204,0,10,240,224,0,146,22,117,255,142,154,120,0,69,212,35,0,208,99,118,1,121,255,3,255,72,6,194,0,117,17,197,255,125,15,23,0,154,79,153,0,214,94,197,255,185,55,147,255,62,254,78,254,127,82,153,0,110,102,63,255,108,82,161,255,105,187,212,1,80,138,39,0,60,255,93,255,72,12,186,0,210,251,31,1,190,167,144,255,228,44,19,254,128,67,232,0,214,249,107,254,136,145,86,255,132,46,176,0,189,187,227,255,208,22,140,0,217,211,116,0,50,81,186,254,139,250,31,0,30,64,198,1,135,155,100,0,160,206,23,254,187,162,211,255,16,188,63,0,254,208,49,0,85,84,191,0,241,192,242,255,153,126,145,1,234,162,162,255,230,97,216,1,64,135,126,0,190,148,223,1,52,0,43,255,28,39,189,1,64,136,238,0,175,196,185,0,98,226,213,255,127,159,244,1,226,175,60,0,160,233,142,1,180,243,207,255,69,152,89,1,31,101,21,0,144,25,164,254,139,191,209,0,91,25,121,0,32,147,5,0,39,186,123,255,63,115,230,255,93,167,198,255,143,213,220,255,179,156,19,255,25,66,122,0,214,160,217,255,2,45,62,255,106,79,146,254,51,137,99,255,87,100,231,255,175,145,232,255,101,184,1,255,174,9,125,0,82,37,161,1,36,114,141,255,48,222,142,255,245,186,154,0,5,174,221,254,63,114,155,255,135,55,160,1,80,31,135,0,126,250,179,1,236,218,45,0,20,28,145,1,16,147,73,0,249,189,132,1,17,189,192,255,223,142,198,255,72,20,15,255,250,53,237,254,15,11,18,0,27,211,113,254,213,107,56,255,174,147,146,255,96,126,48,0,23,193,109,1,37,162,94,0,199,157,249,254,24,128,187,255,205,49,178,254,93,164,42,255,43,119,235,1,88,183,237,255,218,210,1,255,107,254,42,0,230,10,99,255,162,0,226,0,219,237,91,0,129,178,203,0,208,50,95,254,206,208,95,255,247,191,89,254,110,234,79,255,165,61,243,0,20,122,112,255,246,246,185,254,103,4,123,0,233,99,230,1,219,91,252,255,199,222,22,255,179,245,233,255,211,241,234,0,111,250,192,255,85,84,136,0,101,58,50,255,131,173,156,254,119,45,51,255,118,233,16,254,242,90,214,0,94,159,219,1,3,3,234,255,98,76,92,254,80,54,230,0,5,228,231,254,53,24,223,255,113,56,118,1,20,132,1,255,171,210,236,0,56,241,158,255,186,115,19,255,8,229,174,0,48,44,0,1,114,114,166,255,6,73,226,255,205,89,244,0,137,227,75,1,248,173,56,0,74,120,246,254,119,3,11,255,81,120,198,255,136,122,98,255,146,241,221,1,109,194,78,255,223,241,70,1,214,200,169,255,97,190,47,255,47,103,174,255,99,92,72,254,118,233,180,255,193,35,233,254,26,229,32,255,222,252,198,0,204,43,71,255,199,84,172,0,134,102,190,0,111,238,97,254,230,40,230,0,227,205,64,254,200,12,225,0,166,25,222,0,113,69,51,255,143,159,24,0,167,184,74,0,29,224,116,254,158,208,233,0,193,116,126,255,212,11,133,255,22,58,140,1,204,36,51,255,232,30,43,0,235,70,181,255,64,56,146,254,169,18,84,255,226,1,13,255,200,50,176,255,52,213,245,254,168,209,97,0,191,71,55,0,34,78,156,0,232,144,58,1,185,74,189,0,186,142,149,254,64,69,127,255,161,203,147,255,176,151,191,0,136,231,203,254,163,182,137,0,161,126,251,254,233,32,66,0,68,207,66,0,30,28,37,0,93,114,96,1,254,92,247,255,44,171,69,0,202,119,11,255,188,118,50,1,255,83,136,255,71,82,26,0,70,227,2,0,32,235,121,1,181,41,154,0,71,134,229,254,202,255,36,0,41,152,5,0,154,63,73,255,34,182,124,0,121,221,150,255,26,204,213,1,41,172,87,0,90,157,146,255,109,130,20,0,71,107,200,255,243,102,189,0,1,195,145,254,46,88,117,0,8,206,227,0,191,110,253,255,109,128,20,254,134,85,51,255,137,177,112,1,216,34,22,255,131,16,208,255,121,149,170,0,114,19,23,1,166,80,31,255,113,240,122,0,232,179,250,0,68,110,180,254,210,170,119,0,223,108,164,255,207,79,233,255,27,229,226,254,209,98,81,255,79,68,7,0,131,185,100,0,170,29,162,255,17,162,107,255,57,21,11,1,100,200,181,255,127,65,166,1,165,134,204,0,104,167,168,0,1,164,79,0,146,135,59,1,70,50,128,255,102,119,13,254,227,6,135,0,162,142,179,255,160,100,222,0,27,224,219,1,158,93,195,255,234,141,137,0,16,24,125,255,238,206,47,255,97,17,98,255,116,110,12,255,96,115,77,0,91,227,232,255,248,254,79,255,92,229,6,254,88,198,139,0,206,75,129,0,250,77,206,255,141,244,123,1,138,69,220,0,32,151,6,1,131,167,22,255,237,68,167,254,199,189,150,0,163,171,138,255,51,188,6,255,95,29,137,254,148,226,179,0,181,107,208,255,134,31,82,255,151,101,45,255,129,202,225,0,224,72,147,0,48,138,151,255,195,64,206,254,237,218,158,0,106,29,137,254,253,189,233,255,103,15,17,255,194,97,255,0,178,45,169,254,198,225,155,0,39,48,117,255,135,106,115,0,97,38,181,0,150,47,65,255,83,130,229,254,246,38,129,0,92,239,154,254,91,99,127,0,161,111,33,255,238,217,242,255,131,185,195,255,213,191,158,255,41,150,218,0,132,169,131,0,89,84,252,1,171,70,128,255,163,248,203,254,1,50,180,255,124,76,85,1,251,111,80,0,99,66,239,255,154,237,182,255,221,126,133,254,74,204,99,255,65,147,119,255,99,56,167,255,79,248,149,255,116,155,228,255,237,43,14,254,69,137,11,255,22,250,241,1,91,122,143,255,205,249,243,0,212,26,60,255,48,182,176,1,48,23,191,255,203,121,152,254,45,74,213,255,62,90,18,254,245,163,230,255,185,106,116,255,83,35,159,0,12,33,2,255,80,34,62,0,16,87,174,255,173,101,85,0,202,36,81,254,160,69,204,255,64,225,187,0,58,206,94,0,86,144,47,0,229,86,245,0,63,145,190,1,37,5,39,0,109,251,26,0,137,147,234,0,162,121,145,255,144,116,206,255,197,232,185,255,183,190,140,255,73,12,254,255,139,20,242,255,170,90,239,255,97,66,187,255,245,181,135,254,222,136,52,0,245,5,51,254,203,47,78,0,152,101,216,0,73,23,125,0,254,96,33,1,235,210,73,255,43,209,88,1,7,129,109,0,122,104,228,254,170,242,203,0,242,204,135,255,202,28,233,255,65,6,127,0,159,144,71,0,100,140,95,0,78,150,13,0,251,107,118,1,182,58,125,255,1,38,108,255,141,189,209,255,8,155,125,1,113,163,91,255,121,79,190,255,134,239,108,255,76,47,248,0,163,228,239,0,17,111,10,0,88,149,75,255,215,235,239,0,167,159,24,255,47,151,108,255,107,209,188,0,233,231,99,254,28,202,148,255,174,35,138,255,110,24,68,255,2,69,181,0,107,102,82,0,102,237,7,0,92,36,237,255,221,162,83,1,55,202,6,255,135,234,135,255,24,250,222,0,65,94,168,254,245,248,210,255,167,108,201,254,255,161,111,0,205,8,254,0,136,13,116,0,100,176,132,255,43,215,126,255,177,133,130,255,158,79,148,0,67,224,37,1,12,206,21,255,62,34,110,1,237,104,175,255,80,132,111,255,142,174,72,0,84,229,180,254,105,179,140,0,64,248,15,255,233,138,16,0,245,67,123,254,218,121,212,255,63,95,218,1,213,133,137,255,143,182,82,255,48,28,11,0,244,114,141,1,209,175,76,255,157,181,150,255,186,229,3,255,164,157,111,1,231,189,139,0,119,202,190,255,218,106,64,255,68,235,63,254,96,26,172,255,187,47,11,1,215,18,251,255,81,84,89,0,68,58,128,0,94,113,5,1,92,129,208,255,97,15,83,254,9,28,188,0,239,9,164,0,60,205,152,0,192,163,98,255,184,18,60,0,217,182,139,0,109,59,120,255,4,192,251,0,169,210,240,255,37,172,92,254,148,211,245,255,179,65,52,0,253,13,115,0,185,174,206,1,114,188,149,255,237,90,173,0,43,199,192,255,88,108,113,0,52,35,76,0,66,25,148,255,221,4,7,255,151,241,114,255,190,209,232,0,98,50,199,0,151,150,213,255,18,74,36,1,53,40,7,0,19,135,65,255,26,172,69,0,174,237,85,0,99,95,41,0,3,56,16,0,39,160,177,255,200,106,218,254,185,68,84,255,91,186,61,254,67,143,141,255,13,244,166,255,99,114,198,0,199,110,163,255,193,18,186,0,124,239,246,1,110,68,22,0,2,235,46,1,212,60,107,0,105,42,105,1,14,230,152,0,7,5,131,0,141,104,154,255,213,3,6,0,131,228,162,255,179,100,28,1,231,123,85,255,206,14,223,1,253,96,230,0,38,152,149,1,98,137,122,0,214,205,3,255,226,152,179,255,6,133,137,0,158,69,140,255,113,162,154,255,180,243,172,255,27,189,115,255,143,46,220,255,213,134,225,255,126,29,69,0,188,43,137,1,242,70,9,0,90,204,255,255,231,170,147,0,23,56,19,254,56,125,157,255,48,179,218,255,79,182,253,255,38,212,191,1,41,235,124,0,96,151,28,0,135,148,190,0,205,249,39,254,52,96,136,255,212,44,136,255,67,209,131,255,252,130,23,255,219,128,20,255,198,129,118,0,108,101,11,0,178,5,146,1,62,7,100,255,181,236,94,254,28,26,164,0,76,22,112,255,120,102,79,0,202,192,229,1,200,176,215,0,41,64,244,255,206,184,78,0,167,45,63,1,160,35,0,255,59,12,142,255,204,9,144,255,219,94,229,1,122,27,112,0,189,105,109,255,64,208,74,255,251,127,55,1,2,226,198,0,44,76,209,0,151,152,77,255,210,23,46,1,201,171,69,255,44,211,231,0,190,37,224,255,245,196,62,255,169,181,222,255,34,211,17,0,119,241,197,255,229,35,152,1,21,69,40,255,178,226,161,0,148,179,193,0,219,194,254,1,40,206,51,255,231,92,250,1,67,153,170,0,21,148,241,0,170,69,82,255,121,18,231,255,92,114,3,0,184,62,230,0,225,201,87,255,146,96,162,255,181,242,220,0,173,187,221,1,226,62,170,255,56,126,217,1,117,13,227,255,179,44,239,0,157,141,155,255,144,221,83,0,235,209,208,0,42,17,165,1,251,81,133,0,124,245,201,254,97,211,24,255,83,214,166,0,154,36,9,255,248,47,127,0,90,219,140,255,161,217,38,254,212,147,63,255,66,84,148,1,207,3,1,0,230,134,89,1,127,78,122,255,224,155,1,255,82,136,74,0,178,156,208,255,186,25,49,255,222,3,210,1,229,150,190,255,85,162,52,255,41,84,141,255,73,123,84,254,93,17,150,0,119,19,28,1,32,22,215,255,28,23,204,255,142,241,52,255,228,52,125,0,29,76,207,0,215,167,250,254,175,164,230,0,55,207,105,1,109,187,245,255,161,44,220,1,41,101,128,255,167,16,94,0,93,214,107,255,118,72,0,254,80,61,234,255,121,175,125,0,139,169,251,0,97,39,147,254,250,196,49,255,165,179,110,254,223,70,187,255,22,142,125,1,154,179,138,255,118,176,42,1,10,174,153,0,156,92,102,0,168,13,161,255,143,16,32,0,250,197,180,255,203,163,44,1,87,32,36,0,161,153,20,255,123,252,15,0,25,227,80,0,60,88,142,0,17,22,201,1,154,205,77,255,39,63,47,0,8,122,141,0,128,23,182,254,204,39,19,255,4,112,29,255,23,36,140,255,210,234,116,254,53,50,63,255,121,171,104,255,160,219,94,0,87,82,14,254,231,42,5,0,165,139,127,254,86,78,38,0,130,60,66,254,203,30,45,255,46,196,122,1,249,53,162,255,136,143,103,254,215,210,114,0,231,7,160,254,169,152,42,255,111,45,246,0,142,131,135,255,131,71,204,255,36,226,11,0,0,28,242,255,225,138,213,255,247,46,216,254,245,3,183,0,108,252,74,1,206,26,48,255,205,54,246,255,211,198,36,255,121,35,50,0,52,216,202,255,38,139,129,254,242,73,148,0,67,231,141,255,42,47,204,0,78,116,25,1,4,225,191,255,6,147,228,0,58,88,177,0,122,165,229,255,252,83,201,255,224,167,96,1,177,184,158,255,242,105,179,1,248,198,240,0,133,66,203,1,254,36,47,0,45,24,115,255,119,62,254,0,196,225,186,254,123,141,172,0,26,85,41,255,226,111,183,0,213,231,151,0,4,59,7,255,238,138,148,0,66,147,33,255,31,246,141,255,209,141,116,255,104,112,31,0,88,161,172,0,83,215,230,254,47,111,151,0,45,38,52,1,132,45,204,0,138,128,109,254,233,117,134,255,243,190,173,254,241,236,240,0,82,127,236,254,40,223,161,255,110,182,225,255,123,174,239,0,135,242,145,1,51,209,154,0,150,3,115,254,217,164,252,255,55,156,69,1,84,94,255,255,232,73,45,1,20,19,212,255,96,197,59,254,96,251,33,0,38,199,73,1,64,172,247,255,117,116,56,255,228,17,18,0,62,138,103,1,246,229,164,255,244,118,201,254,86,32,159,255,109,34,137,1,85,211,186,0,10,193,193,254,122,194,177,0,122,238,102,255,162,218,171,0,108,217,161,1,158,170,34,0,176,47,155,1,181,228,11,255,8,156,0,0,16,75,93,0,206,98,255,1,58,154,35,0,12,243,184,254,67,117,66,255,230,229,123,0,201,42,110], "i8", ALLOC_NONE, Runtime.GLOBAL_BASE+20480);
+/* memory initializer */ allocate([134,228,178,254,186,108,118,255,58,19,154,255,82,169,62,255,114,143,115,1,239,196,50,255,173,48,193,255,147,2,84,255,150,134,147,254,95,232,73,0,109,227,52,254,191,137,10,0,40,204,30,254,76,52,97,255,164,235,126,0,254,124,188,0,74,182,21,1,121,29,35,255,241,30,7,254,85,218,214,255,7,84,150,254,81,27,117,255,160,159,152,254,66,24,221,255,227,10,60,1,141,135,102,0,208,189,150,1,117,179,92,0,132,22,136,255,120,199,28,0,21,129,79,254,182,9,65,0,218,163,169,0,246,147,198,255,107,38,144,1,78,175,205,255,214,5,250,254,47,88,29,255,164,47,204,255,43,55,6,255,131,134,207,254,116,100,214,0,96,140,75,1,106,220,144,0,195,32,28,1,172,81,5,255,199,179,52,255,37,84,203,0,170,112,174,0,11,4,91,0,69,244,27,1,117,131,92,0,33,152,175,255,140,153,107,255,251,135,43,254,87,138,4,255,198,234,147,254,121,152,84,255,205,101,155,1,157,9,25,0,72,106,17,254,108,153,0,255,189,229,186,0,193,8,176,255,174,149,209,0,238,130,29,0,233,214,126,1,61,226,102,0,57,163,4,1,198,111,51,255,45,79,78,1,115,210,10,255,218,9,25,255,158,139,198,255,211,82,187,254,80,133,83,0,157,129,230,1,243,133,134,255,40,136,16,0,77,107,79,255,183,85,92,1,177,204,202,0,163,71,147,255,152,69,190,0,172,51,188,1,250,210,172,255,211,242,113,1,89,89,26,255,64,66,111,254,116,152,42,0,161,39,27,255,54,80,254,0,106,209,115,1,103,124,97,0,221,230,98,255,31,231,6,0,178,192,120,254,15,217,203,255,124,158,79,0,112,145,247,0,92,250,48,1,163,181,193,255,37,47,142,254,144,189,165,255,46,146,240,0,6,75,128,0,41,157,200,254,87,121,213,0,1,113,236,0,5,45,250,0,144,12,82,0,31,108,231,0,225,239,119,255,167,7,189,255,187,228,132,255,110,189,34,0,94,44,204,1,162,52,197,0,78,188,241,254,57,20,141,0,244,146,47,1,206,100,51,0,125,107,148,254,27,195,77,0,152,253,90,1,7,143,144,255,51,37,31,0,34,119,38,255,7,197,118,0,153,188,211,0,151,20,116,254,245,65,52,255,180,253,110,1,47,177,209,0,161,99,17,255,118,222,202,0,125,179,252,1,123,54,126,255,145,57,191,0,55,186,121,0,10,243,138,0,205,211,229,255,125,156,241,254,148,156,185,255,227,19,188,255,124,41,32,255,31,34,206,254,17,57,83,0,204,22,37,255,42,96,98,0,119,102,184,1,3,190,28,0,110,82,218,255,200,204,192,255,201,145,118,0,117,204,146,0,132,32,98,1,192,194,121,0,106,161,248,1,237,88,124,0,23,212,26,0,205,171,90,255,248,48,216,1,141,37,230,255,124,203,0,254,158,168,30,255,214,248,21,0,112,187,7,255,75,133,239,255,74,227,243,255,250,147,70,0,214,120,162,0,167,9,179,255,22,158,18,0,218,77,209,1,97,109,81,255,244,33,179,255,57,52,57,255,65,172,210,255,249,71,209,255,142,169,238,0,158,189,153,255,174,254,103,254,98,33,14,0,141,76,230,255,113,139,52,255,15,58,212,0,168,215,201,255,248,204,215,1,223,68,160,255,57,154,183,254,47,231,121,0,106,166,137,0,81,136,138,0,165,43,51,0,231,139,61,0,57,95,59,254,118,98,25,255,151,63,236,1,94,190,250,255,169,185,114,1,5,250,58,255,75,105,97,1,215,223,134,0,113,99,163,1,128,62,112,0,99,106,147,0,163,195,10,0,33,205,182,0,214,14,174,255,129,38,231,255,53,182,223,0,98,42,159,255,247,13,40,0,188,210,177,1,6,21,0,255,255,61,148,254,137,45,129,255,89,26,116,254,126,38,114,0,251,50,242,254,121,134,128,255,204,249,167,254,165,235,215,0,202,177,243,0,133,141,62,0,240,130,190,1,110,175,255,0,0,20,146,1,37,210,121,255,7,39,130,0,142,250,84,255,141,200,207,0,9,95,104,255,11,244,174,0,134,232,126,0,167,1,123,254,16,193,149,255,232,233,239,1,213,70,112,255,252,116,160,254,242,222,220,255,205,85,227,0,7,185,58,0,118,247,63,1,116,77,177,255,62,245,200,254,63,18,37,255,107,53,232,254,50,221,211,0,162,219,7,254,2,94,43,0,182,62,182,254,160,78,200,255,135,140,170,0,235,184,228,0,175,53,138,254,80,58,77,255,152,201,2,1,63,196,34,0,5,30,184,0,171,176,154,0,121,59,206,0,38,99,39,0,172,80,77,254,0,134,151,0,186,33,241,254,94,253,223,255,44,114,252,0,108,126,57,255,201,40,13,255,39,229,27,255,39,239,23,1,151,121,51,255,153,150,248,0,10,234,174,255,118,246,4,254,200,245,38,0,69,161,242,1,16,178,150,0,113,56,130,0,171,31,105,0,26,88,108,255,49,42,106,0,251,169,66,0,69,93,149,0,20,57,254,0,164,25,111,0,90,188,90,255,204,4,197,0,40,213,50,1,212,96,132,255,88,138,180,254,228,146,124,255,184,246,247,0,65,117,86,255,253,102,210,254,254,121,36,0,137,115,3,255,60,24,216,0,134,18,29,0,59,226,97,0,176,142,71,0,7,209,161,0,189,84,51,254,155,250,72,0,213,84,235,255,45,222,224,0,238,148,143,255,170,42,53,255,78,167,117,0,186,0,40,255,125,177,103,255,69,225,66,0,227,7,88,1,75,172,6,0,169,45,227,1,16,36,70,255,50,2,9,255,139,193,22,0,143,183,231,254,218,69,50,0,236,56,161,1,213,131,42,0,138,145,44,254,136,229,40,255,49,63,35,255,61,145,245,255,101,192,2,254,232,167,113,0,152,104,38,1,121,185,218,0,121,139,211,254,119,240,35,0,65,189,217,254,187,179,162,255,160,187,230,0,62,248,14,255,60,78,97,0,255,247,163,255,225,59,91,255,107,71,58,255,241,47,33,1,50,117,236,0,219,177,63,254,244,90,179,0,35,194,215,255,189,67,50,255,23,135,129,0,104,189,37,255,185,57,194,0,35,62,231,255,220,248,108,0,12,231,178,0,143,80,91,1,131,93,101,255,144,39,2,1,255,250,178,0,5,17,236,254,139,32,46,0,204,188,38,254,245,115,52,255,191,113,73,254,191,108,69,255,22,69,245,1,23,203,178,0,170,99,170,0,65,248,111,0,37,108,153,255,64,37,69,0,0,88,62,254,89,148,144,255,191,68,224,1,241,39,53,0,41,203,237,255,145,126,194,255,221,42,253,255,25,99,151,0,97,253,223,1,74,115,49,255,6,175,72,255,59,176,203,0,124,183,249,1,228,228,99,0,129,12,207,254,168,192,195,255,204,176,16,254,152,234,171,0,77,37,85,255,33,120,135,255,142,194,227,1,31,214,58,0,213,187,125,255,232,46,60,255,190,116,42,254,151,178,19,255,51,62,237,254,204,236,193,0,194,232,60,0,172,34,157,255,189,16,184,254,103,3,95,255,141,233,36,254,41,25,11,255,21,195,166,0,118,245,45,0,67,213,149,255,159,12,18,255,187,164,227,1,160,25,5,0,12,78,195,1,43,197,225,0,48,142,41,254,196,155,60,255,223,199,18,1,145,136,156,0,252,117,169,254,145,226,238,0,239,23,107,0,109,181,188,255,230,112,49,254,73,170,237,255,231,183,227,255,80,220,20,0,194,107,127,1,127,205,101,0,46,52,197,1,210,171,36,255,88,3,90,255,56,151,141,0,96,187,255,255,42,78,200,0,254,70,70,1,244,125,168,0,204,68,138,1,124,215,70,0,102,66,200,254,17,52,228,0,117,220,143,254,203,248,123,0,56,18,174,255,186,151,164,255,51,232,208,1,160,228,43,255,249,29,25,1,68,190,63,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,52,127,0,0,0,0,0,0,5,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,2,0,0,0,188,129,0,0,0,4,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,10,255,255,255,255], "i8", ALLOC_NONE, Runtime.GLOBAL_BASE+30720);
 
 
 
 
+
+/* no memory initializer */
 var tempDoublePtr = Runtime.alignMemory(allocate(12, "i8", ALLOC_STATIC), 8);
 
 assert(tempDoublePtr % 8 == 0);
@@ -1357,6 +1569,8 @@ function copyTempDouble(ptr) {
 
 }
 
+// {{PRE_LIBRARY}}
+
 
    
   Module["_bitshift64Ashr"] = _bitshift64Ashr;
@@ -1370,206 +1584,160 @@ function copyTempDouble(ptr) {
    
   Module["_memset"] = _memset;
 
+  function _pthread_cleanup_push(routine, arg) {
+      __ATEXIT__.push(function() { Runtime.dynCall('vi', routine, [arg]) })
+      _pthread_cleanup_push.level = __ATEXIT__.length;
+    }
+
    
   Module["_bitshift64Lshr"] = _bitshift64Lshr;
 
    
   Module["_bitshift64Shl"] = _bitshift64Shl;
 
+  function _pthread_cleanup_pop() {
+      assert(_pthread_cleanup_push.level == __ATEXIT__.length, 'cannot pop if something else added meanwhile!');
+      __ATEXIT__.pop();
+      _pthread_cleanup_push.level = __ATEXIT__.length;
+    }
+
   function _abort() {
       Module['abort']();
     }
 
-   
-  Module["_strlen"] = _strlen;
+  function ___lock() {}
 
-  
-  function _emscripten_memcpy_big(dest, src, num) {
-      HEAPU8.set(HEAPU8.subarray(src, src+num), dest);
-      return dest;
-    } 
-  Module["_memcpy"] = _memcpy;
+  function ___unlock() {}
 
   
   
-  var ___errno_state=0;function ___setErrNo(value) {
-      // For convenient setting and returning of errno.
-      HEAP32[((___errno_state)>>2)]=value;
+  
+  var ERRNO_CODES={EPERM:1,ENOENT:2,ESRCH:3,EINTR:4,EIO:5,ENXIO:6,E2BIG:7,ENOEXEC:8,EBADF:9,ECHILD:10,EAGAIN:11,EWOULDBLOCK:11,ENOMEM:12,EACCES:13,EFAULT:14,ENOTBLK:15,EBUSY:16,EEXIST:17,EXDEV:18,ENODEV:19,ENOTDIR:20,EISDIR:21,EINVAL:22,ENFILE:23,EMFILE:24,ENOTTY:25,ETXTBSY:26,EFBIG:27,ENOSPC:28,ESPIPE:29,EROFS:30,EMLINK:31,EPIPE:32,EDOM:33,ERANGE:34,ENOMSG:42,EIDRM:43,ECHRNG:44,EL2NSYNC:45,EL3HLT:46,EL3RST:47,ELNRNG:48,EUNATCH:49,ENOCSI:50,EL2HLT:51,EDEADLK:35,ENOLCK:37,EBADE:52,EBADR:53,EXFULL:54,ENOANO:55,EBADRQC:56,EBADSLT:57,EDEADLOCK:35,EBFONT:59,ENOSTR:60,ENODATA:61,ETIME:62,ENOSR:63,ENONET:64,ENOPKG:65,EREMOTE:66,ENOLINK:67,EADV:68,ESRMNT:69,ECOMM:70,EPROTO:71,EMULTIHOP:72,EDOTDOT:73,EBADMSG:74,ENOTUNIQ:76,EBADFD:77,EREMCHG:78,ELIBACC:79,ELIBBAD:80,ELIBSCN:81,ELIBMAX:82,ELIBEXEC:83,ENOSYS:38,ENOTEMPTY:39,ENAMETOOLONG:36,ELOOP:40,EOPNOTSUPP:95,EPFNOSUPPORT:96,ECONNRESET:104,ENOBUFS:105,EAFNOSUPPORT:97,EPROTOTYPE:91,ENOTSOCK:88,ENOPROTOOPT:92,ESHUTDOWN:108,ECONNREFUSED:111,EADDRINUSE:98,ECONNABORTED:103,ENETUNREACH:101,ENETDOWN:100,ETIMEDOUT:110,EHOSTDOWN:112,EHOSTUNREACH:113,EINPROGRESS:115,EALREADY:114,EDESTADDRREQ:89,EMSGSIZE:90,EPROTONOSUPPORT:93,ESOCKTNOSUPPORT:94,EADDRNOTAVAIL:99,ENETRESET:102,EISCONN:106,ENOTCONN:107,ETOOMANYREFS:109,EUSERS:87,EDQUOT:122,ESTALE:116,ENOTSUP:95,ENOMEDIUM:123,EILSEQ:84,EOVERFLOW:75,ECANCELED:125,ENOTRECOVERABLE:131,EOWNERDEAD:130,ESTRPIPE:86};
+  
+  var ERRNO_MESSAGES={0:"Success",1:"Not super-user",2:"No such file or directory",3:"No such process",4:"Interrupted system call",5:"I/O error",6:"No such device or address",7:"Arg list too long",8:"Exec format error",9:"Bad file number",10:"No children",11:"No more processes",12:"Not enough core",13:"Permission denied",14:"Bad address",15:"Block device required",16:"Mount device busy",17:"File exists",18:"Cross-device link",19:"No such device",20:"Not a directory",21:"Is a directory",22:"Invalid argument",23:"Too many open files in system",24:"Too many open files",25:"Not a typewriter",26:"Text file busy",27:"File too large",28:"No space left on device",29:"Illegal seek",30:"Read only file system",31:"Too many links",32:"Broken pipe",33:"Math arg out of domain of func",34:"Math result not representable",35:"File locking deadlock error",36:"File or path name too long",37:"No record locks available",38:"Function not implemented",39:"Directory not empty",40:"Too many symbolic links",42:"No message of desired type",43:"Identifier removed",44:"Channel number out of range",45:"Level 2 not synchronized",46:"Level 3 halted",47:"Level 3 reset",48:"Link number out of range",49:"Protocol driver not attached",50:"No CSI structure available",51:"Level 2 halted",52:"Invalid exchange",53:"Invalid request descriptor",54:"Exchange full",55:"No anode",56:"Invalid request code",57:"Invalid slot",59:"Bad font file fmt",60:"Device not a stream",61:"No data (for no delay io)",62:"Timer expired",63:"Out of streams resources",64:"Machine is not on the network",65:"Package not installed",66:"The object is remote",67:"The link has been severed",68:"Advertise error",69:"Srmount error",70:"Communication error on send",71:"Protocol error",72:"Multihop attempted",73:"Cross mount point (not really error)",74:"Trying to read unreadable message",75:"Value too large for defined data type",76:"Given log. name not unique",77:"f.d. invalid for this operation",78:"Remote address changed",79:"Can   access a needed shared lib",80:"Accessing a corrupted shared lib",81:".lib section in a.out corrupted",82:"Attempting to link in too many libs",83:"Attempting to exec a shared library",84:"Illegal byte sequence",86:"Streams pipe error",87:"Too many users",88:"Socket operation on non-socket",89:"Destination address required",90:"Message too long",91:"Protocol wrong type for socket",92:"Protocol not available",93:"Unknown protocol",94:"Socket type not supported",95:"Not supported",96:"Protocol family not supported",97:"Address family not supported by protocol family",98:"Address already in use",99:"Address not available",100:"Network interface is not configured",101:"Network is unreachable",102:"Connection reset by network",103:"Connection aborted",104:"Connection reset by peer",105:"No buffer space available",106:"Socket is already connected",107:"Socket is not connected",108:"Can't send after socket shutdown",109:"Too many references",110:"Connection timed out",111:"Connection refused",112:"Host is down",113:"Host is unreachable",114:"Socket already connected",115:"Connection already in progress",116:"Stale file handle",122:"Quota exceeded",123:"No medium (in tape drive)",125:"Operation canceled",130:"Previous owner died",131:"State not recoverable"};
+  
+  function ___setErrNo(value) {
+      if (Module['___errno_location']) HEAP32[((Module['___errno_location']())>>2)]=value;
       return value;
     }
   
-  var ERRNO_CODES={EPERM:1,ENOENT:2,ESRCH:3,EINTR:4,EIO:5,ENXIO:6,E2BIG:7,ENOEXEC:8,EBADF:9,ECHILD:10,EAGAIN:11,EWOULDBLOCK:11,ENOMEM:12,EACCES:13,EFAULT:14,ENOTBLK:15,EBUSY:16,EEXIST:17,EXDEV:18,ENODEV:19,ENOTDIR:20,EISDIR:21,EINVAL:22,ENFILE:23,EMFILE:24,ENOTTY:25,ETXTBSY:26,EFBIG:27,ENOSPC:28,ESPIPE:29,EROFS:30,EMLINK:31,EPIPE:32,EDOM:33,ERANGE:34,ENOMSG:42,EIDRM:43,ECHRNG:44,EL2NSYNC:45,EL3HLT:46,EL3RST:47,ELNRNG:48,EUNATCH:49,ENOCSI:50,EL2HLT:51,EDEADLK:35,ENOLCK:37,EBADE:52,EBADR:53,EXFULL:54,ENOANO:55,EBADRQC:56,EBADSLT:57,EDEADLOCK:35,EBFONT:59,ENOSTR:60,ENODATA:61,ETIME:62,ENOSR:63,ENONET:64,ENOPKG:65,EREMOTE:66,ENOLINK:67,EADV:68,ESRMNT:69,ECOMM:70,EPROTO:71,EMULTIHOP:72,EDOTDOT:73,EBADMSG:74,ENOTUNIQ:76,EBADFD:77,EREMCHG:78,ELIBACC:79,ELIBBAD:80,ELIBSCN:81,ELIBMAX:82,ELIBEXEC:83,ENOSYS:38,ENOTEMPTY:39,ENAMETOOLONG:36,ELOOP:40,EOPNOTSUPP:95,EPFNOSUPPORT:96,ECONNRESET:104,ENOBUFS:105,EAFNOSUPPORT:97,EPROTOTYPE:91,ENOTSOCK:88,ENOPROTOOPT:92,ESHUTDOWN:108,ECONNREFUSED:111,EADDRINUSE:98,ECONNABORTED:103,ENETUNREACH:101,ENETDOWN:100,ETIMEDOUT:110,EHOSTDOWN:112,EHOSTUNREACH:113,EINPROGRESS:115,EALREADY:114,EDESTADDRREQ:89,EMSGSIZE:90,EPROTONOSUPPORT:93,ESOCKTNOSUPPORT:94,EADDRNOTAVAIL:99,ENETRESET:102,EISCONN:106,ENOTCONN:107,ETOOMANYREFS:109,EUSERS:87,EDQUOT:122,ESTALE:116,ENOTSUP:95,ENOMEDIUM:123,EILSEQ:84,EOVERFLOW:75,ECANCELED:125,ENOTRECOVERABLE:131,EOWNERDEAD:130,ESTRPIPE:86};function _sysconf(name) {
-      // long sysconf(int name);
-      // http://pubs.opengroup.org/onlinepubs/009695399/functions/sysconf.html
-      switch(name) {
-        case 30: return PAGE_SIZE;
-        case 132:
-        case 133:
-        case 12:
-        case 137:
-        case 138:
-        case 15:
-        case 235:
-        case 16:
-        case 17:
-        case 18:
-        case 19:
-        case 20:
-        case 149:
-        case 13:
-        case 10:
-        case 236:
-        case 153:
-        case 9:
-        case 21:
-        case 22:
-        case 159:
-        case 154:
-        case 14:
-        case 77:
-        case 78:
-        case 139:
-        case 80:
-        case 81:
-        case 79:
-        case 82:
-        case 68:
-        case 67:
-        case 164:
-        case 11:
-        case 29:
-        case 47:
-        case 48:
-        case 95:
-        case 52:
-        case 51:
-        case 46:
-          return 200809;
-        case 27:
-        case 246:
-        case 127:
-        case 128:
-        case 23:
-        case 24:
-        case 160:
-        case 161:
-        case 181:
-        case 182:
-        case 242:
-        case 183:
-        case 184:
-        case 243:
-        case 244:
-        case 245:
-        case 165:
-        case 178:
-        case 179:
-        case 49:
-        case 50:
-        case 168:
-        case 169:
-        case 175:
-        case 170:
-        case 171:
-        case 172:
-        case 97:
-        case 76:
-        case 32:
-        case 173:
-        case 35:
-          return -1;
-        case 176:
-        case 177:
-        case 7:
-        case 155:
-        case 8:
-        case 157:
-        case 125:
-        case 126:
-        case 92:
-        case 93:
-        case 129:
-        case 130:
-        case 131:
-        case 94:
-        case 91:
-          return 1;
-        case 74:
-        case 60:
-        case 69:
-        case 70:
-        case 4:
-          return 1024;
-        case 31:
-        case 42:
-        case 72:
-          return 32;
-        case 87:
-        case 26:
-        case 33:
-          return 2147483647;
-        case 34:
-        case 1:
-          return 47839;
-        case 38:
-        case 36:
-          return 99;
-        case 43:
-        case 37:
-          return 2048;
-        case 0: return 2097152;
-        case 3: return 65536;
-        case 28: return 32768;
-        case 44: return 32767;
-        case 75: return 16384;
-        case 39: return 1000;
-        case 89: return 700;
-        case 71: return 256;
-        case 40: return 255;
-        case 2: return 100;
-        case 180: return 64;
-        case 25: return 20;
-        case 5: return 16;
-        case 6: return 6;
-        case 73: return 4;
-        case 84: {
-          if (typeof navigator === 'object') return navigator['hardwareConcurrency'] || 1;
-          return 1;
+  var PATH={splitPath:function (filename) {
+        var splitPathRe = /^(\/?|)([\s\S]*?)((?:\.{1,2}|[^\/]+?|)(\.[^.\/]*|))(?:[\/]*)$/;
+        return splitPathRe.exec(filename).slice(1);
+      },normalizeArray:function (parts, allowAboveRoot) {
+        // if the path tries to go above the root, `up` ends up > 0
+        var up = 0;
+        for (var i = parts.length - 1; i >= 0; i--) {
+          var last = parts[i];
+          if (last === '.') {
+            parts.splice(i, 1);
+          } else if (last === '..') {
+            parts.splice(i, 1);
+            up++;
+          } else if (up) {
+            parts.splice(i, 1);
+            up--;
+          }
         }
-      }
-      ___setErrNo(ERRNO_CODES.EINVAL);
-      return -1;
-    }
-
-  function _sbrk(bytes) {
-      // Implement a Linux-like 'memory area' for our 'process'.
-      // Changes the size of the memory area by |bytes|; returns the
-      // address of the previous top ('break') of the memory area
-      // We control the "dynamic" memory - DYNAMIC_BASE to DYNAMICTOP
-      var self = _sbrk;
-      if (!self.called) {
-        DYNAMICTOP = alignMemoryPage(DYNAMICTOP); // make sure we start out aligned
-        self.called = true;
-        assert(Runtime.dynamicAlloc);
-        self.alloc = Runtime.dynamicAlloc;
-        Runtime.dynamicAlloc = function() { abort('cannot dynamically allocate, sbrk now has control') };
-      }
-      var ret = DYNAMICTOP;
-      if (bytes != 0) self.alloc(bytes);
-      return ret;  // Previous break location.
-    }
-
-   
-  Module["_memmove"] = _memmove;
-
-  function ___errno_location() {
-      return ___errno_state;
-    }
-
-  
-  
-  
-  var ERRNO_MESSAGES={0:"Success",1:"Not super-user",2:"No such file or directory",3:"No such process",4:"Interrupted system call",5:"I/O error",6:"No such device or address",7:"Arg list too long",8:"Exec format error",9:"Bad file number",10:"No children",11:"No more processes",12:"Not enough core",13:"Permission denied",14:"Bad address",15:"Block device required",16:"Mount device busy",17:"File exists",18:"Cross-device link",19:"No such device",20:"Not a directory",21:"Is a directory",22:"Invalid argument",23:"Too many open files in system",24:"Too many open files",25:"Not a typewriter",26:"Text file busy",27:"File too large",28:"No space left on device",29:"Illegal seek",30:"Read only file system",31:"Too many links",32:"Broken pipe",33:"Math arg out of domain of func",34:"Math result not representable",35:"File locking deadlock error",36:"File or path name too long",37:"No record locks available",38:"Function not implemented",39:"Directory not empty",40:"Too many symbolic links",42:"No message of desired type",43:"Identifier removed",44:"Channel number out of range",45:"Level 2 not synchronized",46:"Level 3 halted",47:"Level 3 reset",48:"Link number out of range",49:"Protocol driver not attached",50:"No CSI structure available",51:"Level 2 halted",52:"Invalid exchange",53:"Invalid request descriptor",54:"Exchange full",55:"No anode",56:"Invalid request code",57:"Invalid slot",59:"Bad font file fmt",60:"Device not a stream",61:"No data (for no delay io)",62:"Timer expired",63:"Out of streams resources",64:"Machine is not on the network",65:"Package not installed",66:"The object is remote",67:"The link has been severed",68:"Advertise error",69:"Srmount error",70:"Communication error on send",71:"Protocol error",72:"Multihop attempted",73:"Cross mount point (not really error)",74:"Trying to read unreadable message",75:"Value too large for defined data type",76:"Given log. name not unique",77:"f.d. invalid for this operation",78:"Remote address changed",79:"Can   access a needed shared lib",80:"Accessing a corrupted shared lib",81:".lib section in a.out corrupted",82:"Attempting to link in too many libs",83:"Attempting to exec a shared library",84:"Illegal byte sequence",86:"Streams pipe error",87:"Too many users",88:"Socket operation on non-socket",89:"Destination address required",90:"Message too long",91:"Protocol wrong type for socket",92:"Protocol not available",93:"Unknown protocol",94:"Socket type not supported",95:"Not supported",96:"Protocol family not supported",97:"Address family not supported by protocol family",98:"Address already in use",99:"Address not available",100:"Network interface is not configured",101:"Network is unreachable",102:"Connection reset by network",103:"Connection aborted",104:"Connection reset by peer",105:"No buffer space available",106:"Socket is already connected",107:"Socket is not connected",108:"Can't send after socket shutdown",109:"Too many references",110:"Connection timed out",111:"Connection refused",112:"Host is down",113:"Host is unreachable",114:"Socket already connected",115:"Connection already in progress",116:"Stale file handle",122:"Quota exceeded",123:"No medium (in tape drive)",125:"Operation canceled",130:"Previous owner died",131:"State not recoverable"};
+        // if the path is allowed to go above the root, restore leading ..s
+        if (allowAboveRoot) {
+          for (; up--; up) {
+            parts.unshift('..');
+          }
+        }
+        return parts;
+      },normalize:function (path) {
+        var isAbsolute = path.charAt(0) === '/',
+            trailingSlash = path.substr(-1) === '/';
+        // Normalize the path
+        path = PATH.normalizeArray(path.split('/').filter(function(p) {
+          return !!p;
+        }), !isAbsolute).join('/');
+        if (!path && !isAbsolute) {
+          path = '.';
+        }
+        if (path && trailingSlash) {
+          path += '/';
+        }
+        return (isAbsolute ? '/' : '') + path;
+      },dirname:function (path) {
+        var result = PATH.splitPath(path),
+            root = result[0],
+            dir = result[1];
+        if (!root && !dir) {
+          // No dirname whatsoever
+          return '.';
+        }
+        if (dir) {
+          // It has a dirname, strip trailing slash
+          dir = dir.substr(0, dir.length - 1);
+        }
+        return root + dir;
+      },basename:function (path) {
+        // EMSCRIPTEN return '/'' for '/', not an empty string
+        if (path === '/') return '/';
+        var lastSlash = path.lastIndexOf('/');
+        if (lastSlash === -1) return path;
+        return path.substr(lastSlash+1);
+      },extname:function (path) {
+        return PATH.splitPath(path)[3];
+      },join:function () {
+        var paths = Array.prototype.slice.call(arguments, 0);
+        return PATH.normalize(paths.join('/'));
+      },join2:function (l, r) {
+        return PATH.normalize(l + '/' + r);
+      },resolve:function () {
+        var resolvedPath = '',
+          resolvedAbsolute = false;
+        for (var i = arguments.length - 1; i >= -1 && !resolvedAbsolute; i--) {
+          var path = (i >= 0) ? arguments[i] : FS.cwd();
+          // Skip empty and invalid entries
+          if (typeof path !== 'string') {
+            throw new TypeError('Arguments to path.resolve must be strings');
+          } else if (!path) {
+            return ''; // an invalid portion invalidates the whole thing
+          }
+          resolvedPath = path + '/' + resolvedPath;
+          resolvedAbsolute = path.charAt(0) === '/';
+        }
+        // At this point the path should be resolved to a full absolute path, but
+        // handle relative paths to be safe (might happen when process.cwd() fails)
+        resolvedPath = PATH.normalizeArray(resolvedPath.split('/').filter(function(p) {
+          return !!p;
+        }), !resolvedAbsolute).join('/');
+        return ((resolvedAbsolute ? '/' : '') + resolvedPath) || '.';
+      },relative:function (from, to) {
+        from = PATH.resolve(from).substr(1);
+        to = PATH.resolve(to).substr(1);
+        function trim(arr) {
+          var start = 0;
+          for (; start < arr.length; start++) {
+            if (arr[start] !== '') break;
+          }
+          var end = arr.length - 1;
+          for (; end >= 0; end--) {
+            if (arr[end] !== '') break;
+          }
+          if (start > end) return [];
+          return arr.slice(start, end - start + 1);
+        }
+        var fromParts = trim(from.split('/'));
+        var toParts = trim(to.split('/'));
+        var length = Math.min(fromParts.length, toParts.length);
+        var samePartsLength = length;
+        for (var i = 0; i < length; i++) {
+          if (fromParts[i] !== toParts[i]) {
+            samePartsLength = i;
+            break;
+          }
+        }
+        var outputParts = [];
+        for (var i = samePartsLength; i < fromParts.length; i++) {
+          outputParts.push('..');
+        }
+        outputParts = outputParts.concat(toParts.slice(samePartsLength));
+        return outputParts.join('/');
+      }};
   
   var TTY={ttys:[],init:function () {
         // https://github.com/kripken/emscripten/pull/1555
@@ -1647,13 +1815,28 @@ function copyTempDouble(ptr) {
           if (!tty.input.length) {
             var result = null;
             if (ENVIRONMENT_IS_NODE) {
-              result = process['stdin']['read']();
-              if (!result) {
-                if (process['stdin']['_readableState'] && process['stdin']['_readableState']['ended']) {
-                  return null;  // EOF
-                }
-                return undefined;  // no data available
+              // we will read data by chunks of BUFSIZE
+              var BUFSIZE = 256;
+              var buf = new Buffer(BUFSIZE);
+              var bytesRead = 0;
+  
+              var fd = process.stdin.fd;
+              // Linux and Mac cannot use process.stdin.fd (which isn't set up as sync)
+              var usingDevice = false;
+              try {
+                fd = fs.openSync('/dev/stdin', 'r');
+                usingDevice = true;
+              } catch (e) {}
+  
+              bytesRead = fs.readSync(fd, buf, 0, BUFSIZE, null);
+  
+              if (usingDevice) { fs.closeSync(fd); }
+              if (bytesRead > 0) {
+                result = buf.slice(0, bytesRead).toString('utf-8');
+              } else {
+                result = null;
               }
+  
             } else if (typeof window != 'undefined' &&
               typeof window.prompt == 'function') {
               // Browser.
@@ -1674,28 +1857,28 @@ function copyTempDouble(ptr) {
             tty.input = intArrayFromString(result, true);
           }
           return tty.input.shift();
-        },flush:function (tty) {
-          if (tty.output && tty.output.length > 0) {
-            Module['print'](tty.output.join(''));
-            tty.output = [];
-          }
         },put_char:function (tty, val) {
           if (val === null || val === 10) {
-            Module['print'](tty.output.join(''));
+            Module['print'](UTF8ArrayToString(tty.output, 0));
             tty.output = [];
           } else {
-            tty.output.push(TTY.utf8.processCChar(val));
+            if (val != 0) tty.output.push(val); // val == 0 would cut text output off in the middle.
+          }
+        },flush:function (tty) {
+          if (tty.output && tty.output.length > 0) {
+            Module['print'](UTF8ArrayToString(tty.output, 0));
+            tty.output = [];
           }
         }},default_tty1_ops:{put_char:function (tty, val) {
           if (val === null || val === 10) {
-            Module['printErr'](tty.output.join(''));
+            Module['printErr'](UTF8ArrayToString(tty.output, 0));
             tty.output = [];
           } else {
-            tty.output.push(TTY.utf8.processCChar(val));
+            if (val != 0) tty.output.push(val);
           }
         },flush:function (tty) {
           if (tty.output && tty.output.length > 0) {
-            Module['printErr'](tty.output.join(''));
+            Module['printErr'](UTF8ArrayToString(tty.output, 0));
             tty.output = [];
           }
         }}};
@@ -1735,7 +1918,8 @@ function copyTempDouble(ptr) {
                 read: MEMFS.stream_ops.read,
                 write: MEMFS.stream_ops.write,
                 allocate: MEMFS.stream_ops.allocate,
-                mmap: MEMFS.stream_ops.mmap
+                mmap: MEMFS.stream_ops.mmap,
+                msync: MEMFS.stream_ops.msync
               }
             },
             link: {
@@ -1793,7 +1977,6 @@ function copyTempDouble(ptr) {
         if (node.contents.subarray) return node.contents.subarray(0, node.usedBytes); // Make sure to not return excess unused bytes.
         return new Uint8Array(node.contents);
       },expandFileStorage:function (node, newCapacity) {
-  
         // If we are asked to expand the size of a file that already exists, revert to using a standard JS array to store the file
         // instead of a typed array. This makes resizing the array more flexible because we can just .push() elements at the back to
         // increase the size.
@@ -1826,7 +2009,6 @@ function copyTempDouble(ptr) {
           node.usedBytes = 0;
           return;
         }
-  
         if (!node.contents || node.contents.subarray) { // Resize a typed array if that is being used as the backing store.
           var oldContents = node.contents;
           node.contents = new Uint8Array(new ArrayBuffer(newSize)); // Allocate new storage.
@@ -1934,8 +2116,7 @@ function copyTempDouble(ptr) {
           assert(size >= 0);
           if (size > 8 && contents.subarray) { // non-trivial, and typed array
             buffer.set(contents.subarray(position, position + size), offset);
-          } else
-          {
+          } else {
             for (var i = 0; i < size; i++) buffer[offset + i] = contents[position + i];
           }
           return size;
@@ -1958,13 +2139,15 @@ function copyTempDouble(ptr) {
               return length;
             }
           }
+  
           // Appending to an existing file and we need to reallocate, or source data did not come as a typed array.
           MEMFS.expandFileStorage(node, position+length);
           if (node.contents.subarray && buffer.subarray) node.contents.set(buffer.subarray(offset, offset + length), position); // Use typed array write if available.
-          else
+          else {
             for (var i = 0; i < length; i++) {
              node.contents[position + i] = buffer[offset + i]; // Or fall back to manual write if not.
             }
+          }
           node.usedBytes = Math.max(node.usedBytes, position+length);
           return length;
         },llseek:function (stream, offset, whence) {
@@ -2014,6 +2197,18 @@ function copyTempDouble(ptr) {
             buffer.set(contents, ptr);
           }
           return { ptr: ptr, allocated: allocated };
+        },msync:function (stream, buffer, offset, length, mmapFlags) {
+          if (!FS.isFile(stream.node.mode)) {
+            throw new FS.ErrnoError(ERRNO_CODES.ENODEV);
+          }
+          if (mmapFlags & 2) {
+            // MAP_PRIVATE calls need not to be synced back to underlying fs
+            return 0;
+          }
+  
+          var bytesWritten = MEMFS.stream_ops.write(stream, buffer, 0, length, offset, false);
+          // should we check if bytesWritten and length are the same?
+          return 0;
         }}};
   
   var IDBFS={dbs:{},indexedDB:function () {
@@ -2063,7 +2258,9 @@ function copyTempDouble(ptr) {
             fileStore = db.createObjectStore(IDBFS.DB_STORE_NAME);
           }
   
-          fileStore.createIndex('timestamp', 'timestamp', { unique: false });
+          if (!fileStore.indexNames.contains('timestamp')) {
+            fileStore.createIndex('timestamp', 'timestamp', { unique: false });
+          }
         };
         req.onsuccess = function() {
           db = req.result;
@@ -2072,8 +2269,9 @@ function copyTempDouble(ptr) {
           IDBFS.dbs[name] = db;
           callback(null, db);
         };
-        req.onerror = function() {
+        req.onerror = function(e) {
           callback(this.error);
+          e.preventDefault();
         };
       },getLocalSet:function (mount, callback) {
         var entries = {};
@@ -2114,7 +2312,10 @@ function copyTempDouble(ptr) {
           if (err) return callback(err);
   
           var transaction = db.transaction([IDBFS.DB_STORE_NAME], 'readonly');
-          transaction.onerror = function() { callback(this.error); };
+          transaction.onerror = function(e) {
+            callback(this.error);
+            e.preventDefault();
+          };
   
           var store = transaction.objectStore(IDBFS.DB_STORE_NAME);
           var index = store.index('timestamp');
@@ -2187,15 +2388,24 @@ function copyTempDouble(ptr) {
       },loadRemoteEntry:function (store, path, callback) {
         var req = store.get(path);
         req.onsuccess = function(event) { callback(null, event.target.result); };
-        req.onerror = function() { callback(this.error); };
+        req.onerror = function(e) {
+          callback(this.error);
+          e.preventDefault();
+        };
       },storeRemoteEntry:function (store, path, entry, callback) {
         var req = store.put(entry, path);
         req.onsuccess = function() { callback(null); };
-        req.onerror = function() { callback(this.error); };
+        req.onerror = function(e) {
+          callback(this.error);
+          e.preventDefault();
+        };
       },removeRemoteEntry:function (store, path, callback) {
         var req = store.delete(path);
         req.onsuccess = function() { callback(null); };
-        req.onerror = function() { callback(this.error); };
+        req.onerror = function(e) {
+          callback(this.error);
+          e.preventDefault();
+        };
       },reconcile:function (src, dst, callback) {
         var total = 0;
   
@@ -2242,7 +2452,10 @@ function copyTempDouble(ptr) {
           }
         };
   
-        transaction.onerror = function() { done(this.error); };
+        transaction.onerror = function(e) {
+          done(this.error);
+          e.preventDefault();
+        };
   
         // sort paths in ascending order so directory entries are created
         // before the files inside them
@@ -2289,7 +2502,7 @@ function copyTempDouble(ptr) {
         try {
           stat = fs.lstatSync(path);
           if (NODEFS.isWindows) {
-            // On Windows, directories return permission bits 'rw-rw-rw-', even though they have 'rwxrwxrwx', so 
+            // On Windows, directories return permission bits 'rw-rw-rw-', even though they have 'rwxrwxrwx', so
             // propagate write bits to execute bits.
             stat.mode = stat.mode | ((stat.mode & 146) >> 1);
           }
@@ -2308,10 +2521,11 @@ function copyTempDouble(ptr) {
         parts.reverse();
         return PATH.join.apply(null, parts);
       },flagsToPermissionStringMap:{0:"r",1:"r+",2:"r+",64:"r",65:"r+",66:"r+",129:"rx+",193:"rx+",514:"w+",577:"w",578:"w+",705:"wx",706:"wx+",1024:"a",1025:"a",1026:"a+",1089:"a",1090:"a+",1153:"ax",1154:"ax+",1217:"ax",1218:"ax+",4096:"rs",4098:"rs+"},flagsToPermissionString:function (flags) {
+        flags &= ~0100000 /*O_LARGEFILE*/; // Ignore this flag from musl, otherwise node.js fails to open the file.
         if (flags in NODEFS.flagsToPermissionStringMap) {
           return NODEFS.flagsToPermissionStringMap[flags];
         } else {
-          return flags;
+          throw new FS.ErrnoError(ERRNO_CODES.EINVAL);
         }
       },node_ops:{getattr:function (node) {
           var path = NODEFS.realPath(node);
@@ -2427,7 +2641,9 @@ function copyTempDouble(ptr) {
         },readlink:function (node) {
           var path = NODEFS.realPath(node);
           try {
-            return fs.readlinkSync(path);
+            path = fs.readlinkSync(path);
+            path = NODEJS_PATH.relative(NODEJS_PATH.resolve(node.mount.opts.root), path);
+            return path;
           } catch (e) {
             if (!e.code) throw e;
             throw new FS.ErrnoError(ERRNO_CODES[e.code]);
@@ -2499,24 +2715,127 @@ function copyTempDouble(ptr) {
           return position;
         }}};
   
+  var WORKERFS={DIR_MODE:16895,FILE_MODE:33279,reader:null,mount:function (mount) {
+        assert(ENVIRONMENT_IS_WORKER);
+        if (!WORKERFS.reader) WORKERFS.reader = new FileReaderSync();
+        var root = WORKERFS.createNode(null, '/', WORKERFS.DIR_MODE, 0);
+        var createdParents = {};
+        function ensureParent(path) {
+          // return the parent node, creating subdirs as necessary
+          var parts = path.split('/');
+          var parent = root;
+          for (var i = 0; i < parts.length-1; i++) {
+            var curr = parts.slice(0, i+1).join('/');
+            if (!createdParents[curr]) {
+              createdParents[curr] = WORKERFS.createNode(parent, curr, WORKERFS.DIR_MODE, 0);
+            }
+            parent = createdParents[curr];
+          }
+          return parent;
+        }
+        function base(path) {
+          var parts = path.split('/');
+          return parts[parts.length-1];
+        }
+        // We also accept FileList here, by using Array.prototype
+        Array.prototype.forEach.call(mount.opts["files"] || [], function(file) {
+          WORKERFS.createNode(ensureParent(file.name), base(file.name), WORKERFS.FILE_MODE, 0, file, file.lastModifiedDate);
+        });
+        (mount.opts["blobs"] || []).forEach(function(obj) {
+          WORKERFS.createNode(ensureParent(obj["name"]), base(obj["name"]), WORKERFS.FILE_MODE, 0, obj["data"]);
+        });
+        (mount.opts["packages"] || []).forEach(function(pack) {
+          pack['metadata'].files.forEach(function(file) {
+            var name = file.filename.substr(1); // remove initial slash
+            WORKERFS.createNode(ensureParent(name), base(name), WORKERFS.FILE_MODE, 0, pack['blob'].slice(file.start, file.end));
+          });
+        });
+        return root;
+      },createNode:function (parent, name, mode, dev, contents, mtime) {
+        var node = FS.createNode(parent, name, mode);
+        node.mode = mode;
+        node.node_ops = WORKERFS.node_ops;
+        node.stream_ops = WORKERFS.stream_ops;
+        node.timestamp = (mtime || new Date).getTime();
+        assert(WORKERFS.FILE_MODE !== WORKERFS.DIR_MODE);
+        if (mode === WORKERFS.FILE_MODE) {
+          node.size = contents.size;
+          node.contents = contents;
+        } else {
+          node.size = 4096;
+          node.contents = {};
+        }
+        if (parent) {
+          parent.contents[name] = node;
+        }
+        return node;
+      },node_ops:{getattr:function (node) {
+          return {
+            dev: 1,
+            ino: undefined,
+            mode: node.mode,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: undefined,
+            size: node.size,
+            atime: new Date(node.timestamp),
+            mtime: new Date(node.timestamp),
+            ctime: new Date(node.timestamp),
+            blksize: 4096,
+            blocks: Math.ceil(node.size / 4096),
+          };
+        },setattr:function (node, attr) {
+          if (attr.mode !== undefined) {
+            node.mode = attr.mode;
+          }
+          if (attr.timestamp !== undefined) {
+            node.timestamp = attr.timestamp;
+          }
+        },lookup:function (parent, name) {
+          throw new FS.ErrnoError(ERRNO_CODES.ENOENT);
+        },mknod:function (parent, name, mode, dev) {
+          throw new FS.ErrnoError(ERRNO_CODES.EPERM);
+        },rename:function (oldNode, newDir, newName) {
+          throw new FS.ErrnoError(ERRNO_CODES.EPERM);
+        },unlink:function (parent, name) {
+          throw new FS.ErrnoError(ERRNO_CODES.EPERM);
+        },rmdir:function (parent, name) {
+          throw new FS.ErrnoError(ERRNO_CODES.EPERM);
+        },readdir:function (node) {
+          throw new FS.ErrnoError(ERRNO_CODES.EPERM);
+        },symlink:function (parent, newName, oldPath) {
+          throw new FS.ErrnoError(ERRNO_CODES.EPERM);
+        },readlink:function (node) {
+          throw new FS.ErrnoError(ERRNO_CODES.EPERM);
+        }},stream_ops:{read:function (stream, buffer, offset, length, position) {
+          if (position >= stream.node.size) return 0;
+          var chunk = stream.node.contents.slice(position, position + length);
+          var ab = WORKERFS.reader.readAsArrayBuffer(chunk);
+          buffer.set(new Uint8Array(ab), offset);
+          return chunk.size;
+        },write:function (stream, buffer, offset, length, position) {
+          throw new FS.ErrnoError(ERRNO_CODES.EIO);
+        },llseek:function (stream, offset, whence) {
+          var position = offset;
+          if (whence === 1) {  // SEEK_CUR.
+            position += stream.position;
+          } else if (whence === 2) {  // SEEK_END.
+            if (FS.isFile(stream.node.mode)) {
+              position += stream.node.size;
+            }
+          }
+          if (position < 0) {
+            throw new FS.ErrnoError(ERRNO_CODES.EINVAL);
+          }
+          return position;
+        }}};
+  
   var _stdin=allocate(1, "i32*", ALLOC_STATIC);
   
   var _stdout=allocate(1, "i32*", ALLOC_STATIC);
   
-  var _stderr=allocate(1, "i32*", ALLOC_STATIC);
-  
-  function _fflush(stream) {
-      // int fflush(FILE *stream);
-      // http://pubs.opengroup.org/onlinepubs/000095399/functions/fflush.html
-  
-      /*
-      // Disabled, see https://github.com/kripken/emscripten/issues/2770
-      stream = FS.getStreamFromPtr(stream);
-      if (stream.stream_ops.flush) {
-        stream.stream_ops.flush(stream);
-      }
-      */
-    }var FS={root:null,mounts:[],devices:[null],streams:[],nextInode:1,nameTable:null,currentPath:"/",initialized:false,ignorePermissions:true,trackingDelegate:{},tracking:{openFlags:{READ:1,WRITE:2}},ErrnoError:null,genericErrors:{},handleFSError:function (e) {
+  var _stderr=allocate(1, "i32*", ALLOC_STATIC);var FS={root:null,mounts:[],devices:[null],streams:[],nextInode:1,nameTable:null,currentPath:"/",initialized:false,ignorePermissions:true,trackingDelegate:{},tracking:{openFlags:{READ:1,WRITE:2}},ErrnoError:null,genericErrors:{},filesystems:null,handleFSError:function (e) {
         if (!(e instanceof FS.ErrnoError)) throw e + ' : ' + stackTrace();
         return ___setErrNo(e.errno);
       },lookupPath:function (path, opts) {
@@ -2572,7 +2891,7 @@ function copyTempDouble(ptr) {
             while (FS.isLink(current.mode)) {
               var link = FS.readlink(current_path);
               current_path = PATH.resolve(PATH.dirname(current_path), link);
-              
+  
               var lookup = FS.lookupPath(current_path, { recurse_count: opts.recurse_count });
               current = lookup.node;
   
@@ -2710,8 +3029,7 @@ function copyTempDouble(ptr) {
         }
         return flags;
       },flagsToPermissionString:function (flag) {
-        var accmode = flag & 2097155;
-        var perms = ['r', 'w', 'rw'][accmode];
+        var perms = ['r', 'w', 'rw'][flag & 3];
         if ((flag & 512)) {
           perms += 'w';
         }
@@ -2822,10 +3140,6 @@ function copyTempDouble(ptr) {
         return stream;
       },closeStream:function (fd) {
         FS.streams[fd] = null;
-      },getStreamFromPtr:function (ptr) {
-        return FS.streams[ptr - 1];
-      },getPtrForStream:function (stream) {
-        return stream ? stream.fd + 1 : 0;
       },chrdev_stream_ops:{open:function (stream) {
           var device = FS.getDevice(stream.node.rdev);
           // override node's stream ops with the device's
@@ -3190,7 +3504,7 @@ function copyTempDouble(ptr) {
         if (!link.node_ops.readlink) {
           throw new FS.ErrnoError(ERRNO_CODES.EINVAL);
         }
-        return link.node_ops.readlink(link);
+        return PATH.resolve(FS.getPath(link.parent), link.node_ops.readlink(link));
       },stat:function (path, dontFollow) {
         var lookup = FS.lookupPath(path, { follow: !dontFollow });
         var node = lookup.node;
@@ -3338,6 +3652,10 @@ function copyTempDouble(ptr) {
         if (FS.isChrdev(node.mode)) {
           flags &= ~512;
         }
+        // if asked only for a directory, then this must be one
+        if ((flags & 65536) && !FS.isDir(node.mode)) {
+          throw new FS.ErrnoError(ERRNO_CODES.ENOTDIR);
+        }
         // check permissions, if this is not a file we just created now (it is ok to
         // create and write to a file with read-only permissions; it is read-only
         // for later use)
@@ -3393,6 +3711,7 @@ function copyTempDouble(ptr) {
         }
         return stream;
       },close:function (stream) {
+        if (stream.getdents) stream.getdents = null; // free readdir state
         try {
           if (stream.stream_ops.close) {
             stream.stream_ops.close(stream);
@@ -3487,6 +3806,13 @@ function copyTempDouble(ptr) {
           throw new FS.ErrnoError(ERRNO_CODES.ENODEV);
         }
         return stream.stream_ops.mmap(stream, buffer, offset, length, position, prot, flags);
+      },msync:function (stream, buffer, offset, length, mmapFlags) {
+        if (!stream || !stream.stream_ops.msync) {
+          return 0;
+        }
+        return stream.stream_ops.msync(stream, buffer, offset, length, mmapFlags);
+      },munmap:function (stream) {
+        return 0;
       },ioctl:function (stream, cmd, arg) {
         if (!stream.stream_ops.ioctl) {
           throw new FS.ErrnoError(ERRNO_CODES.ENOTTY);
@@ -3506,11 +3832,7 @@ function copyTempDouble(ptr) {
         var buf = new Uint8Array(length);
         FS.read(stream, buf, 0, length, 0);
         if (opts.encoding === 'utf8') {
-          ret = '';
-          var utf8 = new Runtime.UTF8Processor();
-          for (var i = 0; i < length; i++) {
-            ret += utf8.processCChar(buf[i]);
-          }
+          ret = UTF8ArrayToString(buf, 0);
         } else if (opts.encoding === 'binary') {
           ret = buf;
         }
@@ -3525,9 +3847,9 @@ function copyTempDouble(ptr) {
         }
         var stream = FS.open(path, opts.flags, opts.mode);
         if (opts.encoding === 'utf8') {
-          var utf8 = new Runtime.UTF8Processor();
-          var buf = new Uint8Array(utf8.processJSString(data));
-          FS.write(stream, buf, 0, buf.length, 0, opts.canOwn);
+          var buf = new Uint8Array(lengthBytesUTF8(data)+1);
+          var actualNumBytes = stringToUTF8Array(data, buf, 0, buf.length);
+          FS.write(stream, buf, 0, actualNumBytes, 0, opts.canOwn);
         } else if (opts.encoding === 'binary') {
           FS.write(stream, data, 0, data.length, 0, opts.canOwn);
         }
@@ -3554,7 +3876,7 @@ function copyTempDouble(ptr) {
         // setup /dev/null
         FS.registerDevice(FS.makedev(1, 3), {
           read: function() { return 0; },
-          write: function() { return 0; }
+          write: function(stream, buffer, offset, length, pos) { return length; }
         });
         FS.mkdev('/dev/null', FS.makedev(1, 3));
         // setup /dev/tty and /dev/tty1
@@ -3583,6 +3905,31 @@ function copyTempDouble(ptr) {
         // just create the tmp dirs that reside in it commonly
         FS.mkdir('/dev/shm');
         FS.mkdir('/dev/shm/tmp');
+      },createSpecialDirectories:function () {
+        // create /proc/self/fd which allows /proc/self/fd/6 => readlink gives the name of the stream for fd 6 (see test_unistd_ttyname)
+        FS.mkdir('/proc');
+        FS.mkdir('/proc/self');
+        FS.mkdir('/proc/self/fd');
+        FS.mount({
+          mount: function() {
+            var node = FS.createNode('/proc/self', 'fd', 16384 | 0777, 73);
+            node.node_ops = {
+              lookup: function(parent, name) {
+                var fd = +name;
+                var stream = FS.getStream(fd);
+                if (!stream) throw new FS.ErrnoError(ERRNO_CODES.EBADF);
+                var ret = {
+                  parent: null,
+                  mount: { mountpoint: 'fake' },
+                  node_ops: { readlink: function() { return stream.path } }
+                };
+                ret.parent = ret; // make it look like a simple root node
+                return ret;
+              }
+            };
+            return node;
+          }
+        }, {}, '/proc/self/fd');
       },createStandardStreams:function () {
         // TODO deprecate the old functionality of a single
         // input / output callback and that utilizes FS.createDevice
@@ -3610,19 +3957,17 @@ function copyTempDouble(ptr) {
   
         // open default streams for the stdin, stdout and stderr devices
         var stdin = FS.open('/dev/stdin', 'r');
-        HEAP32[((_stdin)>>2)]=FS.getPtrForStream(stdin);
         assert(stdin.fd === 0, 'invalid handle for stdin (' + stdin.fd + ')');
   
         var stdout = FS.open('/dev/stdout', 'w');
-        HEAP32[((_stdout)>>2)]=FS.getPtrForStream(stdout);
         assert(stdout.fd === 1, 'invalid handle for stdout (' + stdout.fd + ')');
   
         var stderr = FS.open('/dev/stderr', 'w');
-        HEAP32[((_stderr)>>2)]=FS.getPtrForStream(stderr);
         assert(stderr.fd === 2, 'invalid handle for stderr (' + stderr.fd + ')');
       },ensureErrnoError:function () {
         if (FS.ErrnoError) return;
         FS.ErrnoError = function ErrnoError(errno, node) {
+          //Module.printErr(stackTrace()); // useful for debugging
           this.node = node;
           this.setErrno = function(errno) {
             this.errno = errno;
@@ -3652,6 +3997,14 @@ function copyTempDouble(ptr) {
   
         FS.createDefaultDirectories();
         FS.createDefaultDevices();
+        FS.createSpecialDirectories();
+  
+        FS.filesystems = {
+          'MEMFS': MEMFS,
+          'IDBFS': IDBFS,
+          'NODEFS': NODEFS,
+          'WORKERFS': WORKERFS,
+        };
       },init:function (input, output, error) {
         assert(!FS.init.initialized, 'FS.init was previously called. If you want to initialize later with custom parameters, remove any earlier calls (note that one is automatically added to the generated code)');
         FS.init.initialized = true;
@@ -3666,6 +4019,10 @@ function copyTempDouble(ptr) {
         FS.createStandardStreams();
       },quit:function () {
         FS.init.initialized = false;
+        // force-flush all streams, so we get musl std streams printed out
+        var fflush = Module['_fflush'];
+        if (fflush) fflush(0);
+        // close all of our streams
         for (var i = 0; i < FS.streams.length; i++) {
           var stream = FS.streams[i];
           if (!stream) {
@@ -3982,18 +4339,20 @@ function copyTempDouble(ptr) {
         };
         node.stream_ops = stream_ops;
         return node;
-      },createPreloadedFile:function (parent, name, url, canRead, canWrite, onload, onerror, dontCreateFile, canOwn) {
+      },createPreloadedFile:function (parent, name, url, canRead, canWrite, onload, onerror, dontCreateFile, canOwn, preFinish) {
         Browser.init();
         // TODO we should allow people to just pass in a complete filename instead
         // of parent and name being that we just join them anyways
         var fullname = name ? PATH.resolve(PATH.join2(parent, name)) : parent;
+        var dep = getUniqueRunDependency('cp ' + fullname); // might have several active requests for the same fullname
         function processData(byteArray) {
           function finish(byteArray) {
+            if (preFinish) preFinish();
             if (!dontCreateFile) {
               FS.createDataFile(parent, name, byteArray, canRead, canWrite, canOwn);
             }
             if (onload) onload();
-            removeRunDependency('cp ' + fullname);
+            removeRunDependency(dep);
           }
           var handled = false;
           Module['preloadPlugins'].forEach(function(plugin) {
@@ -4001,14 +4360,14 @@ function copyTempDouble(ptr) {
             if (plugin['canHandle'](fullname)) {
               plugin['handle'](byteArray, fullname, finish, function() {
                 if (onerror) onerror();
-                removeRunDependency('cp ' + fullname);
+                removeRunDependency(dep);
               });
               handled = true;
             }
           });
           if (!handled) finish(byteArray);
         }
-        addRunDependency('cp ' + fullname);
+        addRunDependency(dep);
         if (typeof url == 'string') {
           Browser.asyncLoad(url, function(byteArray) {
             processData(byteArray);
@@ -4088,123 +4447,337 @@ function copyTempDouble(ptr) {
           transaction.onerror = onerror;
         };
         openRequest.onerror = onerror;
-      }};var PATH={splitPath:function (filename) {
-        var splitPathRe = /^(\/?|)([\s\S]*?)((?:\.{1,2}|[^\/]+?|)(\.[^.\/]*|))(?:[\/]*)$/;
-        return splitPathRe.exec(filename).slice(1);
-      },normalizeArray:function (parts, allowAboveRoot) {
-        // if the path tries to go above the root, `up` ends up > 0
-        var up = 0;
-        for (var i = parts.length - 1; i >= 0; i--) {
-          var last = parts[i];
-          if (last === '.') {
-            parts.splice(i, 1);
-          } else if (last === '..') {
-            parts.splice(i, 1);
-            up++;
-          } else if (up) {
-            parts.splice(i, 1);
-            up--;
+      }};var SYSCALLS={DEFAULT_POLLMASK:5,mappings:{},umask:511,calculateAt:function (dirfd, path) {
+        if (path[0] !== '/') {
+          // relative path
+          var dir;
+          if (dirfd === -100) {
+            dir = FS.cwd();
+          } else {
+            var dirstream = FS.getStream(dirfd);
+            if (!dirstream) throw new FS.ErrnoError(ERRNO_CODES.EBADF);
+            dir = dirstream.path;
           }
+          path = PATH.join2(dir, path);
         }
-        // if the path is allowed to go above the root, restore leading ..s
-        if (allowAboveRoot) {
-          for (; up--; up) {
-            parts.unshift('..');
+        return path;
+      },doStat:function (func, path, buf) {
+        try {
+          var stat = func(path);
+        } catch (e) {
+          if (e && e.node && PATH.normalize(path) !== PATH.normalize(FS.getPath(e.node))) {
+            // an error occurred while trying to look up the path; we should just report ENOTDIR
+            return -ERRNO_CODES.ENOTDIR;
           }
+          throw e;
         }
-        return parts;
-      },normalize:function (path) {
-        var isAbsolute = path.charAt(0) === '/',
-            trailingSlash = path.substr(-1) === '/';
-        // Normalize the path
-        path = PATH.normalizeArray(path.split('/').filter(function(p) {
-          return !!p;
-        }), !isAbsolute).join('/');
-        if (!path && !isAbsolute) {
-          path = '.';
-        }
-        if (path && trailingSlash) {
-          path += '/';
-        }
-        return (isAbsolute ? '/' : '') + path;
-      },dirname:function (path) {
-        var result = PATH.splitPath(path),
-            root = result[0],
-            dir = result[1];
-        if (!root && !dir) {
-          // No dirname whatsoever
-          return '.';
-        }
-        if (dir) {
-          // It has a dirname, strip trailing slash
-          dir = dir.substr(0, dir.length - 1);
-        }
-        return root + dir;
-      },basename:function (path) {
-        // EMSCRIPTEN return '/'' for '/', not an empty string
-        if (path === '/') return '/';
-        var lastSlash = path.lastIndexOf('/');
-        if (lastSlash === -1) return path;
-        return path.substr(lastSlash+1);
-      },extname:function (path) {
-        return PATH.splitPath(path)[3];
-      },join:function () {
-        var paths = Array.prototype.slice.call(arguments, 0);
-        return PATH.normalize(paths.join('/'));
-      },join2:function (l, r) {
-        return PATH.normalize(l + '/' + r);
-      },resolve:function () {
-        var resolvedPath = '',
-          resolvedAbsolute = false;
-        for (var i = arguments.length - 1; i >= -1 && !resolvedAbsolute; i--) {
-          var path = (i >= 0) ? arguments[i] : FS.cwd();
-          // Skip empty and invalid entries
-          if (typeof path !== 'string') {
-            throw new TypeError('Arguments to path.resolve must be strings');
-          } else if (!path) {
-            return ''; // an invalid portion invalidates the whole thing
-          }
-          resolvedPath = path + '/' + resolvedPath;
-          resolvedAbsolute = path.charAt(0) === '/';
-        }
-        // At this point the path should be resolved to a full absolute path, but
-        // handle relative paths to be safe (might happen when process.cwd() fails)
-        resolvedPath = PATH.normalizeArray(resolvedPath.split('/').filter(function(p) {
-          return !!p;
-        }), !resolvedAbsolute).join('/');
-        return ((resolvedAbsolute ? '/' : '') + resolvedPath) || '.';
-      },relative:function (from, to) {
-        from = PATH.resolve(from).substr(1);
-        to = PATH.resolve(to).substr(1);
-        function trim(arr) {
-          var start = 0;
-          for (; start < arr.length; start++) {
-            if (arr[start] !== '') break;
-          }
-          var end = arr.length - 1;
-          for (; end >= 0; end--) {
-            if (arr[end] !== '') break;
-          }
-          if (start > end) return [];
-          return arr.slice(start, end - start + 1);
-        }
-        var fromParts = trim(from.split('/'));
-        var toParts = trim(to.split('/'));
-        var length = Math.min(fromParts.length, toParts.length);
-        var samePartsLength = length;
-        for (var i = 0; i < length; i++) {
-          if (fromParts[i] !== toParts[i]) {
-            samePartsLength = i;
+        HEAP32[((buf)>>2)]=stat.dev;
+        HEAP32[(((buf)+(4))>>2)]=0;
+        HEAP32[(((buf)+(8))>>2)]=stat.ino;
+        HEAP32[(((buf)+(12))>>2)]=stat.mode;
+        HEAP32[(((buf)+(16))>>2)]=stat.nlink;
+        HEAP32[(((buf)+(20))>>2)]=stat.uid;
+        HEAP32[(((buf)+(24))>>2)]=stat.gid;
+        HEAP32[(((buf)+(28))>>2)]=stat.rdev;
+        HEAP32[(((buf)+(32))>>2)]=0;
+        HEAP32[(((buf)+(36))>>2)]=stat.size;
+        HEAP32[(((buf)+(40))>>2)]=4096;
+        HEAP32[(((buf)+(44))>>2)]=stat.blocks;
+        HEAP32[(((buf)+(48))>>2)]=(stat.atime.getTime() / 1000)|0;
+        HEAP32[(((buf)+(52))>>2)]=0;
+        HEAP32[(((buf)+(56))>>2)]=(stat.mtime.getTime() / 1000)|0;
+        HEAP32[(((buf)+(60))>>2)]=0;
+        HEAP32[(((buf)+(64))>>2)]=(stat.ctime.getTime() / 1000)|0;
+        HEAP32[(((buf)+(68))>>2)]=0;
+        HEAP32[(((buf)+(72))>>2)]=stat.ino;
+        return 0;
+      },doMsync:function (addr, stream, len, flags) {
+        var buffer = new Uint8Array(HEAPU8.subarray(addr, addr + len));
+        FS.msync(stream, buffer, 0, len, flags);
+      },doMkdir:function (path, mode) {
+        // remove a trailing slash, if one - /a/b/ has basename of '', but
+        // we want to create b in the context of this function
+        path = PATH.normalize(path);
+        if (path[path.length-1] === '/') path = path.substr(0, path.length-1);
+        FS.mkdir(path, mode, 0);
+        return 0;
+      },doMknod:function (path, mode, dev) {
+        // we don't want this in the JS API as it uses mknod to create all nodes.
+        switch (mode & 61440) {
+          case 32768:
+          case 8192:
+          case 24576:
+          case 4096:
+          case 49152:
             break;
-          }
+          default: return -ERRNO_CODES.EINVAL;
         }
-        var outputParts = [];
-        for (var i = samePartsLength; i < fromParts.length; i++) {
-          outputParts.push('..');
+        FS.mknod(path, mode, dev);
+        return 0;
+      },doReadlink:function (path, buf, bufsize) {
+        if (bufsize <= 0) return -ERRNO_CODES.EINVAL;
+        var ret = FS.readlink(path);
+        ret = ret.slice(0, Math.max(0, bufsize));
+        writeStringToMemory(ret, buf, true);
+        return ret.length;
+      },doAccess:function (path, amode) {
+        if (amode & ~7) {
+          // need a valid mode
+          return -ERRNO_CODES.EINVAL;
         }
-        outputParts = outputParts.concat(toParts.slice(samePartsLength));
-        return outputParts.join('/');
-      }};
+        var node;
+        var lookup = FS.lookupPath(path, { follow: true });
+        node = lookup.node;
+        var perms = '';
+        if (amode & 4) perms += 'r';
+        if (amode & 2) perms += 'w';
+        if (amode & 1) perms += 'x';
+        if (perms /* otherwise, they've just passed F_OK */ && FS.nodePermissions(node, perms)) {
+          return -ERRNO_CODES.EACCES;
+        }
+        return 0;
+      },doDup:function (path, flags, suggestFD) {
+        var suggest = FS.getStream(suggestFD);
+        if (suggest) FS.close(suggest);
+        return FS.open(path, flags, 0, suggestFD, suggestFD).fd;
+      },doReadv:function (stream, iov, iovcnt, offset) {
+        var ret = 0;
+        for (var i = 0; i < iovcnt; i++) {
+          var ptr = HEAP32[(((iov)+(i*8))>>2)];
+          var len = HEAP32[(((iov)+(i*8 + 4))>>2)];
+          var curr = FS.read(stream, HEAP8,ptr, len, offset);
+          if (curr < 0) return -1;
+          ret += curr;
+          if (curr < len) break; // nothing more to read
+        }
+        return ret;
+      },doWritev:function (stream, iov, iovcnt, offset) {
+        var ret = 0;
+        for (var i = 0; i < iovcnt; i++) {
+          var ptr = HEAP32[(((iov)+(i*8))>>2)];
+          var len = HEAP32[(((iov)+(i*8 + 4))>>2)];
+          var curr = FS.write(stream, HEAP8,ptr, len, offset);
+          if (curr < 0) return -1;
+          ret += curr;
+        }
+        return ret;
+      },varargs:0,get:function (varargs) {
+        SYSCALLS.varargs += 4;
+        var ret = HEAP32[(((SYSCALLS.varargs)-(4))>>2)];
+        return ret;
+      },getStr:function () {
+        var ret = Pointer_stringify(SYSCALLS.get());
+        return ret;
+      },getStreamFromFD:function () {
+        var stream = FS.getStream(SYSCALLS.get());
+        if (!stream) throw new FS.ErrnoError(ERRNO_CODES.EBADF);
+        return stream;
+      },getSocketFromFD:function () {
+        var socket = SOCKFS.getSocket(SYSCALLS.get());
+        if (!socket) throw new FS.ErrnoError(ERRNO_CODES.EBADF);
+        return socket;
+      },getSocketAddress:function (allowNull) {
+        var addrp = SYSCALLS.get(), addrlen = SYSCALLS.get();
+        if (allowNull && addrp === 0) return null;
+        var info = __read_sockaddr(addrp, addrlen);
+        if (info.errno) throw new FS.ErrnoError(info.errno);
+        info.addr = DNS.lookup_addr(info.addr) || info.addr;
+        return info;
+      },get64:function () {
+        var low = SYSCALLS.get(), high = SYSCALLS.get();
+        if (low >= 0) assert(high === 0);
+        else assert(high === -1);
+        return low;
+      },getZero:function () {
+        assert(SYSCALLS.get() === 0);
+      }};function ___syscall6(which, varargs) {SYSCALLS.varargs = varargs;
+  try {
+   // close
+      var stream = SYSCALLS.getStreamFromFD();
+      FS.close(stream);
+      return 0;
+    } catch (e) {
+    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
+    return -e.errno;
+  }
+  }
+
+  function _sysconf(name) {
+      // long sysconf(int name);
+      // http://pubs.opengroup.org/onlinepubs/009695399/functions/sysconf.html
+      switch(name) {
+        case 30: return PAGE_SIZE;
+        case 85: return totalMemory / PAGE_SIZE;
+        case 132:
+        case 133:
+        case 12:
+        case 137:
+        case 138:
+        case 15:
+        case 235:
+        case 16:
+        case 17:
+        case 18:
+        case 19:
+        case 20:
+        case 149:
+        case 13:
+        case 10:
+        case 236:
+        case 153:
+        case 9:
+        case 21:
+        case 22:
+        case 159:
+        case 154:
+        case 14:
+        case 77:
+        case 78:
+        case 139:
+        case 80:
+        case 81:
+        case 82:
+        case 68:
+        case 67:
+        case 164:
+        case 11:
+        case 29:
+        case 47:
+        case 48:
+        case 95:
+        case 52:
+        case 51:
+        case 46:
+          return 200809;
+        case 79:
+          return 0;
+        case 27:
+        case 246:
+        case 127:
+        case 128:
+        case 23:
+        case 24:
+        case 160:
+        case 161:
+        case 181:
+        case 182:
+        case 242:
+        case 183:
+        case 184:
+        case 243:
+        case 244:
+        case 245:
+        case 165:
+        case 178:
+        case 179:
+        case 49:
+        case 50:
+        case 168:
+        case 169:
+        case 175:
+        case 170:
+        case 171:
+        case 172:
+        case 97:
+        case 76:
+        case 32:
+        case 173:
+        case 35:
+          return -1;
+        case 176:
+        case 177:
+        case 7:
+        case 155:
+        case 8:
+        case 157:
+        case 125:
+        case 126:
+        case 92:
+        case 93:
+        case 129:
+        case 130:
+        case 131:
+        case 94:
+        case 91:
+          return 1;
+        case 74:
+        case 60:
+        case 69:
+        case 70:
+        case 4:
+          return 1024;
+        case 31:
+        case 42:
+        case 72:
+          return 32;
+        case 87:
+        case 26:
+        case 33:
+          return 2147483647;
+        case 34:
+        case 1:
+          return 47839;
+        case 38:
+        case 36:
+          return 99;
+        case 43:
+        case 37:
+          return 2048;
+        case 0: return 2097152;
+        case 3: return 65536;
+        case 28: return 32768;
+        case 44: return 32767;
+        case 75: return 16384;
+        case 39: return 1000;
+        case 89: return 700;
+        case 71: return 256;
+        case 40: return 255;
+        case 2: return 100;
+        case 180: return 64;
+        case 25: return 20;
+        case 5: return 16;
+        case 6: return 6;
+        case 73: return 4;
+        case 84: {
+          if (typeof navigator === 'object') return navigator['hardwareConcurrency'] || 1;
+          return 1;
+        }
+      }
+      ___setErrNo(ERRNO_CODES.EINVAL);
+      return -1;
+    }
+
+  function _sbrk(bytes) {
+      // Implement a Linux-like 'memory area' for our 'process'.
+      // Changes the size of the memory area by |bytes|; returns the
+      // address of the previous top ('break') of the memory area
+      // We control the "dynamic" memory - DYNAMIC_BASE to DYNAMICTOP
+      var self = _sbrk;
+      if (!self.called) {
+        DYNAMICTOP = alignMemoryPage(DYNAMICTOP); // make sure we start out aligned
+        self.called = true;
+        assert(Runtime.dynamicAlloc);
+        self.alloc = Runtime.dynamicAlloc;
+        Runtime.dynamicAlloc = function() { abort('cannot dynamically allocate, sbrk now has control') };
+      }
+      var ret = DYNAMICTOP;
+      if (bytes != 0) {
+        var success = self.alloc(bytes);
+        if (!success) return -1 >>> 0; // sbrk failure code
+      }
+      return ret;  // Previous break location.
+    }
+
+  
+  
+  function _emscripten_memcpy_big(dest, src, num) {
+      HEAPU8.set(HEAPU8.subarray(src, src+num), dest);
+      return dest;
+    } 
+  Module["_memcpy"] = _memcpy; 
+  Module["_memmove"] = _memmove;
+
+
   
   
   function _emscripten_set_main_loop_timing(mode, value) {
@@ -4216,18 +4789,39 @@ function copyTempDouble(ptr) {
       }
   
       if (mode == 0 /*EM_TIMING_SETTIMEOUT*/) {
-        Browser.mainLoop.scheduler = function Browser_mainLoop_scheduler() {
+        Browser.mainLoop.scheduler = function Browser_mainLoop_scheduler_setTimeout() {
           setTimeout(Browser.mainLoop.runner, value); // doing this each time means that on exception, we stop
         };
         Browser.mainLoop.method = 'timeout';
       } else if (mode == 1 /*EM_TIMING_RAF*/) {
-        Browser.mainLoop.scheduler = function Browser_mainLoop_scheduler() {
+        Browser.mainLoop.scheduler = function Browser_mainLoop_scheduler_rAF() {
           Browser.requestAnimationFrame(Browser.mainLoop.runner);
         };
         Browser.mainLoop.method = 'rAF';
+      } else if (mode == 2 /*EM_TIMING_SETIMMEDIATE*/) {
+        if (!window['setImmediate']) {
+          // Emulate setImmediate. (note: not a complete polyfill, we don't emulate clearImmediate() to keep code size to minimum, since not needed)
+          var setImmediates = [];
+          var emscriptenMainLoopMessageId = '__emcc';
+          function Browser_setImmediate_messageHandler(event) {
+            if (event.source === window && event.data === emscriptenMainLoopMessageId) {
+              event.stopPropagation();
+              setImmediates.shift()();
+            }
+          }
+          window.addEventListener("message", Browser_setImmediate_messageHandler, true);
+          window['setImmediate'] = function Browser_emulated_setImmediate(func) {
+            setImmediates.push(func);
+            window.postMessage(emscriptenMainLoopMessageId, "*");
+          }
+        }
+        Browser.mainLoop.scheduler = function Browser_mainLoop_scheduler_setImmediate() {
+          window['setImmediate'](Browser.mainLoop.runner);
+        };
+        Browser.mainLoop.method = 'immediate';
       }
       return 0;
-    }function _emscripten_set_main_loop(func, fps, simulateInfiniteLoop, arg) {
+    }function _emscripten_set_main_loop(func, fps, simulateInfiniteLoop, arg, noSetTiming) {
       Module['noExitRuntime'] = true;
   
       assert(!Browser.mainLoop.func, 'emscripten_set_main_loop: there can only be one main loop function at once: call emscripten_cancel_main_loop to cancel the previous one before setting a new one with different parameters.');
@@ -4299,10 +4893,12 @@ function copyTempDouble(ptr) {
         Browser.mainLoop.scheduler();
       }
   
-      if (fps && fps > 0) _emscripten_set_main_loop_timing(0/*EM_TIMING_SETTIMEOUT*/, 1000.0 / fps);
-      else _emscripten_set_main_loop_timing(1/*EM_TIMING_RAF*/, 1); // Do rAF by rendering each frame (no decimating)
+      if (!noSetTiming) {
+        if (fps && fps > 0) _emscripten_set_main_loop_timing(0/*EM_TIMING_SETTIMEOUT*/, 1000.0 / fps);
+        else _emscripten_set_main_loop_timing(1/*EM_TIMING_RAF*/, 1); // Do rAF by rendering each frame (no decimating)
   
-      Browser.mainLoop.scheduler();
+        Browser.mainLoop.scheduler();
+      }
   
       if (simulateInfiniteLoop) {
         throw 'SimulateInfiniteLoop';
@@ -4316,8 +4912,9 @@ function copyTempDouble(ptr) {
           var timingValue = Browser.mainLoop.timingValue;
           var func = Browser.mainLoop.func;
           Browser.mainLoop.func = null;
-          _emscripten_set_main_loop(func, 0, false, Browser.mainLoop.arg);
+          _emscripten_set_main_loop(func, 0, false, Browser.mainLoop.arg, true /* do not set timing and call scheduler, we will do it on the next lines */);
           _emscripten_set_main_loop_timing(timingMode, timingValue);
+          Browser.mainLoop.scheduler();
         },updateStatus:function () {
           if (Module['setStatus']) {
             var message = Module['statusMessage'] || 'Please wait...';
@@ -4571,11 +5168,13 @@ function copyTempDouble(ptr) {
           Browser.init();
         }
         return ctx;
-      },destroyContext:function (canvas, useWebGL, setInModule) {},fullScreenHandlersInstalled:false,lockPointer:undefined,resizeCanvas:undefined,requestFullScreen:function (lockPointer, resizeCanvas) {
+      },destroyContext:function (canvas, useWebGL, setInModule) {},fullScreenHandlersInstalled:false,lockPointer:undefined,resizeCanvas:undefined,requestFullScreen:function (lockPointer, resizeCanvas, vrDevice) {
         Browser.lockPointer = lockPointer;
         Browser.resizeCanvas = resizeCanvas;
+        Browser.vrDevice = vrDevice;
         if (typeof Browser.lockPointer === 'undefined') Browser.lockPointer = true;
         if (typeof Browser.resizeCanvas === 'undefined') Browser.resizeCanvas = false;
+        if (typeof Browser.vrDevice === 'undefined') Browser.vrDevice = null;
   
         var canvas = Module['canvas'];
         function fullScreenChange() {
@@ -4620,13 +5219,18 @@ function copyTempDouble(ptr) {
         var canvasContainer = document.createElement("div");
         canvas.parentNode.insertBefore(canvasContainer, canvas);
         canvasContainer.appendChild(canvas);
-        
+  
         // use parent of canvas as full screen root to allow aspect ratio correction (Firefox stretches the root to screen size)
         canvasContainer.requestFullScreen = canvasContainer['requestFullScreen'] ||
                                             canvasContainer['mozRequestFullScreen'] ||
                                             canvasContainer['msRequestFullscreen'] ||
                                            (canvasContainer['webkitRequestFullScreen'] ? function() { canvasContainer['webkitRequestFullScreen'](Element['ALLOW_KEYBOARD_INPUT']) } : null);
-        canvasContainer.requestFullScreen();
+  
+        if (vrDevice) {
+          canvasContainer.requestFullScreen({ vrDisplay: vrDevice });
+        } else {
+          canvasContainer.requestFullScreen();
+        }
       },nextRAF:0,fakeRequestAnimationFrame:function (func) {
         // try to keep 60fps between calls to here
         var now = Date.now();
@@ -4657,19 +5261,43 @@ function copyTempDouble(ptr) {
         return function() {
           if (!ABORT) return func.apply(null, arguments);
         };
+      },allowAsyncCallbacks:true,queuedAsyncCallbacks:[],pauseAsyncCallbacks:function () {
+        Browser.allowAsyncCallbacks = false;
+      },resumeAsyncCallbacks:function () { // marks future callbacks as ok to execute, and synchronously runs any remaining ones right now
+        Browser.allowAsyncCallbacks = true;
+        if (Browser.queuedAsyncCallbacks.length > 0) {
+          var callbacks = Browser.queuedAsyncCallbacks;
+          Browser.queuedAsyncCallbacks = [];
+          callbacks.forEach(function(func) {
+            func();
+          });
+        }
       },safeRequestAnimationFrame:function (func) {
         return Browser.requestAnimationFrame(function() {
-          if (!ABORT) func();
+          if (ABORT) return;
+          if (Browser.allowAsyncCallbacks) {
+            func();
+          } else {
+            Browser.queuedAsyncCallbacks.push(func);
+          }
         });
       },safeSetTimeout:function (func, timeout) {
         Module['noExitRuntime'] = true;
         return setTimeout(function() {
-          if (!ABORT) func();
+          if (ABORT) return;
+          if (Browser.allowAsyncCallbacks) {
+            func();
+          } else {
+            Browser.queuedAsyncCallbacks.push(func);
+          }
         }, timeout);
       },safeSetInterval:function (func, timeout) {
         Module['noExitRuntime'] = true;
         return setInterval(function() {
-          if (!ABORT) func();
+          if (ABORT) return;
+          if (Browser.allowAsyncCallbacks) {
+            func();
+          } // drop it on the floor otherwise, next interval will kick in
         }, timeout);
       },getMimetype:function (name) {
         return {
@@ -4767,8 +5395,10 @@ function copyTempDouble(ptr) {
               Browser.lastTouches[touch.identifier] = coords;
               Browser.touches[touch.identifier] = coords;
             } else if (event.type === 'touchend' || event.type === 'touchmove') {
-              Browser.lastTouches[touch.identifier] = Browser.touches[touch.identifier];
-              Browser.touches[touch.identifier] = { x: adjustedX, y: adjustedY };
+              var last = Browser.touches[touch.identifier];
+              if (!last) last = coords;
+              Browser.lastTouches[touch.identifier] = last;
+              Browser.touches[touch.identifier] = coords;
             } 
             return;
           }
@@ -4897,16 +5527,83 @@ function copyTempDouble(ptr) {
       }
       return ret;
     }
-___errno_state = Runtime.staticAlloc(4); HEAP32[((___errno_state)>>2)]=0;
-Module["requestFullScreen"] = function Module_requestFullScreen(lockPointer, resizeCanvas) { Browser.requestFullScreen(lockPointer, resizeCanvas) };
+
+  function _pthread_self() {
+      //FIXME: assumes only a single thread
+      return 0;
+    }
+
+  function ___syscall140(which, varargs) {SYSCALLS.varargs = varargs;
+  try {
+   // llseek
+      var stream = SYSCALLS.getStreamFromFD(), offset_high = SYSCALLS.get(), offset_low = SYSCALLS.get(), result = SYSCALLS.get(), whence = SYSCALLS.get();
+      var offset = offset_low;
+      assert(offset_high === 0);
+      FS.llseek(stream, offset, whence);
+      HEAP32[((result)>>2)]=stream.position;
+      if (stream.getdents && offset === 0 && whence === 0) stream.getdents = null; // reset readdir state
+      return 0;
+    } catch (e) {
+    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
+    return -e.errno;
+  }
+  }
+
+  function ___syscall146(which, varargs) {SYSCALLS.varargs = varargs;
+  try {
+   // writev
+      var stream = SYSCALLS.getStreamFromFD(), iov = SYSCALLS.get(), iovcnt = SYSCALLS.get();
+      return SYSCALLS.doWritev(stream, iov, iovcnt);
+    } catch (e) {
+    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
+    return -e.errno;
+  }
+  }
+
+  function ___syscall54(which, varargs) {SYSCALLS.varargs = varargs;
+  try {
+   // ioctl
+      var stream = SYSCALLS.getStreamFromFD(), op = SYSCALLS.get();
+      switch (op) {
+        case 21505: {
+          if (!stream.tty) return -ERRNO_CODES.ENOTTY;
+          return 0;
+        }
+        case 21506: {
+          if (!stream.tty) return -ERRNO_CODES.ENOTTY;
+          return 0; // no-op, not actually adjusting terminal settings
+        }
+        case 21519: {
+          if (!stream.tty) return -ERRNO_CODES.ENOTTY;
+          var argp = SYSCALLS.get();
+          HEAP32[((argp)>>2)]=0;
+          return 0;
+        }
+        case 21520: {
+          if (!stream.tty) return -ERRNO_CODES.ENOTTY;
+          return -ERRNO_CODES.EINVAL; // not supported
+        }
+        case 21531: {
+          var argp = SYSCALLS.get();
+          return FS.ioctl(stream, op, argp);
+        }
+        default: abort('bad ioctl syscall ' + op);
+      }
+    } catch (e) {
+    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
+    return -e.errno;
+  }
+  }
+FS.staticInit();__ATINIT__.unshift(function() { if (!Module["noFSInit"] && !FS.init.initialized) FS.init() });__ATMAIN__.push(function() { FS.ignorePermissions = false });__ATEXIT__.push(function() { FS.quit() });Module["FS_createFolder"] = FS.createFolder;Module["FS_createPath"] = FS.createPath;Module["FS_createDataFile"] = FS.createDataFile;Module["FS_createPreloadedFile"] = FS.createPreloadedFile;Module["FS_createLazyFile"] = FS.createLazyFile;Module["FS_createLink"] = FS.createLink;Module["FS_createDevice"] = FS.createDevice;Module["FS_unlink"] = FS.unlink;
+__ATINIT__.unshift(function() { TTY.init() });__ATEXIT__.push(function() { TTY.shutdown() });
+if (ENVIRONMENT_IS_NODE) { var fs = require("fs"); var NODEJS_PATH = require("path"); NODEFS.staticInit(); }
+Module["requestFullScreen"] = function Module_requestFullScreen(lockPointer, resizeCanvas, vrDevice) { Browser.requestFullScreen(lockPointer, resizeCanvas, vrDevice) };
   Module["requestAnimationFrame"] = function Module_requestAnimationFrame(func) { Browser.requestAnimationFrame(func) };
   Module["setCanvasSize"] = function Module_setCanvasSize(width, height, noUpdates) { Browser.setCanvasSize(width, height, noUpdates) };
   Module["pauseMainLoop"] = function Module_pauseMainLoop() { Browser.mainLoop.pause() };
   Module["resumeMainLoop"] = function Module_resumeMainLoop() { Browser.mainLoop.resume() };
   Module["getUserMedia"] = function Module_getUserMedia() { Browser.getUserMedia() }
-FS.staticInit();__ATINIT__.unshift({ func: function() { if (!Module["noFSInit"] && !FS.init.initialized) FS.init() } });__ATMAIN__.push({ func: function() { FS.ignorePermissions = false } });__ATEXIT__.push({ func: function() { FS.quit() } });Module["FS_createFolder"] = FS.createFolder;Module["FS_createPath"] = FS.createPath;Module["FS_createDataFile"] = FS.createDataFile;Module["FS_createPreloadedFile"] = FS.createPreloadedFile;Module["FS_createLazyFile"] = FS.createLazyFile;Module["FS_createLink"] = FS.createLink;Module["FS_createDevice"] = FS.createDevice;
-__ATINIT__.unshift({ func: function() { TTY.init() } });__ATEXIT__.push({ func: function() { TTY.shutdown() } });TTY.utf8 = new Runtime.UTF8Processor();
-if (ENVIRONMENT_IS_NODE) { var fs = require("fs"); NODEFS.staticInit(); }
+  Module["createContext"] = function Module_createContext(canvas, useWebGL, setInModule, webGLContextAttributes) { return Browser.createContext(canvas, useWebGL, setInModule, webGLContextAttributes) }
 STACK_BASE = STACKTOP = Runtime.alignMemory(STATICTOP);
 
 staticSealed = true; // seal the static portion of memory
@@ -4917,15 +5614,43 @@ DYNAMIC_BASE = DYNAMICTOP = Runtime.alignMemory(STACK_MAX);
 
 assert(DYNAMIC_BASE < TOTAL_MEMORY, "TOTAL_MEMORY not big enough for stack");
 
- var ctlz_i8 = allocate([8,7,6,6,5,5,5,5,4,4,4,4,4,4,4,4,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "i8", ALLOC_DYNAMIC);
  var cttz_i8 = allocate([8,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,5,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,6,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,5,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,7,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,5,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,6,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,5,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0], "i8", ALLOC_DYNAMIC);
 
 
-Module.asmGlobalArg = { "Math": Math, "Int8Array": Int8Array, "Int16Array": Int16Array, "Int32Array": Int32Array, "Uint8Array": Uint8Array, "Uint16Array": Uint16Array, "Uint32Array": Uint32Array, "Float32Array": Float32Array, "Float64Array": Float64Array };
-Module.asmLibraryArg = { "abort": abort, "assert": assert, "min": Math_min, "_fflush": _fflush, "_sysconf": _sysconf, "_abort": _abort, "___setErrNo": ___setErrNo, "_sbrk": _sbrk, "_time": _time, "_emscripten_set_main_loop_timing": _emscripten_set_main_loop_timing, "_emscripten_memcpy_big": _emscripten_memcpy_big, "_emscripten_set_main_loop": _emscripten_set_main_loop, "___errno_location": ___errno_location, "STACKTOP": STACKTOP, "STACK_MAX": STACK_MAX, "tempDoublePtr": tempDoublePtr, "ABORT": ABORT, "cttz_i8": cttz_i8, "ctlz_i8": ctlz_i8, "NaN": NaN, "Infinity": Infinity };
+function invoke_ii(index,a1) {
+  try {
+    return Module["dynCall_ii"](index,a1);
+  } catch(e) {
+    if (typeof e !== 'number' && e !== 'longjmp') throw e;
+    asm["setThrew"](1, 0);
+  }
+}
+
+function invoke_iiii(index,a1,a2,a3) {
+  try {
+    return Module["dynCall_iiii"](index,a1,a2,a3);
+  } catch(e) {
+    if (typeof e !== 'number' && e !== 'longjmp') throw e;
+    asm["setThrew"](1, 0);
+  }
+}
+
+function invoke_vi(index,a1) {
+  try {
+    Module["dynCall_vi"](index,a1);
+  } catch(e) {
+    if (typeof e !== 'number' && e !== 'longjmp') throw e;
+    asm["setThrew"](1, 0);
+  }
+}
+
+Module.asmGlobalArg = { "Math": Math, "Int8Array": Int8Array, "Int16Array": Int16Array, "Int32Array": Int32Array, "Uint8Array": Uint8Array, "Uint16Array": Uint16Array, "Uint32Array": Uint32Array, "Float32Array": Float32Array, "Float64Array": Float64Array, "NaN": NaN, "Infinity": Infinity };
+
+Module.asmLibraryArg = { "abort": abort, "assert": assert, "invoke_ii": invoke_ii, "invoke_iiii": invoke_iiii, "invoke_vi": invoke_vi, "_pthread_cleanup_pop": _pthread_cleanup_pop, "___lock": ___lock, "_emscripten_set_main_loop": _emscripten_set_main_loop, "_pthread_self": _pthread_self, "___syscall6": ___syscall6, "_emscripten_set_main_loop_timing": _emscripten_set_main_loop_timing, "_abort": _abort, "_sbrk": _sbrk, "_time": _time, "___setErrNo": ___setErrNo, "_emscripten_memcpy_big": _emscripten_memcpy_big, "___syscall54": ___syscall54, "___unlock": ___unlock, "___syscall140": ___syscall140, "_pthread_cleanup_push": _pthread_cleanup_push, "_sysconf": _sysconf, "___syscall146": ___syscall146, "STACKTOP": STACKTOP, "STACK_MAX": STACK_MAX, "tempDoublePtr": tempDoublePtr, "ABORT": ABORT, "cttz_i8": cttz_i8 };
 // EMSCRIPTEN_START_ASM
 var asm = (function(global, env, buffer) {
   'use asm';
+  
   
   var HEAP8 = new global.Int8Array(buffer);
   var HEAP16 = new global.Int16Array(buffer);
@@ -4942,13 +5667,12 @@ var asm = (function(global, env, buffer) {
   var tempDoublePtr=env.tempDoublePtr|0;
   var ABORT=env.ABORT|0;
   var cttz_i8=env.cttz_i8|0;
-  var ctlz_i8=env.ctlz_i8|0;
 
   var __THREW__ = 0;
   var threwValue = 0;
   var setjmpId = 0;
   var undef = 0;
-  var nan = +env.NaN, inf = +env.Infinity;
+  var nan = global.NaN, inf = global.Infinity;
   var tempInt = 0, tempBigInt = 0, tempBigIntP = 0, tempBigIntS = 0, tempBigIntR = 0.0, tempBigIntI = 0, tempBigIntD = 0, tempValue = 0, tempDouble = 0.0;
 
   var tempRet0 = 0;
@@ -4976,19 +5700,30 @@ var asm = (function(global, env, buffer) {
   var Math_log=global.Math.log;
   var Math_ceil=global.Math.ceil;
   var Math_imul=global.Math.imul;
+  var Math_min=global.Math.min;
+  var Math_clz32=global.Math.clz32;
   var abort=env.abort;
   var assert=env.assert;
-  var Math_min=env.min;
-  var _fflush=env._fflush;
-  var _sysconf=env._sysconf;
+  var invoke_ii=env.invoke_ii;
+  var invoke_iiii=env.invoke_iiii;
+  var invoke_vi=env.invoke_vi;
+  var _pthread_cleanup_pop=env._pthread_cleanup_pop;
+  var ___lock=env.___lock;
+  var _emscripten_set_main_loop=env._emscripten_set_main_loop;
+  var _pthread_self=env._pthread_self;
+  var ___syscall6=env.___syscall6;
+  var _emscripten_set_main_loop_timing=env._emscripten_set_main_loop_timing;
   var _abort=env._abort;
-  var ___setErrNo=env.___setErrNo;
   var _sbrk=env._sbrk;
   var _time=env._time;
-  var _emscripten_set_main_loop_timing=env._emscripten_set_main_loop_timing;
+  var ___setErrNo=env.___setErrNo;
   var _emscripten_memcpy_big=env._emscripten_memcpy_big;
-  var _emscripten_set_main_loop=env._emscripten_set_main_loop;
-  var ___errno_location=env.___errno_location;
+  var ___syscall54=env.___syscall54;
+  var ___unlock=env.___unlock;
+  var ___syscall140=env.___syscall140;
+  var _pthread_cleanup_push=env._pthread_cleanup_push;
+  var _sysconf=env._sysconf;
+  var ___syscall146=env.___syscall146;
   var tempFloat = 0.0;
 
 // EMSCRIPTEN_START_FUNCS
@@ -4997,7 +5732,7 @@ function stackAlloc(size) {
   var ret = 0;
   ret = STACKTOP;
   STACKTOP = (STACKTOP + size)|0;
-STACKTOP = (STACKTOP + 15)&-16;
+  STACKTOP = (STACKTOP + 15)&-16;
 
   return ret|0;
 }
@@ -5007,6 +5742,12 @@ function stackSave() {
 function stackRestore(top) {
   top = top|0;
   STACKTOP = top;
+}
+function establishStackSpace(stackBase, stackMax) {
+  stackBase = stackBase|0;
+  stackMax = stackMax|0;
+  STACKTOP = stackBase;
+  STACK_MAX = stackMax;
 }
 
 function setThrew(threw, value) {
@@ -5035,6 +5776,7 @@ function copyTempDouble(ptr) {
   HEAP8[tempDoublePtr+6>>0] = HEAP8[ptr+6>>0];
   HEAP8[tempDoublePtr+7>>0] = HEAP8[ptr+7>>0];
 }
+
 function setTempRet0(value) {
   value = value|0;
   tempRet0 = value;
@@ -5060,189 +5802,189 @@ function _crypto_verify_32_ref($x,$y) {
  $0 = HEAP8[$x>>0]|0;
  $1 = HEAP8[$y>>0]|0;
  $2 = $1 ^ $0;
- $3 = (($x) + 1|0);
+ $3 = ((($x)) + 1|0);
  $4 = HEAP8[$3>>0]|0;
- $5 = (($y) + 1|0);
+ $5 = ((($y)) + 1|0);
  $6 = HEAP8[$5>>0]|0;
  $7 = $6 ^ $4;
  $8 = $7 | $2;
- $9 = (($x) + 2|0);
+ $9 = ((($x)) + 2|0);
  $10 = HEAP8[$9>>0]|0;
- $11 = (($y) + 2|0);
+ $11 = ((($y)) + 2|0);
  $12 = HEAP8[$11>>0]|0;
  $13 = $12 ^ $10;
  $14 = $8 | $13;
- $15 = (($x) + 3|0);
+ $15 = ((($x)) + 3|0);
  $16 = HEAP8[$15>>0]|0;
- $17 = (($y) + 3|0);
+ $17 = ((($y)) + 3|0);
  $18 = HEAP8[$17>>0]|0;
  $19 = $18 ^ $16;
  $20 = $14 | $19;
- $21 = (($x) + 4|0);
+ $21 = ((($x)) + 4|0);
  $22 = HEAP8[$21>>0]|0;
- $23 = (($y) + 4|0);
+ $23 = ((($y)) + 4|0);
  $24 = HEAP8[$23>>0]|0;
  $25 = $24 ^ $22;
  $26 = $20 | $25;
- $27 = (($x) + 5|0);
+ $27 = ((($x)) + 5|0);
  $28 = HEAP8[$27>>0]|0;
- $29 = (($y) + 5|0);
+ $29 = ((($y)) + 5|0);
  $30 = HEAP8[$29>>0]|0;
  $31 = $30 ^ $28;
  $32 = $26 | $31;
- $33 = (($x) + 6|0);
+ $33 = ((($x)) + 6|0);
  $34 = HEAP8[$33>>0]|0;
- $35 = (($y) + 6|0);
+ $35 = ((($y)) + 6|0);
  $36 = HEAP8[$35>>0]|0;
  $37 = $36 ^ $34;
  $38 = $32 | $37;
- $39 = (($x) + 7|0);
+ $39 = ((($x)) + 7|0);
  $40 = HEAP8[$39>>0]|0;
- $41 = (($y) + 7|0);
+ $41 = ((($y)) + 7|0);
  $42 = HEAP8[$41>>0]|0;
  $43 = $42 ^ $40;
  $44 = $38 | $43;
- $45 = (($x) + 8|0);
+ $45 = ((($x)) + 8|0);
  $46 = HEAP8[$45>>0]|0;
- $47 = (($y) + 8|0);
+ $47 = ((($y)) + 8|0);
  $48 = HEAP8[$47>>0]|0;
  $49 = $48 ^ $46;
  $50 = $44 | $49;
- $51 = (($x) + 9|0);
+ $51 = ((($x)) + 9|0);
  $52 = HEAP8[$51>>0]|0;
- $53 = (($y) + 9|0);
+ $53 = ((($y)) + 9|0);
  $54 = HEAP8[$53>>0]|0;
  $55 = $54 ^ $52;
  $56 = $50 | $55;
- $57 = (($x) + 10|0);
+ $57 = ((($x)) + 10|0);
  $58 = HEAP8[$57>>0]|0;
- $59 = (($y) + 10|0);
+ $59 = ((($y)) + 10|0);
  $60 = HEAP8[$59>>0]|0;
  $61 = $60 ^ $58;
  $62 = $56 | $61;
- $63 = (($x) + 11|0);
+ $63 = ((($x)) + 11|0);
  $64 = HEAP8[$63>>0]|0;
- $65 = (($y) + 11|0);
+ $65 = ((($y)) + 11|0);
  $66 = HEAP8[$65>>0]|0;
  $67 = $66 ^ $64;
  $68 = $62 | $67;
- $69 = (($x) + 12|0);
+ $69 = ((($x)) + 12|0);
  $70 = HEAP8[$69>>0]|0;
- $71 = (($y) + 12|0);
+ $71 = ((($y)) + 12|0);
  $72 = HEAP8[$71>>0]|0;
  $73 = $72 ^ $70;
  $74 = $68 | $73;
- $75 = (($x) + 13|0);
+ $75 = ((($x)) + 13|0);
  $76 = HEAP8[$75>>0]|0;
- $77 = (($y) + 13|0);
+ $77 = ((($y)) + 13|0);
  $78 = HEAP8[$77>>0]|0;
  $79 = $78 ^ $76;
  $80 = $74 | $79;
- $81 = (($x) + 14|0);
+ $81 = ((($x)) + 14|0);
  $82 = HEAP8[$81>>0]|0;
- $83 = (($y) + 14|0);
+ $83 = ((($y)) + 14|0);
  $84 = HEAP8[$83>>0]|0;
  $85 = $84 ^ $82;
  $86 = $80 | $85;
- $87 = (($x) + 15|0);
+ $87 = ((($x)) + 15|0);
  $88 = HEAP8[$87>>0]|0;
- $89 = (($y) + 15|0);
+ $89 = ((($y)) + 15|0);
  $90 = HEAP8[$89>>0]|0;
  $91 = $90 ^ $88;
  $92 = $86 | $91;
- $93 = (($x) + 16|0);
+ $93 = ((($x)) + 16|0);
  $94 = HEAP8[$93>>0]|0;
- $95 = (($y) + 16|0);
+ $95 = ((($y)) + 16|0);
  $96 = HEAP8[$95>>0]|0;
  $97 = $96 ^ $94;
  $98 = $92 | $97;
- $99 = (($x) + 17|0);
+ $99 = ((($x)) + 17|0);
  $100 = HEAP8[$99>>0]|0;
- $101 = (($y) + 17|0);
+ $101 = ((($y)) + 17|0);
  $102 = HEAP8[$101>>0]|0;
  $103 = $102 ^ $100;
  $104 = $98 | $103;
- $105 = (($x) + 18|0);
+ $105 = ((($x)) + 18|0);
  $106 = HEAP8[$105>>0]|0;
- $107 = (($y) + 18|0);
+ $107 = ((($y)) + 18|0);
  $108 = HEAP8[$107>>0]|0;
  $109 = $108 ^ $106;
  $110 = $104 | $109;
- $111 = (($x) + 19|0);
+ $111 = ((($x)) + 19|0);
  $112 = HEAP8[$111>>0]|0;
- $113 = (($y) + 19|0);
+ $113 = ((($y)) + 19|0);
  $114 = HEAP8[$113>>0]|0;
  $115 = $114 ^ $112;
  $116 = $110 | $115;
- $117 = (($x) + 20|0);
+ $117 = ((($x)) + 20|0);
  $118 = HEAP8[$117>>0]|0;
- $119 = (($y) + 20|0);
+ $119 = ((($y)) + 20|0);
  $120 = HEAP8[$119>>0]|0;
  $121 = $120 ^ $118;
  $122 = $116 | $121;
- $123 = (($x) + 21|0);
+ $123 = ((($x)) + 21|0);
  $124 = HEAP8[$123>>0]|0;
- $125 = (($y) + 21|0);
+ $125 = ((($y)) + 21|0);
  $126 = HEAP8[$125>>0]|0;
  $127 = $126 ^ $124;
  $128 = $122 | $127;
- $129 = (($x) + 22|0);
+ $129 = ((($x)) + 22|0);
  $130 = HEAP8[$129>>0]|0;
- $131 = (($y) + 22|0);
+ $131 = ((($y)) + 22|0);
  $132 = HEAP8[$131>>0]|0;
  $133 = $132 ^ $130;
  $134 = $128 | $133;
- $135 = (($x) + 23|0);
+ $135 = ((($x)) + 23|0);
  $136 = HEAP8[$135>>0]|0;
- $137 = (($y) + 23|0);
+ $137 = ((($y)) + 23|0);
  $138 = HEAP8[$137>>0]|0;
  $139 = $138 ^ $136;
  $140 = $134 | $139;
- $141 = (($x) + 24|0);
+ $141 = ((($x)) + 24|0);
  $142 = HEAP8[$141>>0]|0;
- $143 = (($y) + 24|0);
+ $143 = ((($y)) + 24|0);
  $144 = HEAP8[$143>>0]|0;
  $145 = $144 ^ $142;
  $146 = $140 | $145;
- $147 = (($x) + 25|0);
+ $147 = ((($x)) + 25|0);
  $148 = HEAP8[$147>>0]|0;
- $149 = (($y) + 25|0);
+ $149 = ((($y)) + 25|0);
  $150 = HEAP8[$149>>0]|0;
  $151 = $150 ^ $148;
  $152 = $146 | $151;
- $153 = (($x) + 26|0);
+ $153 = ((($x)) + 26|0);
  $154 = HEAP8[$153>>0]|0;
- $155 = (($y) + 26|0);
+ $155 = ((($y)) + 26|0);
  $156 = HEAP8[$155>>0]|0;
  $157 = $156 ^ $154;
  $158 = $152 | $157;
- $159 = (($x) + 27|0);
+ $159 = ((($x)) + 27|0);
  $160 = HEAP8[$159>>0]|0;
- $161 = (($y) + 27|0);
+ $161 = ((($y)) + 27|0);
  $162 = HEAP8[$161>>0]|0;
  $163 = $162 ^ $160;
  $164 = $158 | $163;
- $165 = (($x) + 28|0);
+ $165 = ((($x)) + 28|0);
  $166 = HEAP8[$165>>0]|0;
- $167 = (($y) + 28|0);
+ $167 = ((($y)) + 28|0);
  $168 = HEAP8[$167>>0]|0;
  $169 = $168 ^ $166;
  $170 = $164 | $169;
- $171 = (($x) + 29|0);
+ $171 = ((($x)) + 29|0);
  $172 = HEAP8[$171>>0]|0;
- $173 = (($y) + 29|0);
+ $173 = ((($y)) + 29|0);
  $174 = HEAP8[$173>>0]|0;
  $175 = $174 ^ $172;
  $176 = $170 | $175;
- $177 = (($x) + 30|0);
+ $177 = ((($x)) + 30|0);
  $178 = HEAP8[$177>>0]|0;
- $179 = (($y) + 30|0);
+ $179 = ((($y)) + 30|0);
  $180 = HEAP8[$179>>0]|0;
  $181 = $180 ^ $178;
  $182 = $176 | $181;
- $183 = (($x) + 31|0);
+ $183 = ((($x)) + 31|0);
  $184 = HEAP8[$183>>0]|0;
- $185 = (($y) + 31|0);
+ $185 = ((($y)) + 31|0);
  $186 = HEAP8[$185>>0]|0;
  $187 = $186 ^ $184;
  $188 = $182 | $187;
@@ -5251,39 +5993,40 @@ function _crypto_verify_32_ref($x,$y) {
  $191 = $190 >>> 8;
  $192 = $191 & 1;
  $193 = (($192) + -1)|0;
- STACKTOP = sp;return ($193|0);
+ return ($193|0);
 }
 function _curve25519_sign($signature_out,$curve25519_privkey,$msg,$msg_len) {
  $signature_out = $signature_out|0;
  $curve25519_privkey = $curve25519_privkey|0;
  $msg = $msg|0;
  $msg_len = $msg_len|0;
- var $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $ed_keypair = 0, $ed_pubkey_point = 0, $sigbuf_out_len = 0, dest = 0;
- var label = 0, sp = 0, src = 0, stop = 0;
+ var $$alloca_mul = 0, $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $ed_keypair = 0, $ed_pubkey_point = 0, $sigbuf_out_len = 0;
+ var dest = 0, label = 0, sp = 0, src = 0, stop = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 240|0;
  $ed_pubkey_point = sp + 8|0;
  $ed_keypair = sp + 168|0;
  $sigbuf_out_len = sp;
  $0 = (($msg_len) + 64)|0;
- $1 = STACKTOP; STACKTOP = STACKTOP + ((((1*$0)|0)+15)&-16)|0;;
+ $$alloca_mul = $0;
+ $1 = STACKTOP; STACKTOP = STACKTOP + ((((1*$$alloca_mul)|0)+15)&-16)|0;;
  $2 = $sigbuf_out_len;
  $3 = $2;
  HEAP32[$3>>2] = 0;
  $4 = (($2) + 4)|0;
  $5 = $4;
  HEAP32[$5>>2] = 0;
- dest=$ed_keypair+0|0; src=$curve25519_privkey+0|0; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
+ dest=$ed_keypair; src=$curve25519_privkey; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
  _crypto_sign_ed25519_ref10_ge_scalarmult_base($ed_pubkey_point,$curve25519_privkey);
- $6 = (($ed_keypair) + 32|0);
+ $6 = ((($ed_keypair)) + 32|0);
  _crypto_sign_ed25519_ref10_ge_p3_tobytes($6,$ed_pubkey_point);
- $7 = (($ed_keypair) + 63|0);
+ $7 = ((($ed_keypair)) + 63|0);
  $8 = HEAP8[$7>>0]|0;
  $9 = $8&255;
  $10 = $9 & 128;
  (_crypto_sign_modified($1,$sigbuf_out_len,$msg,$msg_len,0,$ed_keypair)|0);
- dest=$signature_out+0|0; src=$1+0|0; stop=dest+64|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
- $11 = (($signature_out) + 63|0);
+ dest=$signature_out; src=$1; stop=dest+64|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
+ $11 = ((($signature_out)) + 63|0);
  $12 = HEAP8[$11>>0]|0;
  $13 = $12&255;
  $14 = $13 | $10;
@@ -5296,8 +6039,8 @@ function _curve25519_verify($signature,$curve25519_pubkey,$msg,$msg_len) {
  $curve25519_pubkey = $curve25519_pubkey|0;
  $msg = $msg|0;
  $msg_len = $msg_len|0;
- var $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $ed_pubkey = 0, $ed_y = 0;
- var $inv_mont_x_plus_one = 0, $mont_x = 0, $mont_x_minus_one = 0, $mont_x_plus_one = 0, $one = 0, $some_retval = 0, dest = 0, label = 0, sp = 0, src = 0, stop = 0;
+ var $$alloca_mul = 0, $$alloca_mul1 = 0, $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0;
+ var $ed_pubkey = 0, $ed_y = 0, $inv_mont_x_plus_one = 0, $mont_x = 0, $mont_x_minus_one = 0, $mont_x_plus_one = 0, $one = 0, $some_retval = 0, dest = 0, label = 0, sp = 0, src = 0, stop = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 288|0;
  $mont_x = sp + 208|0;
@@ -5309,8 +6052,10 @@ function _curve25519_verify($signature,$curve25519_pubkey,$msg,$msg_len) {
  $ed_pubkey = sp + 248|0;
  $some_retval = sp;
  $0 = (($msg_len) + 64)|0;
- $1 = STACKTOP; STACKTOP = STACKTOP + ((((1*$0)|0)+15)&-16)|0;;
- $2 = STACKTOP; STACKTOP = STACKTOP + ((((1*$0)|0)+15)&-16)|0;;
+ $$alloca_mul = $0;
+ $1 = STACKTOP; STACKTOP = STACKTOP + ((((1*$$alloca_mul)|0)+15)&-16)|0;;
+ $$alloca_mul1 = $0;
+ $2 = STACKTOP; STACKTOP = STACKTOP + ((((1*$$alloca_mul1)|0)+15)&-16)|0;;
  _crypto_sign_ed25519_ref10_fe_frombytes($mont_x,$curve25519_pubkey);
  _crypto_sign_ed25519_ref10_fe_1($one);
  _crypto_sign_ed25519_ref10_fe_sub($mont_x_minus_one,$mont_x,$one);
@@ -5318,11 +6063,11 @@ function _curve25519_verify($signature,$curve25519_pubkey,$msg,$msg_len) {
  _crypto_sign_ed25519_ref10_fe_invert($inv_mont_x_plus_one,$mont_x_plus_one);
  _crypto_sign_ed25519_ref10_fe_mul($ed_y,$mont_x_minus_one,$inv_mont_x_plus_one);
  _crypto_sign_ed25519_ref10_fe_tobytes($ed_pubkey,$ed_y);
- $3 = (($signature) + 63|0);
+ $3 = ((($signature)) + 63|0);
  $4 = HEAP8[$3>>0]|0;
  $5 = $4&255;
  $6 = $5 & 128;
- $7 = (($ed_pubkey) + 31|0);
+ $7 = ((($ed_pubkey)) + 31|0);
  $8 = HEAP8[$7>>0]|0;
  $9 = $8&255;
  $10 = $9 | $6;
@@ -5333,8 +6078,8 @@ function _curve25519_verify($signature,$curve25519_pubkey,$msg,$msg_len) {
  $14 = $13 & 127;
  $15 = $14&255;
  HEAP8[$3>>0] = $15;
- dest=$1+0|0; src=$signature+0|0; stop=dest+64|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
- $16 = (($1) + 64|0);
+ dest=$1; src=$signature; stop=dest+64|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
+ $16 = ((($1)) + 64|0);
  _memcpy(($16|0),($msg|0),($msg_len|0))|0;
  $17 = (_crypto_sign_edwards25519sha512batch_ref10_open($2,$some_retval,$1,$0,0,$ed_pubkey)|0);
  STACKTOP = sp;return ($17|0);
@@ -5363,12 +6108,12 @@ function _crypto_sign_modified($sm,$smlen,$m,$0,$1,$sk) {
  var $10 = 0, $11 = 0, $12 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $R = 0, $hram = 0, $nonce = 0, $pk1 = 0, dest = 0, label = 0, sp = 0, src = 0, stop = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 320|0;
- $pk1 = sp + 288|0;
- $nonce = sp + 224|0;
+ $pk1 = sp + 224|0;
+ $nonce = sp + 256|0;
  $hram = sp + 160|0;
  $R = sp;
- $2 = (($sk) + 32|0);
- dest=$pk1+0|0; src=$2+0|0; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
+ $2 = ((($sk)) + 32|0);
+ dest=$pk1; src=$2; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
  $3 = (_i64Add(($0|0),($1|0),64,0)|0);
  $4 = tempRet0;
  $5 = $smlen;
@@ -5377,14 +6122,14 @@ function _crypto_sign_modified($sm,$smlen,$m,$0,$1,$sk) {
  $7 = (($5) + 4)|0;
  $8 = $7;
  HEAP32[$8>>2] = $4;
- $9 = (($sm) + 64|0);
+ $9 = ((($sm)) + 64|0);
  _memmove(($9|0),($m|0),($0|0))|0;
- $10 = (($sm) + 32|0);
+ $10 = ((($sm)) + 32|0);
  _memmove(($10|0),($sk|0),32)|0;
  $11 = (_i64Add(($0|0),($1|0),32,0)|0);
  $12 = tempRet0;
  (_crypto_hash_sha512_ref($nonce,$10,$11,$12)|0);
- dest=$10+0|0; src=$pk1+0|0; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
+ dest=$10; src=$pk1; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
  _crypto_sign_ed25519_ref10_sc_reduce($nonce);
  _crypto_sign_ed25519_ref10_ge_scalarmult_base($R,$nonce);
  _crypto_sign_ed25519_ref10_ge_p3_tobytes($sm,$R);
@@ -5405,7 +6150,7 @@ function _curve25519_donna($mypublic,$secret,$basepoint) {
  $z = sp + 80|0;
  $zmone = sp;
  $e = sp + 328|0;
- dest=$e+0|0; src=$secret+0|0; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
+ dest=$e; src=$secret; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
  _fexpand($bp,$basepoint);
  _cmult($x,$z,$e,$bp);
  _crecip($zmone,$z);
@@ -5434,20 +6179,20 @@ function _fexpand($output,$input) {
  sp = STACKTOP;
  $0 = HEAP8[$input>>0]|0;
  $1 = $0&255;
- $2 = (($input) + 1|0);
+ $2 = ((($input)) + 1|0);
  $3 = HEAP8[$2>>0]|0;
  $4 = $3&255;
  $5 = (_bitshift64Shl(($4|0),0,8)|0);
  $6 = tempRet0;
  $7 = $5 | $1;
- $8 = (($input) + 2|0);
+ $8 = ((($input)) + 2|0);
  $9 = HEAP8[$8>>0]|0;
  $10 = $9&255;
  $11 = (_bitshift64Shl(($10|0),0,16)|0);
  $12 = tempRet0;
  $13 = $7 | $11;
  $14 = $6 | $12;
- $15 = (($input) + 3|0);
+ $15 = ((($input)) + 3|0);
  $16 = HEAP8[$15>>0]|0;
  $17 = $16&255;
  $18 = (_bitshift64Shl(($17|0),0,24)|0);
@@ -5462,20 +6207,20 @@ function _fexpand($output,$input) {
  HEAP32[$25>>2] = $14;
  $26 = HEAP8[$15>>0]|0;
  $27 = $26&255;
- $28 = (($input) + 4|0);
+ $28 = ((($input)) + 4|0);
  $29 = HEAP8[$28>>0]|0;
  $30 = $29&255;
  $31 = (_bitshift64Shl(($30|0),0,8)|0);
  $32 = tempRet0;
  $33 = $31 | $27;
- $34 = (($input) + 5|0);
+ $34 = ((($input)) + 5|0);
  $35 = HEAP8[$34>>0]|0;
  $36 = $35&255;
  $37 = (_bitshift64Shl(($36|0),0,16)|0);
  $38 = tempRet0;
  $39 = $33 | $37;
  $40 = $32 | $38;
- $41 = (($input) + 6|0);
+ $41 = ((($input)) + 6|0);
  $42 = HEAP8[$41>>0]|0;
  $43 = $42&255;
  $44 = (_bitshift64Shl(($43|0),0,24)|0);
@@ -5485,7 +6230,7 @@ function _fexpand($output,$input) {
  $48 = (_bitshift64Lshr(($46|0),($47|0),2)|0);
  $49 = tempRet0;
  $50 = $48 & 33554431;
- $51 = (($output) + 8|0);
+ $51 = ((($output)) + 8|0);
  $52 = $51;
  $53 = $52;
  HEAP32[$53>>2] = $50;
@@ -5494,20 +6239,20 @@ function _fexpand($output,$input) {
  HEAP32[$55>>2] = 0;
  $56 = HEAP8[$41>>0]|0;
  $57 = $56&255;
- $58 = (($input) + 7|0);
+ $58 = ((($input)) + 7|0);
  $59 = HEAP8[$58>>0]|0;
  $60 = $59&255;
  $61 = (_bitshift64Shl(($60|0),0,8)|0);
  $62 = tempRet0;
  $63 = $61 | $57;
- $64 = (($input) + 8|0);
+ $64 = ((($input)) + 8|0);
  $65 = HEAP8[$64>>0]|0;
  $66 = $65&255;
  $67 = (_bitshift64Shl(($66|0),0,16)|0);
  $68 = tempRet0;
  $69 = $63 | $67;
  $70 = $62 | $68;
- $71 = (($input) + 9|0);
+ $71 = ((($input)) + 9|0);
  $72 = HEAP8[$71>>0]|0;
  $73 = $72&255;
  $74 = (_bitshift64Shl(($73|0),0,24)|0);
@@ -5517,7 +6262,7 @@ function _fexpand($output,$input) {
  $78 = (_bitshift64Lshr(($76|0),($77|0),3)|0);
  $79 = tempRet0;
  $80 = $78 & 67108863;
- $81 = (($output) + 16|0);
+ $81 = ((($output)) + 16|0);
  $82 = $81;
  $83 = $82;
  HEAP32[$83>>2] = $80;
@@ -5526,20 +6271,20 @@ function _fexpand($output,$input) {
  HEAP32[$85>>2] = 0;
  $86 = HEAP8[$71>>0]|0;
  $87 = $86&255;
- $88 = (($input) + 10|0);
+ $88 = ((($input)) + 10|0);
  $89 = HEAP8[$88>>0]|0;
  $90 = $89&255;
  $91 = (_bitshift64Shl(($90|0),0,8)|0);
  $92 = tempRet0;
  $93 = $91 | $87;
- $94 = (($input) + 11|0);
+ $94 = ((($input)) + 11|0);
  $95 = HEAP8[$94>>0]|0;
  $96 = $95&255;
  $97 = (_bitshift64Shl(($96|0),0,16)|0);
  $98 = tempRet0;
  $99 = $93 | $97;
  $100 = $92 | $98;
- $101 = (($input) + 12|0);
+ $101 = ((($input)) + 12|0);
  $102 = HEAP8[$101>>0]|0;
  $103 = $102&255;
  $104 = (_bitshift64Shl(($103|0),0,24)|0);
@@ -5549,7 +6294,7 @@ function _fexpand($output,$input) {
  $108 = (_bitshift64Lshr(($106|0),($107|0),5)|0);
  $109 = tempRet0;
  $110 = $108 & 33554431;
- $111 = (($output) + 24|0);
+ $111 = ((($output)) + 24|0);
  $112 = $111;
  $113 = $112;
  HEAP32[$113>>2] = $110;
@@ -5558,20 +6303,20 @@ function _fexpand($output,$input) {
  HEAP32[$115>>2] = 0;
  $116 = HEAP8[$101>>0]|0;
  $117 = $116&255;
- $118 = (($input) + 13|0);
+ $118 = ((($input)) + 13|0);
  $119 = HEAP8[$118>>0]|0;
  $120 = $119&255;
  $121 = (_bitshift64Shl(($120|0),0,8)|0);
  $122 = tempRet0;
  $123 = $121 | $117;
- $124 = (($input) + 14|0);
+ $124 = ((($input)) + 14|0);
  $125 = HEAP8[$124>>0]|0;
  $126 = $125&255;
  $127 = (_bitshift64Shl(($126|0),0,16)|0);
  $128 = tempRet0;
  $129 = $123 | $127;
  $130 = $122 | $128;
- $131 = (($input) + 15|0);
+ $131 = ((($input)) + 15|0);
  $132 = HEAP8[$131>>0]|0;
  $133 = $132&255;
  $134 = (_bitshift64Shl(($133|0),0,24)|0);
@@ -5581,37 +6326,37 @@ function _fexpand($output,$input) {
  $138 = (_bitshift64Lshr(($136|0),($137|0),6)|0);
  $139 = tempRet0;
  $140 = $138 & 67108863;
- $141 = (($output) + 32|0);
+ $141 = ((($output)) + 32|0);
  $142 = $141;
  $143 = $142;
  HEAP32[$143>>2] = $140;
  $144 = (($142) + 4)|0;
  $145 = $144;
  HEAP32[$145>>2] = 0;
- $146 = (($input) + 16|0);
+ $146 = ((($input)) + 16|0);
  $147 = HEAP8[$146>>0]|0;
  $148 = $147&255;
- $149 = (($input) + 17|0);
+ $149 = ((($input)) + 17|0);
  $150 = HEAP8[$149>>0]|0;
  $151 = $150&255;
  $152 = (_bitshift64Shl(($151|0),0,8)|0);
  $153 = tempRet0;
  $154 = $152 | $148;
- $155 = (($input) + 18|0);
+ $155 = ((($input)) + 18|0);
  $156 = HEAP8[$155>>0]|0;
  $157 = $156&255;
  $158 = (_bitshift64Shl(($157|0),0,16)|0);
  $159 = tempRet0;
  $160 = $154 | $158;
  $161 = $153 | $159;
- $162 = (($input) + 19|0);
+ $162 = ((($input)) + 19|0);
  $163 = HEAP8[$162>>0]|0;
  $164 = $163&255;
  $165 = (_bitshift64Shl(($164|0),0,24)|0);
  $166 = tempRet0;
  $167 = $165 & 16777216;
  $168 = $160 | $167;
- $169 = (($output) + 40|0);
+ $169 = ((($output)) + 40|0);
  $170 = $169;
  $171 = $170;
  HEAP32[$171>>2] = $168;
@@ -5620,20 +6365,20 @@ function _fexpand($output,$input) {
  HEAP32[$173>>2] = $161;
  $174 = HEAP8[$162>>0]|0;
  $175 = $174&255;
- $176 = (($input) + 20|0);
+ $176 = ((($input)) + 20|0);
  $177 = HEAP8[$176>>0]|0;
  $178 = $177&255;
  $179 = (_bitshift64Shl(($178|0),0,8)|0);
  $180 = tempRet0;
  $181 = $179 | $175;
- $182 = (($input) + 21|0);
+ $182 = ((($input)) + 21|0);
  $183 = HEAP8[$182>>0]|0;
  $184 = $183&255;
  $185 = (_bitshift64Shl(($184|0),0,16)|0);
  $186 = tempRet0;
  $187 = $181 | $185;
  $188 = $180 | $186;
- $189 = (($input) + 22|0);
+ $189 = ((($input)) + 22|0);
  $190 = HEAP8[$189>>0]|0;
  $191 = $190&255;
  $192 = (_bitshift64Shl(($191|0),0,24)|0);
@@ -5643,7 +6388,7 @@ function _fexpand($output,$input) {
  $196 = (_bitshift64Lshr(($194|0),($195|0),1)|0);
  $197 = tempRet0;
  $198 = $196 & 67108863;
- $199 = (($output) + 48|0);
+ $199 = ((($output)) + 48|0);
  $200 = $199;
  $201 = $200;
  HEAP32[$201>>2] = $198;
@@ -5652,20 +6397,20 @@ function _fexpand($output,$input) {
  HEAP32[$203>>2] = 0;
  $204 = HEAP8[$189>>0]|0;
  $205 = $204&255;
- $206 = (($input) + 23|0);
+ $206 = ((($input)) + 23|0);
  $207 = HEAP8[$206>>0]|0;
  $208 = $207&255;
  $209 = (_bitshift64Shl(($208|0),0,8)|0);
  $210 = tempRet0;
  $211 = $209 | $205;
- $212 = (($input) + 24|0);
+ $212 = ((($input)) + 24|0);
  $213 = HEAP8[$212>>0]|0;
  $214 = $213&255;
  $215 = (_bitshift64Shl(($214|0),0,16)|0);
  $216 = tempRet0;
  $217 = $211 | $215;
  $218 = $210 | $216;
- $219 = (($input) + 25|0);
+ $219 = ((($input)) + 25|0);
  $220 = HEAP8[$219>>0]|0;
  $221 = $220&255;
  $222 = (_bitshift64Shl(($221|0),0,24)|0);
@@ -5675,7 +6420,7 @@ function _fexpand($output,$input) {
  $226 = (_bitshift64Lshr(($224|0),($225|0),3)|0);
  $227 = tempRet0;
  $228 = $226 & 33554431;
- $229 = (($output) + 56|0);
+ $229 = ((($output)) + 56|0);
  $230 = $229;
  $231 = $230;
  HEAP32[$231>>2] = $228;
@@ -5684,20 +6429,20 @@ function _fexpand($output,$input) {
  HEAP32[$233>>2] = 0;
  $234 = HEAP8[$219>>0]|0;
  $235 = $234&255;
- $236 = (($input) + 26|0);
+ $236 = ((($input)) + 26|0);
  $237 = HEAP8[$236>>0]|0;
  $238 = $237&255;
  $239 = (_bitshift64Shl(($238|0),0,8)|0);
  $240 = tempRet0;
  $241 = $239 | $235;
- $242 = (($input) + 27|0);
+ $242 = ((($input)) + 27|0);
  $243 = HEAP8[$242>>0]|0;
  $244 = $243&255;
  $245 = (_bitshift64Shl(($244|0),0,16)|0);
  $246 = tempRet0;
  $247 = $241 | $245;
  $248 = $240 | $246;
- $249 = (($input) + 28|0);
+ $249 = ((($input)) + 28|0);
  $250 = HEAP8[$249>>0]|0;
  $251 = $250&255;
  $252 = (_bitshift64Shl(($251|0),0,24)|0);
@@ -5707,7 +6452,7 @@ function _fexpand($output,$input) {
  $256 = (_bitshift64Lshr(($254|0),($255|0),4)|0);
  $257 = tempRet0;
  $258 = $256 & 67108863;
- $259 = (($output) + 64|0);
+ $259 = ((($output)) + 64|0);
  $260 = $259;
  $261 = $260;
  HEAP32[$261>>2] = $258;
@@ -5716,20 +6461,20 @@ function _fexpand($output,$input) {
  HEAP32[$263>>2] = 0;
  $264 = HEAP8[$249>>0]|0;
  $265 = $264&255;
- $266 = (($input) + 29|0);
+ $266 = ((($input)) + 29|0);
  $267 = HEAP8[$266>>0]|0;
  $268 = $267&255;
  $269 = (_bitshift64Shl(($268|0),0,8)|0);
  $270 = tempRet0;
  $271 = $269 | $265;
- $272 = (($input) + 30|0);
+ $272 = ((($input)) + 30|0);
  $273 = HEAP8[$272>>0]|0;
  $274 = $273&255;
  $275 = (_bitshift64Shl(($274|0),0,16)|0);
  $276 = tempRet0;
  $277 = $271 | $275;
  $278 = $270 | $276;
- $279 = (($input) + 31|0);
+ $279 = ((($input)) + 31|0);
  $280 = HEAP8[$279>>0]|0;
  $281 = $280&255;
  $282 = (_bitshift64Shl(($281|0),0,24)|0);
@@ -5739,14 +6484,14 @@ function _fexpand($output,$input) {
  $286 = (_bitshift64Lshr(($284|0),($285|0),6)|0);
  $287 = tempRet0;
  $288 = $286 & 33554431;
- $289 = (($output) + 72|0);
+ $289 = ((($output)) + 72|0);
  $290 = $289;
  $291 = $290;
  HEAP32[$291>>2] = $288;
  $292 = (($290) + 4)|0;
  $293 = $292;
  HEAP32[$293>>2] = 0;
- STACKTOP = sp;return;
+ return;
 }
 function _cmult($resultx,$resultz,$n,$q) {
  $resultx = $resultx|0;
@@ -5755,8 +6500,8 @@ function _cmult($resultx,$resultz,$n,$q) {
  $q = $q|0;
  var $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $3 = 0, $4 = 0;
  var $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $a = 0, $b = 0, $byte$09 = 0, $c = 0, $d = 0, $e = 0, $exitcond = 0, $exitcond20 = 0, $f = 0, $g = 0, $h = 0, $i$018 = 0, $j$08 = 0, $nqpqx$019 = 0, $nqpqx$110 = 0;
- var $nqpqx$110$phi = 0, $nqpqx2$014 = 0, $nqpqx2$14 = 0, $nqpqx2$14$phi = 0, $nqpqz$013 = 0, $nqpqz$13 = 0, $nqpqz$13$phi = 0, $nqpqz2$015 = 0, $nqpqz2$15 = 0, $nqpqz2$15$phi = 0, $nqx$011 = 0, $nqx$11 = 0, $nqx$11$phi = 0, $nqx2$016 = 0, $nqx2$16 = 0, $nqx2$16$phi = 0, $nqz$012 = 0, $nqz$12 = 0, $nqz$12$phi = 0, $nqz2$017 = 0;
- var $nqz2$17 = 0, $nqz2$17$phi = 0, dest = 0, label = 0, sp = 0, src = 0, stop = 0;
+ var $nqpqx$110$lcssa = 0, $nqpqx$110$phi = 0, $nqpqx2$014 = 0, $nqpqx2$14 = 0, $nqpqx2$14$lcssa = 0, $nqpqx2$14$phi = 0, $nqpqz$013 = 0, $nqpqz$13 = 0, $nqpqz$13$lcssa = 0, $nqpqz$13$phi = 0, $nqpqz2$015 = 0, $nqpqz2$15 = 0, $nqpqz2$15$lcssa = 0, $nqpqz2$15$phi = 0, $nqx$011 = 0, $nqx$11 = 0, $nqx$11$lcssa = 0, $nqx$11$phi = 0, $nqx2$016 = 0, $nqx2$16 = 0;
+ var $nqx2$16$lcssa = 0, $nqx2$16$lcssa$lcssa = 0, $nqx2$16$phi = 0, $nqz$012 = 0, $nqz$12 = 0, $nqz$12$lcssa = 0, $nqz$12$phi = 0, $nqz2$017 = 0, $nqz2$17 = 0, $nqz2$17$lcssa = 0, $nqz2$17$lcssa$lcssa = 0, $nqz2$17$phi = 0, dest = 0, label = 0, sp = 0, src = 0, stop = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 1216|0;
  $a = sp + 1064|0;
@@ -5799,7 +6544,7 @@ function _cmult($resultx,$resultz,$n,$q) {
  $14 = (($12) + 4)|0;
  $15 = $14;
  HEAP32[$15>>2] = 0;
- dest=$a+0|0; src=$q+0|0; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
+ dest=$a; src=$q; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
  $i$018 = 0;$nqpqx$019 = $a;$nqpqx2$014 = $e;$nqpqz$013 = $b;$nqpqz2$015 = $f;$nqx$011 = $c;$nqx2$016 = $g;$nqz$012 = $d;$nqz2$017 = $h;
  while(1) {
   $16 = (31 - ($i$018))|0;
@@ -5819,6 +6564,7 @@ function _cmult($resultx,$resultz,$n,$q) {
    $23 = (($j$08) + 1)|0;
    $exitcond = ($23|0)==(8);
    if ($exitcond) {
+    $nqpqx$110$lcssa = $nqpqx$110;$nqpqx2$14$lcssa = $nqpqx2$14;$nqpqz$13$lcssa = $nqpqz$13;$nqpqz2$15$lcssa = $nqpqz2$15;$nqx$11$lcssa = $nqx$11;$nqx2$16$lcssa = $nqx2$16;$nqz$12$lcssa = $nqz$12;$nqz2$17$lcssa = $nqz2$17;
     break;
    } else {
     $nqz2$17$phi = $nqz$12;$nqz$12$phi = $nqz2$17;$nqx2$16$phi = $nqx$11;$nqx$11$phi = $nqx2$16;$nqpqz2$15$phi = $nqpqz$13;$nqpqz$13$phi = $nqpqz2$15;$nqpqx2$14$phi = $nqpqx$110;$nqpqx$110$phi = $nqpqx2$14;$byte$09 = $22;$j$08 = $23;$nqz2$17 = $nqz2$17$phi;$nqz$12 = $nqz$12$phi;$nqx2$16 = $nqx2$16$phi;$nqx$11 = $nqx$11$phi;$nqpqz2$15 = $nqpqz2$15$phi;$nqpqz$13 = $nqpqz$13$phi;$nqpqx2$14 = $nqpqx2$14$phi;$nqpqx$110 = $nqpqx$110$phi;
@@ -5827,13 +6573,14 @@ function _cmult($resultx,$resultz,$n,$q) {
   $24 = (($i$018) + 1)|0;
   $exitcond20 = ($24|0)==(32);
   if ($exitcond20) {
+   $nqx2$16$lcssa$lcssa = $nqx2$16$lcssa;$nqz2$17$lcssa$lcssa = $nqz2$17$lcssa;
    break;
   } else {
-   $i$018 = $24;$nqpqx$019 = $nqpqx2$14;$nqpqx2$014 = $nqpqx$110;$nqpqz$013 = $nqpqz2$15;$nqpqz2$015 = $nqpqz$13;$nqx$011 = $nqx2$16;$nqx2$016 = $nqx$11;$nqz$012 = $nqz2$17;$nqz2$017 = $nqz$12;
+   $i$018 = $24;$nqpqx$019 = $nqpqx2$14$lcssa;$nqpqx2$014 = $nqpqx$110$lcssa;$nqpqz$013 = $nqpqz2$15$lcssa;$nqpqz2$015 = $nqpqz$13$lcssa;$nqx$011 = $nqx2$16$lcssa;$nqx2$016 = $nqx$11$lcssa;$nqz$012 = $nqz2$17$lcssa;$nqz2$017 = $nqz$12$lcssa;
   }
  }
- dest=$resultx+0|0; src=$nqx2$16+0|0; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
- dest=$resultz+0|0; src=$nqz2$17+0|0; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
+ dest=$resultx; src=$nqx2$16$lcssa$lcssa; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
+ dest=$resultz; src=$nqz2$17$lcssa$lcssa; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
  STACKTOP = sp;return;
 }
 function _crecip($out,$z) {
@@ -5973,34 +6720,35 @@ function _fmul($output,$in,$in2) {
  _fproduct($t,$in,$in2);
  _freduce_degree($t);
  _freduce_coefficients($t);
- dest=$output+0|0; src=$t+0|0; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
+ dest=$output; src=$t; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
  STACKTOP = sp;return;
 }
 function _fcontract($output,$input_limbs) {
  $output = $output|0;
  $input_limbs = $input_limbs|0;
- var $$pn = 0, $0 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0;
- var $115 = 0, $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0;
- var $133 = 0, $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0;
- var $151 = 0, $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0;
- var $17 = 0, $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0;
- var $188 = 0, $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0, $197 = 0, $198 = 0, $199 = 0, $2 = 0, $20 = 0, $200 = 0, $201 = 0, $202 = 0, $203 = 0, $204 = 0;
- var $205 = 0, $206 = 0, $207 = 0, $208 = 0, $209 = 0, $21 = 0, $210 = 0, $211 = 0, $212 = 0, $213 = 0, $214 = 0, $215 = 0, $216 = 0, $217 = 0, $218 = 0, $219 = 0, $22 = 0, $220 = 0, $221 = 0, $222 = 0;
- var $223 = 0, $224 = 0, $225 = 0, $226 = 0, $227 = 0, $228 = 0, $229 = 0, $23 = 0, $230 = 0, $231 = 0, $232 = 0, $233 = 0, $234 = 0, $235 = 0, $236 = 0, $237 = 0, $238 = 0, $239 = 0, $24 = 0, $240 = 0;
- var $241 = 0, $242 = 0, $243 = 0, $244 = 0, $245 = 0, $246 = 0, $247 = 0, $248 = 0, $249 = 0, $25 = 0, $250 = 0, $251 = 0, $252 = 0, $253 = 0, $254 = 0, $255 = 0, $256 = 0, $257 = 0, $258 = 0, $259 = 0;
- var $26 = 0, $260 = 0, $261 = 0, $262 = 0, $263 = 0, $264 = 0, $265 = 0, $266 = 0, $267 = 0, $268 = 0, $269 = 0, $27 = 0, $270 = 0, $271 = 0, $272 = 0, $273 = 0, $274 = 0, $275 = 0, $276 = 0, $277 = 0;
- var $278 = 0, $279 = 0, $28 = 0, $280 = 0, $281 = 0, $282 = 0, $283 = 0, $284 = 0, $285 = 0, $286 = 0, $287 = 0, $288 = 0, $289 = 0, $29 = 0, $290 = 0, $291 = 0, $292 = 0, $293 = 0, $294 = 0, $295 = 0;
- var $296 = 0, $297 = 0, $298 = 0, $299 = 0, $3 = 0, $30 = 0, $300 = 0, $301 = 0, $302 = 0, $303 = 0, $304 = 0, $305 = 0, $306 = 0, $307 = 0, $308 = 0, $309 = 0, $31 = 0, $310 = 0, $311 = 0, $312 = 0;
- var $313 = 0, $314 = 0, $315 = 0, $316 = 0, $317 = 0, $318 = 0, $319 = 0, $32 = 0, $320 = 0, $321 = 0, $322 = 0, $323 = 0, $324 = 0, $325 = 0, $326 = 0, $327 = 0, $328 = 0, $329 = 0, $33 = 0, $330 = 0;
- var $331 = 0, $332 = 0, $333 = 0, $334 = 0, $335 = 0, $336 = 0, $337 = 0, $338 = 0, $339 = 0, $34 = 0, $340 = 0, $341 = 0, $342 = 0, $343 = 0, $344 = 0, $345 = 0, $346 = 0, $347 = 0, $348 = 0, $349 = 0;
- var $35 = 0, $350 = 0, $351 = 0, $352 = 0, $353 = 0, $354 = 0, $355 = 0, $356 = 0, $357 = 0, $358 = 0, $359 = 0, $36 = 0, $360 = 0, $361 = 0, $362 = 0, $363 = 0, $364 = 0, $365 = 0, $366 = 0, $367 = 0;
- var $368 = 0, $369 = 0, $37 = 0, $370 = 0, $371 = 0, $372 = 0, $373 = 0, $374 = 0, $375 = 0, $376 = 0, $377 = 0, $378 = 0, $379 = 0, $38 = 0, $380 = 0, $381 = 0, $382 = 0, $383 = 0, $384 = 0, $385 = 0;
- var $386 = 0, $387 = 0, $388 = 0, $389 = 0, $39 = 0, $390 = 0, $391 = 0, $392 = 0, $393 = 0, $394 = 0, $395 = 0, $396 = 0, $397 = 0, $398 = 0, $399 = 0, $4 = 0, $40 = 0, $400 = 0, $401 = 0, $402 = 0;
- var $403 = 0, $404 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0;
- var $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0, $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0;
- var $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0, $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0;
- var $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, $exitcond = 0, $exitcond11 = 0, $exitcond11$1 = 0, $exitcond14 = 0, $exitcond14$1 = 0, $i$17 = 0, $i$17$1 = 0, $i$24 = 0, $i$24$1 = 0, $i$33 = 0, $input = 0, $mask$02 = 0, $mask$1 = 0, label = 0;
- var sp = 0;
+ var $0 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0;
+ var $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0;
+ var $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0;
+ var $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0;
+ var $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0;
+ var $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0, $197 = 0, $198 = 0, $199 = 0, $2 = 0, $20 = 0, $200 = 0, $201 = 0, $202 = 0, $203 = 0, $204 = 0, $205 = 0;
+ var $206 = 0, $207 = 0, $208 = 0, $209 = 0, $21 = 0, $210 = 0, $211 = 0, $212 = 0, $213 = 0, $214 = 0, $215 = 0, $216 = 0, $217 = 0, $218 = 0, $219 = 0, $22 = 0, $220 = 0, $221 = 0, $222 = 0, $223 = 0;
+ var $224 = 0, $225 = 0, $226 = 0, $227 = 0, $228 = 0, $229 = 0, $23 = 0, $230 = 0, $231 = 0, $232 = 0, $233 = 0, $234 = 0, $235 = 0, $236 = 0, $237 = 0, $238 = 0, $239 = 0, $24 = 0, $240 = 0, $241 = 0;
+ var $242 = 0, $243 = 0, $244 = 0, $245 = 0, $246 = 0, $247 = 0, $248 = 0, $249 = 0, $25 = 0, $250 = 0, $251 = 0, $252 = 0, $253 = 0, $254 = 0, $255 = 0, $256 = 0, $257 = 0, $258 = 0, $259 = 0, $26 = 0;
+ var $260 = 0, $261 = 0, $262 = 0, $263 = 0, $264 = 0, $265 = 0, $266 = 0, $267 = 0, $268 = 0, $269 = 0, $27 = 0, $270 = 0, $271 = 0, $272 = 0, $273 = 0, $274 = 0, $275 = 0, $276 = 0, $277 = 0, $278 = 0;
+ var $279 = 0, $28 = 0, $280 = 0, $281 = 0, $282 = 0, $283 = 0, $284 = 0, $285 = 0, $286 = 0, $287 = 0, $288 = 0, $289 = 0, $29 = 0, $290 = 0, $291 = 0, $292 = 0, $293 = 0, $294 = 0, $295 = 0, $296 = 0;
+ var $297 = 0, $298 = 0, $299 = 0, $3 = 0, $30 = 0, $300 = 0, $301 = 0, $302 = 0, $303 = 0, $304 = 0, $305 = 0, $306 = 0, $307 = 0, $308 = 0, $309 = 0, $31 = 0, $310 = 0, $311 = 0, $312 = 0, $313 = 0;
+ var $314 = 0, $315 = 0, $316 = 0, $317 = 0, $318 = 0, $319 = 0, $32 = 0, $320 = 0, $321 = 0, $322 = 0, $323 = 0, $324 = 0, $325 = 0, $326 = 0, $327 = 0, $328 = 0, $329 = 0, $33 = 0, $330 = 0, $331 = 0;
+ var $332 = 0, $333 = 0, $334 = 0, $335 = 0, $336 = 0, $337 = 0, $338 = 0, $339 = 0, $34 = 0, $340 = 0, $341 = 0, $342 = 0, $343 = 0, $344 = 0, $345 = 0, $346 = 0, $347 = 0, $348 = 0, $349 = 0, $35 = 0;
+ var $350 = 0, $351 = 0, $352 = 0, $353 = 0, $354 = 0, $355 = 0, $356 = 0, $357 = 0, $358 = 0, $359 = 0, $36 = 0, $360 = 0, $361 = 0, $362 = 0, $363 = 0, $364 = 0, $365 = 0, $366 = 0, $367 = 0, $368 = 0;
+ var $369 = 0, $37 = 0, $370 = 0, $371 = 0, $372 = 0, $373 = 0, $374 = 0, $375 = 0, $376 = 0, $377 = 0, $378 = 0, $379 = 0, $38 = 0, $380 = 0, $381 = 0, $382 = 0, $383 = 0, $384 = 0, $385 = 0, $386 = 0;
+ var $387 = 0, $388 = 0, $389 = 0, $39 = 0, $390 = 0, $391 = 0, $392 = 0, $393 = 0, $394 = 0, $395 = 0, $396 = 0, $397 = 0, $398 = 0, $399 = 0, $4 = 0, $40 = 0, $400 = 0, $401 = 0, $402 = 0, $403 = 0;
+ var $404 = 0, $405 = 0, $406 = 0, $407 = 0, $408 = 0, $409 = 0, $41 = 0, $410 = 0, $411 = 0, $412 = 0, $413 = 0, $414 = 0, $415 = 0, $416 = 0, $417 = 0, $418 = 0, $419 = 0, $42 = 0, $420 = 0, $421 = 0;
+ var $422 = 0, $423 = 0, $424 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0;
+ var $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0, $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0;
+ var $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0, $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0;
+ var $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, $exitcond = 0, $exitcond$1 = 0, $exitcond13 = 0, $exitcond13$1 = 0, $i$18 = 0, $i$18$1 = 0, $i$26 = 0, $i$26$1 = 0, $input = 0, $mask$1 = 0, $mask$1$1 = 0, $mask$1$2 = 0, $mask$1$3 = 0, $mask$1$4 = 0, $mask$1$5 = 0;
+ var $mask$1$6 = 0, $mask$1$7 = 0, $mask$1$8 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 48|0;
  $input = sp;
@@ -6011,93 +6759,93 @@ function _fcontract($output,$input_limbs) {
  $4 = $3;
  $5 = HEAP32[$4>>2]|0;
  HEAP32[$input>>2] = $2;
- $6 = (($input_limbs) + 8|0);
+ $6 = ((($input_limbs)) + 8|0);
  $7 = $6;
  $8 = $7;
  $9 = HEAP32[$8>>2]|0;
  $10 = (($7) + 4)|0;
  $11 = $10;
  $12 = HEAP32[$11>>2]|0;
- $13 = (($input) + 4|0);
+ $13 = ((($input)) + 4|0);
  HEAP32[$13>>2] = $9;
- $14 = (($input_limbs) + 16|0);
+ $14 = ((($input_limbs)) + 16|0);
  $15 = $14;
  $16 = $15;
  $17 = HEAP32[$16>>2]|0;
  $18 = (($15) + 4)|0;
  $19 = $18;
  $20 = HEAP32[$19>>2]|0;
- $21 = (($input) + 8|0);
+ $21 = ((($input)) + 8|0);
  HEAP32[$21>>2] = $17;
- $22 = (($input_limbs) + 24|0);
+ $22 = ((($input_limbs)) + 24|0);
  $23 = $22;
  $24 = $23;
  $25 = HEAP32[$24>>2]|0;
  $26 = (($23) + 4)|0;
  $27 = $26;
  $28 = HEAP32[$27>>2]|0;
- $29 = (($input) + 12|0);
+ $29 = ((($input)) + 12|0);
  HEAP32[$29>>2] = $25;
- $30 = (($input_limbs) + 32|0);
+ $30 = ((($input_limbs)) + 32|0);
  $31 = $30;
  $32 = $31;
  $33 = HEAP32[$32>>2]|0;
  $34 = (($31) + 4)|0;
  $35 = $34;
  $36 = HEAP32[$35>>2]|0;
- $37 = (($input) + 16|0);
+ $37 = ((($input)) + 16|0);
  HEAP32[$37>>2] = $33;
- $38 = (($input_limbs) + 40|0);
+ $38 = ((($input_limbs)) + 40|0);
  $39 = $38;
  $40 = $39;
  $41 = HEAP32[$40>>2]|0;
  $42 = (($39) + 4)|0;
  $43 = $42;
  $44 = HEAP32[$43>>2]|0;
- $45 = (($input) + 20|0);
+ $45 = ((($input)) + 20|0);
  HEAP32[$45>>2] = $41;
- $46 = (($input_limbs) + 48|0);
+ $46 = ((($input_limbs)) + 48|0);
  $47 = $46;
  $48 = $47;
  $49 = HEAP32[$48>>2]|0;
  $50 = (($47) + 4)|0;
  $51 = $50;
  $52 = HEAP32[$51>>2]|0;
- $53 = (($input) + 24|0);
+ $53 = ((($input)) + 24|0);
  HEAP32[$53>>2] = $49;
- $54 = (($input_limbs) + 56|0);
+ $54 = ((($input_limbs)) + 56|0);
  $55 = $54;
  $56 = $55;
  $57 = HEAP32[$56>>2]|0;
  $58 = (($55) + 4)|0;
  $59 = $58;
  $60 = HEAP32[$59>>2]|0;
- $61 = (($input) + 28|0);
+ $61 = ((($input)) + 28|0);
  HEAP32[$61>>2] = $57;
- $62 = (($input_limbs) + 64|0);
+ $62 = ((($input_limbs)) + 64|0);
  $63 = $62;
  $64 = $63;
  $65 = HEAP32[$64>>2]|0;
  $66 = (($63) + 4)|0;
  $67 = $66;
  $68 = HEAP32[$67>>2]|0;
- $69 = (($input) + 32|0);
+ $69 = ((($input)) + 32|0);
  HEAP32[$69>>2] = $65;
- $70 = (($input_limbs) + 72|0);
+ $70 = ((($input_limbs)) + 72|0);
  $71 = $70;
  $72 = $71;
  $73 = HEAP32[$72>>2]|0;
  $74 = (($71) + 4)|0;
  $75 = $74;
  $76 = HEAP32[$75>>2]|0;
- $77 = (($input) + 36|0);
+ $77 = ((($input)) + 36|0);
  HEAP32[$77>>2] = $73;
- $78 = (($input) + 36|0);
- $i$17 = 0;
+ $78 = ((($input)) + 36|0);
+ $i$18 = 0;
  while(1) {
-  $79 = $i$17 & 1;
+  $79 = $i$18 & 1;
   $80 = ($79|0)==(0);
-  $81 = (($input) + ($i$17<<2)|0);
+  $81 = (($input) + ($i$18<<2)|0);
   $82 = HEAP32[$81>>2]|0;
   $83 = $82 >> 31;
   $84 = $83 & $82;
@@ -6106,7 +6854,7 @@ function _fcontract($output,$input_limbs) {
    $93 = Math_imul($92, -67108864)|0;
    $94 = (($93) + ($82))|0;
    HEAP32[$81>>2] = $94;
-   $95 = (($i$17) + 1)|0;
+   $95 = (($i$18) + 1)|0;
    $96 = (($input) + ($95<<2)|0);
    $97 = HEAP32[$96>>2]|0;
    $98 = (($97) + ($92))|0;
@@ -6116,18 +6864,18 @@ function _fcontract($output,$input_limbs) {
    $86 = Math_imul($85, -33554432)|0;
    $87 = (($86) + ($82))|0;
    HEAP32[$81>>2] = $87;
-   $88 = (($i$17) + 1)|0;
+   $88 = (($i$18) + 1)|0;
    $89 = (($input) + ($88<<2)|0);
    $90 = HEAP32[$89>>2]|0;
    $91 = (($90) + ($85))|0;
    HEAP32[$89>>2] = $91;
   }
-  $99 = (($i$17) + 1)|0;
-  $exitcond14 = ($99|0)==(9);
-  if ($exitcond14) {
+  $99 = (($i$18) + 1)|0;
+  $exitcond13 = ($99|0)==(9);
+  if ($exitcond13) {
    break;
   } else {
-   $i$17 = $99;
+   $i$18 = $99;
   }
  }
  $100 = HEAP32[$78>>2]|0;
@@ -6141,41 +6889,41 @@ function _fcontract($output,$input_limbs) {
  $107 = ($103*19)|0;
  $108 = (($107) + ($106))|0;
  HEAP32[$input>>2] = $108;
- $i$17$1 = 0;
+ $i$18$1 = 0;
  while(1) {
-  $384 = $i$17$1 & 1;
-  $385 = ($384|0)==(0);
-  $386 = (($input) + ($i$17$1<<2)|0);
-  $387 = HEAP32[$386>>2]|0;
-  $388 = $387 >> 31;
-  $389 = $388 & $387;
-  if ($385) {
-   $397 = $389 >> 26;
-   $398 = Math_imul($397, -67108864)|0;
-   $399 = (($398) + ($387))|0;
-   HEAP32[$386>>2] = $399;
-   $400 = (($i$17$1) + 1)|0;
-   $401 = (($input) + ($400<<2)|0);
-   $402 = HEAP32[$401>>2]|0;
-   $403 = (($402) + ($397))|0;
-   HEAP32[$401>>2] = $403;
+  $404 = $i$18$1 & 1;
+  $405 = ($404|0)==(0);
+  $406 = (($input) + ($i$18$1<<2)|0);
+  $407 = HEAP32[$406>>2]|0;
+  $408 = $407 >> 31;
+  $409 = $408 & $407;
+  if ($405) {
+   $417 = $409 >> 26;
+   $418 = Math_imul($417, -67108864)|0;
+   $419 = (($418) + ($407))|0;
+   HEAP32[$406>>2] = $419;
+   $420 = (($i$18$1) + 1)|0;
+   $421 = (($input) + ($420<<2)|0);
+   $422 = HEAP32[$421>>2]|0;
+   $423 = (($422) + ($417))|0;
+   HEAP32[$421>>2] = $423;
   } else {
-   $390 = $389 >> 25;
-   $391 = Math_imul($390, -33554432)|0;
-   $392 = (($391) + ($387))|0;
-   HEAP32[$386>>2] = $392;
-   $393 = (($i$17$1) + 1)|0;
-   $394 = (($input) + ($393<<2)|0);
-   $395 = HEAP32[$394>>2]|0;
-   $396 = (($395) + ($390))|0;
-   HEAP32[$394>>2] = $396;
+   $410 = $409 >> 25;
+   $411 = Math_imul($410, -33554432)|0;
+   $412 = (($411) + ($407))|0;
+   HEAP32[$406>>2] = $412;
+   $413 = (($i$18$1) + 1)|0;
+   $414 = (($input) + ($413<<2)|0);
+   $415 = HEAP32[$414>>2]|0;
+   $416 = (($415) + ($410))|0;
+   HEAP32[$414>>2] = $416;
   }
-  $404 = (($i$17$1) + 1)|0;
-  $exitcond14$1 = ($404|0)==(9);
-  if ($exitcond14$1) {
+  $424 = (($i$18$1) + 1)|0;
+  $exitcond13$1 = ($424|0)==(9);
+  if ($exitcond13$1) {
    break;
   } else {
-   $i$17$1 = $404;
+   $i$18$1 = $424;
   }
  }
  $109 = HEAP32[$78>>2]|0;
@@ -6194,22 +6942,22 @@ function _fcontract($output,$input_limbs) {
  $121 = Math_imul($120, -67108864)|0;
  $122 = (($121) + ($117))|0;
  HEAP32[$input>>2] = $122;
- $123 = (($input) + 4|0);
+ $123 = ((($input)) + 4|0);
  $124 = HEAP32[$123>>2]|0;
  $125 = (($120) + ($124))|0;
  HEAP32[$123>>2] = $125;
- $126 = (($input) + 36|0);
- $i$24 = 0;
+ $126 = ((($input)) + 36|0);
+ $i$26 = 0;
  while(1) {
-  $127 = $i$24 & 1;
+  $127 = $i$26 & 1;
   $128 = ($127|0)==(0);
-  $129 = (($input) + ($i$24<<2)|0);
+  $129 = (($input) + ($i$26<<2)|0);
   $130 = HEAP32[$129>>2]|0;
   if ($128) {
    $137 = $130 >> 26;
    $138 = $130 & 67108863;
    HEAP32[$129>>2] = $138;
-   $139 = (($i$24) + 1)|0;
+   $139 = (($i$26) + 1)|0;
    $140 = (($input) + ($139<<2)|0);
    $141 = HEAP32[$140>>2]|0;
    $142 = (($141) + ($137))|0;
@@ -6218,18 +6966,18 @@ function _fcontract($output,$input_limbs) {
    $131 = $130 >> 25;
    $132 = $130 & 33554431;
    HEAP32[$129>>2] = $132;
-   $133 = (($i$24) + 1)|0;
+   $133 = (($i$26) + 1)|0;
    $134 = (($input) + ($133<<2)|0);
    $135 = HEAP32[$134>>2]|0;
    $136 = (($135) + ($131))|0;
    HEAP32[$134>>2] = $136;
   }
-  $143 = (($i$24) + 1)|0;
-  $exitcond11 = ($143|0)==(9);
-  if ($exitcond11) {
+  $143 = (($i$26) + 1)|0;
+  $exitcond = ($143|0)==(9);
+  if ($exitcond) {
    break;
   } else {
-   $i$24 = $143;
+   $i$26 = $143;
   }
  }
  $144 = HEAP32[$126>>2]|0;
@@ -6240,466 +6988,369 @@ function _fcontract($output,$input_limbs) {
  $148 = HEAP32[$input>>2]|0;
  $149 = (($147) + ($148))|0;
  HEAP32[$input>>2] = $149;
- $i$24$1 = 0;
+ $i$26$1 = 0;
  while(1) {
-  $360 = $i$24$1 & 1;
-  $361 = ($360|0)==(0);
-  $362 = (($input) + ($i$24$1<<2)|0);
-  $363 = HEAP32[$362>>2]|0;
-  if ($361) {
-   $370 = $363 >> 26;
-   $371 = $363 & 67108863;
-   HEAP32[$362>>2] = $371;
-   $372 = (($i$24$1) + 1)|0;
-   $373 = (($input) + ($372<<2)|0);
-   $374 = HEAP32[$373>>2]|0;
-   $375 = (($374) + ($370))|0;
-   HEAP32[$373>>2] = $375;
+  $387 = $i$26$1 & 1;
+  $388 = ($387|0)==(0);
+  $389 = (($input) + ($i$26$1<<2)|0);
+  $390 = HEAP32[$389>>2]|0;
+  if ($388) {
+   $397 = $390 >> 26;
+   $398 = $390 & 67108863;
+   HEAP32[$389>>2] = $398;
+   $399 = (($i$26$1) + 1)|0;
+   $400 = (($input) + ($399<<2)|0);
+   $401 = HEAP32[$400>>2]|0;
+   $402 = (($401) + ($397))|0;
+   HEAP32[$400>>2] = $402;
   } else {
-   $364 = $363 >> 25;
-   $365 = $363 & 33554431;
-   HEAP32[$362>>2] = $365;
-   $366 = (($i$24$1) + 1)|0;
-   $367 = (($input) + ($366<<2)|0);
-   $368 = HEAP32[$367>>2]|0;
-   $369 = (($368) + ($364))|0;
-   HEAP32[$367>>2] = $369;
+   $391 = $390 >> 25;
+   $392 = $390 & 33554431;
+   HEAP32[$389>>2] = $392;
+   $393 = (($i$26$1) + 1)|0;
+   $394 = (($input) + ($393<<2)|0);
+   $395 = HEAP32[$394>>2]|0;
+   $396 = (($395) + ($391))|0;
+   HEAP32[$394>>2] = $396;
   }
-  $376 = (($i$24$1) + 1)|0;
-  $exitcond11$1 = ($376|0)==(9);
-  if ($exitcond11$1) {
+  $403 = (($i$26$1) + 1)|0;
+  $exitcond$1 = ($403|0)==(9);
+  if ($exitcond$1) {
    break;
   } else {
-   $i$24$1 = $376;
+   $i$26$1 = $403;
   }
  }
- $377 = HEAP32[$126>>2]|0;
- $378 = $377 >> 25;
- $379 = $377 & 33554431;
- HEAP32[$126>>2] = $379;
- $380 = ($378*19)|0;
- $381 = HEAP32[$input>>2]|0;
- $382 = (($380) + ($381))|0;
- HEAP32[$input>>2] = $382;
- $383 = (_s32_gte($382)|0);
- $i$33 = 1;$mask$02 = $383;
- while(1) {
-  $150 = $i$33 & 1;
-  $151 = ($150|0)==(0);
-  $152 = (($input) + ($i$33<<2)|0);
-  $153 = HEAP32[$152>>2]|0;
-  if ($151) {
-   $155 = (_s32_eq($153,67108863)|0);
-   $$pn = $155;
-  } else {
-   $154 = (_s32_eq($153,33554431)|0);
-   $$pn = $154;
-  }
-  $mask$1 = $$pn & $mask$02;
-  $156 = (($i$33) + 1)|0;
-  $exitcond = ($156|0)==(10);
-  if ($exitcond) {
-   break;
-  } else {
-   $i$33 = $156;$mask$02 = $mask$1;
-  }
- }
- $157 = $mask$1 & 67108845;
- $158 = HEAP32[$input>>2]|0;
- $159 = (($158) - ($157))|0;
- HEAP32[$input>>2] = $159;
- $160 = $mask$1 & 67108863;
- $161 = $mask$1 & 33554431;
- $162 = (($input) + 4|0);
- $163 = HEAP32[$162>>2]|0;
- $164 = (($163) - ($161))|0;
- HEAP32[$162>>2] = $164;
- $165 = (($input) + 8|0);
- $166 = HEAP32[$165>>2]|0;
- $167 = (($166) - ($160))|0;
- HEAP32[$165>>2] = $167;
- $168 = (($input) + 12|0);
- $169 = HEAP32[$168>>2]|0;
- $170 = (($169) - ($161))|0;
- HEAP32[$168>>2] = $170;
- $171 = (($input) + 16|0);
- $172 = HEAP32[$171>>2]|0;
- $173 = (($172) - ($160))|0;
- HEAP32[$171>>2] = $173;
- $174 = (($input) + 20|0);
- $175 = HEAP32[$174>>2]|0;
- $176 = (($175) - ($161))|0;
- HEAP32[$174>>2] = $176;
- $177 = (($input) + 24|0);
- $178 = HEAP32[$177>>2]|0;
- $179 = (($178) - ($160))|0;
- HEAP32[$177>>2] = $179;
- $180 = (($input) + 28|0);
- $181 = HEAP32[$180>>2]|0;
- $182 = (($181) - ($161))|0;
- HEAP32[$180>>2] = $182;
- $183 = (($input) + 32|0);
- $184 = HEAP32[$183>>2]|0;
- $185 = (($184) - ($160))|0;
- HEAP32[$183>>2] = $185;
- $186 = (($input) + 36|0);
- $187 = HEAP32[$186>>2]|0;
- $188 = (($187) - ($161))|0;
- HEAP32[$186>>2] = $188;
- $189 = HEAP32[$123>>2]|0;
- $190 = $189 << 2;
- HEAP32[$123>>2] = $190;
- $191 = (($input) + 8|0);
- $192 = HEAP32[$191>>2]|0;
- $193 = $192 << 3;
- HEAP32[$191>>2] = $193;
- $194 = (($input) + 12|0);
- $195 = HEAP32[$194>>2]|0;
- $196 = $195 << 5;
- HEAP32[$194>>2] = $196;
- $197 = (($input) + 16|0);
- $198 = HEAP32[$197>>2]|0;
- $199 = $198 << 6;
- HEAP32[$197>>2] = $199;
- $200 = (($input) + 24|0);
- $201 = HEAP32[$200>>2]|0;
- $202 = $201 << 1;
- HEAP32[$200>>2] = $202;
- $203 = (($input) + 28|0);
- $204 = HEAP32[$203>>2]|0;
- $205 = $204 << 3;
- HEAP32[$203>>2] = $205;
- $206 = (($input) + 32|0);
- $207 = HEAP32[$206>>2]|0;
- $208 = $207 << 4;
- HEAP32[$206>>2] = $208;
- $209 = (($input) + 36|0);
- $210 = HEAP32[$209>>2]|0;
- $211 = $210 << 6;
- HEAP32[$209>>2] = $211;
+ $150 = HEAP32[$126>>2]|0;
+ $151 = $150 >> 25;
+ $152 = $150 & 33554431;
+ HEAP32[$126>>2] = $152;
+ $153 = ($151*19)|0;
+ $154 = HEAP32[$input>>2]|0;
+ $155 = (($153) + ($154))|0;
+ HEAP32[$input>>2] = $155;
+ $156 = (_s32_gte($155)|0);
+ $157 = ((($input)) + 4|0);
+ $158 = HEAP32[$157>>2]|0;
+ $159 = (_s32_eq($158,33554431)|0);
+ $mask$1 = $159 & $156;
+ $160 = ((($input)) + 8|0);
+ $161 = HEAP32[$160>>2]|0;
+ $162 = (_s32_eq($161,67108863)|0);
+ $mask$1$1 = $162 & $mask$1;
+ $163 = ((($input)) + 12|0);
+ $164 = HEAP32[$163>>2]|0;
+ $165 = (_s32_eq($164,33554431)|0);
+ $mask$1$2 = $165 & $mask$1$1;
+ $166 = ((($input)) + 16|0);
+ $167 = HEAP32[$166>>2]|0;
+ $168 = (_s32_eq($167,67108863)|0);
+ $mask$1$3 = $168 & $mask$1$2;
+ $169 = ((($input)) + 20|0);
+ $170 = HEAP32[$169>>2]|0;
+ $171 = (_s32_eq($170,33554431)|0);
+ $mask$1$4 = $171 & $mask$1$3;
+ $172 = ((($input)) + 24|0);
+ $173 = HEAP32[$172>>2]|0;
+ $174 = (_s32_eq($173,67108863)|0);
+ $mask$1$5 = $174 & $mask$1$4;
+ $175 = ((($input)) + 28|0);
+ $176 = HEAP32[$175>>2]|0;
+ $177 = (_s32_eq($176,33554431)|0);
+ $mask$1$6 = $177 & $mask$1$5;
+ $178 = ((($input)) + 32|0);
+ $179 = HEAP32[$178>>2]|0;
+ $180 = (_s32_eq($179,67108863)|0);
+ $mask$1$7 = $180 & $mask$1$6;
+ $181 = ((($input)) + 36|0);
+ $182 = HEAP32[$181>>2]|0;
+ $183 = (_s32_eq($182,33554431)|0);
+ $mask$1$8 = $183 & $mask$1$7;
+ $184 = $mask$1$8 & 67108845;
+ $185 = HEAP32[$input>>2]|0;
+ $186 = (($185) - ($184))|0;
+ HEAP32[$input>>2] = $186;
+ $187 = $mask$1$8 & 67108863;
+ $188 = $mask$1$8 & 33554431;
+ $189 = ((($input)) + 4|0);
+ $190 = HEAP32[$189>>2]|0;
+ $191 = (($190) - ($188))|0;
+ HEAP32[$189>>2] = $191;
+ $192 = ((($input)) + 8|0);
+ $193 = HEAP32[$192>>2]|0;
+ $194 = (($193) - ($187))|0;
+ HEAP32[$192>>2] = $194;
+ $195 = ((($input)) + 12|0);
+ $196 = HEAP32[$195>>2]|0;
+ $197 = (($196) - ($188))|0;
+ HEAP32[$195>>2] = $197;
+ $198 = ((($input)) + 16|0);
+ $199 = HEAP32[$198>>2]|0;
+ $200 = (($199) - ($187))|0;
+ HEAP32[$198>>2] = $200;
+ $201 = ((($input)) + 20|0);
+ $202 = HEAP32[$201>>2]|0;
+ $203 = (($202) - ($188))|0;
+ HEAP32[$201>>2] = $203;
+ $204 = ((($input)) + 24|0);
+ $205 = HEAP32[$204>>2]|0;
+ $206 = (($205) - ($187))|0;
+ HEAP32[$204>>2] = $206;
+ $207 = ((($input)) + 28|0);
+ $208 = HEAP32[$207>>2]|0;
+ $209 = (($208) - ($188))|0;
+ HEAP32[$207>>2] = $209;
+ $210 = ((($input)) + 32|0);
+ $211 = HEAP32[$210>>2]|0;
+ $212 = (($211) - ($187))|0;
+ HEAP32[$210>>2] = $212;
+ $213 = ((($input)) + 36|0);
+ $214 = HEAP32[$213>>2]|0;
+ $215 = (($214) - ($188))|0;
+ HEAP32[$213>>2] = $215;
+ $216 = HEAP32[$123>>2]|0;
+ $217 = $216 << 2;
+ HEAP32[$123>>2] = $217;
+ $218 = ((($input)) + 8|0);
+ $219 = HEAP32[$218>>2]|0;
+ $220 = $219 << 3;
+ HEAP32[$218>>2] = $220;
+ $221 = ((($input)) + 12|0);
+ $222 = HEAP32[$221>>2]|0;
+ $223 = $222 << 5;
+ HEAP32[$221>>2] = $223;
+ $224 = ((($input)) + 16|0);
+ $225 = HEAP32[$224>>2]|0;
+ $226 = $225 << 6;
+ HEAP32[$224>>2] = $226;
+ $227 = ((($input)) + 24|0);
+ $228 = HEAP32[$227>>2]|0;
+ $229 = $228 << 1;
+ HEAP32[$227>>2] = $229;
+ $230 = ((($input)) + 28|0);
+ $231 = HEAP32[$230>>2]|0;
+ $232 = $231 << 3;
+ HEAP32[$230>>2] = $232;
+ $233 = ((($input)) + 32|0);
+ $234 = HEAP32[$233>>2]|0;
+ $235 = $234 << 4;
+ HEAP32[$233>>2] = $235;
+ $236 = ((($input)) + 36|0);
+ $237 = HEAP32[$236>>2]|0;
+ $238 = $237 << 6;
+ HEAP32[$236>>2] = $238;
  HEAP8[$output>>0] = 0;
- $212 = (($output) + 16|0);
- HEAP8[$212>>0] = 0;
- $213 = HEAP32[$input>>2]|0;
- $214 = HEAP8[$output>>0]|0;
- $215 = $214&255;
- $216 = $215 | $213;
- $217 = $216&255;
- HEAP8[$output>>0] = $217;
- $218 = HEAP32[$input>>2]|0;
- $219 = $218 >>> 8;
- $220 = $219&255;
- $221 = (($output) + 1|0);
- HEAP8[$221>>0] = $220;
- $222 = HEAP32[$input>>2]|0;
- $223 = $222 >>> 16;
- $224 = $223&255;
- $225 = (($output) + 2|0);
- HEAP8[$225>>0] = $224;
- $226 = HEAP32[$input>>2]|0;
- $227 = $226 >>> 24;
- $228 = (($output) + 3|0);
- $229 = HEAP32[$123>>2]|0;
- $230 = $227 | $229;
- $231 = $230&255;
- HEAP8[$228>>0] = $231;
- $232 = HEAP32[$123>>2]|0;
- $233 = $232 >>> 8;
- $234 = $233&255;
- $235 = (($output) + 4|0);
- HEAP8[$235>>0] = $234;
- $236 = HEAP32[$123>>2]|0;
- $237 = $236 >>> 16;
- $238 = $237&255;
- $239 = (($output) + 5|0);
- HEAP8[$239>>0] = $238;
- $240 = HEAP32[$123>>2]|0;
- $241 = $240 >>> 24;
- $242 = (($output) + 6|0);
- $243 = HEAP32[$191>>2]|0;
- $244 = $241 | $243;
- $245 = $244&255;
- HEAP8[$242>>0] = $245;
- $246 = HEAP32[$191>>2]|0;
- $247 = $246 >>> 8;
- $248 = $247&255;
- $249 = (($output) + 7|0);
- HEAP8[$249>>0] = $248;
- $250 = HEAP32[$191>>2]|0;
- $251 = $250 >>> 16;
- $252 = $251&255;
- $253 = (($output) + 8|0);
- HEAP8[$253>>0] = $252;
- $254 = HEAP32[$191>>2]|0;
- $255 = $254 >>> 24;
- $256 = (($output) + 9|0);
- $257 = HEAP32[$194>>2]|0;
- $258 = $255 | $257;
- $259 = $258&255;
- HEAP8[$256>>0] = $259;
- $260 = HEAP32[$194>>2]|0;
- $261 = $260 >>> 8;
- $262 = $261&255;
- $263 = (($output) + 10|0);
- HEAP8[$263>>0] = $262;
- $264 = HEAP32[$194>>2]|0;
- $265 = $264 >>> 16;
- $266 = $265&255;
- $267 = (($output) + 11|0);
- HEAP8[$267>>0] = $266;
- $268 = HEAP32[$194>>2]|0;
- $269 = $268 >>> 24;
- $270 = (($output) + 12|0);
- $271 = HEAP32[$197>>2]|0;
- $272 = $269 | $271;
- $273 = $272&255;
- HEAP8[$270>>0] = $273;
- $274 = HEAP32[$197>>2]|0;
- $275 = $274 >>> 8;
- $276 = $275&255;
- $277 = (($output) + 13|0);
- HEAP8[$277>>0] = $276;
- $278 = HEAP32[$197>>2]|0;
- $279 = $278 >>> 16;
- $280 = $279&255;
- $281 = (($output) + 14|0);
- HEAP8[$281>>0] = $280;
- $282 = HEAP32[$197>>2]|0;
- $283 = $282 >>> 24;
- $284 = $283&255;
- $285 = (($output) + 15|0);
- HEAP8[$285>>0] = $284;
- $286 = (($input) + 20|0);
- $287 = HEAP32[$286>>2]|0;
- $288 = HEAP8[$212>>0]|0;
+ $239 = ((($output)) + 16|0);
+ HEAP8[$239>>0] = 0;
+ $240 = HEAP32[$input>>2]|0;
+ $241 = HEAP8[$output>>0]|0;
+ $242 = $241&255;
+ $243 = $242 | $240;
+ $244 = $243&255;
+ HEAP8[$output>>0] = $244;
+ $245 = HEAP32[$input>>2]|0;
+ $246 = $245 >>> 8;
+ $247 = $246&255;
+ $248 = ((($output)) + 1|0);
+ HEAP8[$248>>0] = $247;
+ $249 = HEAP32[$input>>2]|0;
+ $250 = $249 >>> 16;
+ $251 = $250&255;
+ $252 = ((($output)) + 2|0);
+ HEAP8[$252>>0] = $251;
+ $253 = HEAP32[$input>>2]|0;
+ $254 = $253 >>> 24;
+ $255 = ((($output)) + 3|0);
+ $256 = HEAP32[$123>>2]|0;
+ $257 = $254 | $256;
+ $258 = $257&255;
+ HEAP8[$255>>0] = $258;
+ $259 = HEAP32[$123>>2]|0;
+ $260 = $259 >>> 8;
+ $261 = $260&255;
+ $262 = ((($output)) + 4|0);
+ HEAP8[$262>>0] = $261;
+ $263 = HEAP32[$123>>2]|0;
+ $264 = $263 >>> 16;
+ $265 = $264&255;
+ $266 = ((($output)) + 5|0);
+ HEAP8[$266>>0] = $265;
+ $267 = HEAP32[$123>>2]|0;
+ $268 = $267 >>> 24;
+ $269 = ((($output)) + 6|0);
+ $270 = HEAP32[$218>>2]|0;
+ $271 = $268 | $270;
+ $272 = $271&255;
+ HEAP8[$269>>0] = $272;
+ $273 = HEAP32[$218>>2]|0;
+ $274 = $273 >>> 8;
+ $275 = $274&255;
+ $276 = ((($output)) + 7|0);
+ HEAP8[$276>>0] = $275;
+ $277 = HEAP32[$218>>2]|0;
+ $278 = $277 >>> 16;
+ $279 = $278&255;
+ $280 = ((($output)) + 8|0);
+ HEAP8[$280>>0] = $279;
+ $281 = HEAP32[$218>>2]|0;
+ $282 = $281 >>> 24;
+ $283 = ((($output)) + 9|0);
+ $284 = HEAP32[$221>>2]|0;
+ $285 = $282 | $284;
+ $286 = $285&255;
+ HEAP8[$283>>0] = $286;
+ $287 = HEAP32[$221>>2]|0;
+ $288 = $287 >>> 8;
  $289 = $288&255;
- $290 = $289 | $287;
- $291 = $290&255;
- HEAP8[$212>>0] = $291;
- $292 = HEAP32[$286>>2]|0;
- $293 = $292 >>> 8;
- $294 = $293&255;
- $295 = (($output) + 17|0);
- HEAP8[$295>>0] = $294;
- $296 = HEAP32[$286>>2]|0;
- $297 = $296 >>> 16;
- $298 = $297&255;
- $299 = (($output) + 18|0);
- HEAP8[$299>>0] = $298;
- $300 = HEAP32[$286>>2]|0;
- $301 = $300 >>> 24;
- $302 = (($output) + 19|0);
- $303 = HEAP32[$200>>2]|0;
- $304 = $301 | $303;
- $305 = $304&255;
- HEAP8[$302>>0] = $305;
- $306 = HEAP32[$200>>2]|0;
- $307 = $306 >>> 8;
- $308 = $307&255;
- $309 = (($output) + 20|0);
- HEAP8[$309>>0] = $308;
- $310 = HEAP32[$200>>2]|0;
- $311 = $310 >>> 16;
- $312 = $311&255;
- $313 = (($output) + 21|0);
- HEAP8[$313>>0] = $312;
- $314 = HEAP32[$200>>2]|0;
- $315 = $314 >>> 24;
- $316 = (($output) + 22|0);
- $317 = HEAP32[$203>>2]|0;
- $318 = $315 | $317;
- $319 = $318&255;
- HEAP8[$316>>0] = $319;
- $320 = HEAP32[$203>>2]|0;
- $321 = $320 >>> 8;
- $322 = $321&255;
- $323 = (($output) + 23|0);
- HEAP8[$323>>0] = $322;
- $324 = HEAP32[$203>>2]|0;
- $325 = $324 >>> 16;
- $326 = $325&255;
- $327 = (($output) + 24|0);
- HEAP8[$327>>0] = $326;
- $328 = HEAP32[$203>>2]|0;
- $329 = $328 >>> 24;
- $330 = (($output) + 25|0);
- $331 = HEAP32[$206>>2]|0;
- $332 = $329 | $331;
- $333 = $332&255;
- HEAP8[$330>>0] = $333;
- $334 = HEAP32[$206>>2]|0;
- $335 = $334 >>> 8;
- $336 = $335&255;
- $337 = (($output) + 26|0);
- HEAP8[$337>>0] = $336;
- $338 = HEAP32[$206>>2]|0;
- $339 = $338 >>> 16;
- $340 = $339&255;
- $341 = (($output) + 27|0);
- HEAP8[$341>>0] = $340;
- $342 = HEAP32[$206>>2]|0;
- $343 = $342 >>> 24;
- $344 = (($output) + 28|0);
- $345 = HEAP32[$209>>2]|0;
- $346 = $343 | $345;
- $347 = $346&255;
- HEAP8[$344>>0] = $347;
- $348 = HEAP32[$209>>2]|0;
- $349 = $348 >>> 8;
- $350 = $349&255;
- $351 = (($output) + 29|0);
- HEAP8[$351>>0] = $350;
- $352 = HEAP32[$209>>2]|0;
- $353 = $352 >>> 16;
- $354 = $353&255;
- $355 = (($output) + 30|0);
- HEAP8[$355>>0] = $354;
- $356 = HEAP32[$209>>2]|0;
- $357 = $356 >>> 24;
- $358 = $357&255;
- $359 = (($output) + 31|0);
- HEAP8[$359>>0] = $358;
+ $290 = ((($output)) + 10|0);
+ HEAP8[$290>>0] = $289;
+ $291 = HEAP32[$221>>2]|0;
+ $292 = $291 >>> 16;
+ $293 = $292&255;
+ $294 = ((($output)) + 11|0);
+ HEAP8[$294>>0] = $293;
+ $295 = HEAP32[$221>>2]|0;
+ $296 = $295 >>> 24;
+ $297 = ((($output)) + 12|0);
+ $298 = HEAP32[$224>>2]|0;
+ $299 = $296 | $298;
+ $300 = $299&255;
+ HEAP8[$297>>0] = $300;
+ $301 = HEAP32[$224>>2]|0;
+ $302 = $301 >>> 8;
+ $303 = $302&255;
+ $304 = ((($output)) + 13|0);
+ HEAP8[$304>>0] = $303;
+ $305 = HEAP32[$224>>2]|0;
+ $306 = $305 >>> 16;
+ $307 = $306&255;
+ $308 = ((($output)) + 14|0);
+ HEAP8[$308>>0] = $307;
+ $309 = HEAP32[$224>>2]|0;
+ $310 = $309 >>> 24;
+ $311 = $310&255;
+ $312 = ((($output)) + 15|0);
+ HEAP8[$312>>0] = $311;
+ $313 = ((($input)) + 20|0);
+ $314 = HEAP32[$313>>2]|0;
+ $315 = HEAP8[$239>>0]|0;
+ $316 = $315&255;
+ $317 = $316 | $314;
+ $318 = $317&255;
+ HEAP8[$239>>0] = $318;
+ $319 = HEAP32[$313>>2]|0;
+ $320 = $319 >>> 8;
+ $321 = $320&255;
+ $322 = ((($output)) + 17|0);
+ HEAP8[$322>>0] = $321;
+ $323 = HEAP32[$313>>2]|0;
+ $324 = $323 >>> 16;
+ $325 = $324&255;
+ $326 = ((($output)) + 18|0);
+ HEAP8[$326>>0] = $325;
+ $327 = HEAP32[$313>>2]|0;
+ $328 = $327 >>> 24;
+ $329 = ((($output)) + 19|0);
+ $330 = HEAP32[$227>>2]|0;
+ $331 = $328 | $330;
+ $332 = $331&255;
+ HEAP8[$329>>0] = $332;
+ $333 = HEAP32[$227>>2]|0;
+ $334 = $333 >>> 8;
+ $335 = $334&255;
+ $336 = ((($output)) + 20|0);
+ HEAP8[$336>>0] = $335;
+ $337 = HEAP32[$227>>2]|0;
+ $338 = $337 >>> 16;
+ $339 = $338&255;
+ $340 = ((($output)) + 21|0);
+ HEAP8[$340>>0] = $339;
+ $341 = HEAP32[$227>>2]|0;
+ $342 = $341 >>> 24;
+ $343 = ((($output)) + 22|0);
+ $344 = HEAP32[$230>>2]|0;
+ $345 = $342 | $344;
+ $346 = $345&255;
+ HEAP8[$343>>0] = $346;
+ $347 = HEAP32[$230>>2]|0;
+ $348 = $347 >>> 8;
+ $349 = $348&255;
+ $350 = ((($output)) + 23|0);
+ HEAP8[$350>>0] = $349;
+ $351 = HEAP32[$230>>2]|0;
+ $352 = $351 >>> 16;
+ $353 = $352&255;
+ $354 = ((($output)) + 24|0);
+ HEAP8[$354>>0] = $353;
+ $355 = HEAP32[$230>>2]|0;
+ $356 = $355 >>> 24;
+ $357 = ((($output)) + 25|0);
+ $358 = HEAP32[$233>>2]|0;
+ $359 = $356 | $358;
+ $360 = $359&255;
+ HEAP8[$357>>0] = $360;
+ $361 = HEAP32[$233>>2]|0;
+ $362 = $361 >>> 8;
+ $363 = $362&255;
+ $364 = ((($output)) + 26|0);
+ HEAP8[$364>>0] = $363;
+ $365 = HEAP32[$233>>2]|0;
+ $366 = $365 >>> 16;
+ $367 = $366&255;
+ $368 = ((($output)) + 27|0);
+ HEAP8[$368>>0] = $367;
+ $369 = HEAP32[$233>>2]|0;
+ $370 = $369 >>> 24;
+ $371 = ((($output)) + 28|0);
+ $372 = HEAP32[$236>>2]|0;
+ $373 = $370 | $372;
+ $374 = $373&255;
+ HEAP8[$371>>0] = $374;
+ $375 = HEAP32[$236>>2]|0;
+ $376 = $375 >>> 8;
+ $377 = $376&255;
+ $378 = ((($output)) + 29|0);
+ HEAP8[$378>>0] = $377;
+ $379 = HEAP32[$236>>2]|0;
+ $380 = $379 >>> 16;
+ $381 = $380&255;
+ $382 = ((($output)) + 30|0);
+ HEAP8[$382>>0] = $381;
+ $383 = HEAP32[$236>>2]|0;
+ $384 = $383 >>> 24;
+ $385 = $384&255;
+ $386 = ((($output)) + 31|0);
+ HEAP8[$386>>0] = $385;
  STACKTOP = sp;return;
 }
-function _swap_conditional($a,$b,$0,$1) {
+function _s32_gte($a) {
+ $a = $a|0;
+ var $0 = 0, $1 = 0, $2 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $0 = (($a) + -67108845)|0;
+ $1 = $0 >> 31;
+ $2 = $1 ^ -1;
+ return ($2|0);
+}
+function _s32_eq($a,$b) {
  $a = $a|0;
  $b = $b|0;
- $0 = $0|0;
- $1 = $1|0;
- var $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
- var $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0;
- var $9 = 0, $exitcond = 0, $i$02 = 0, label = 0, sp = 0;
+ var $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, label = 0, sp = 0;
  sp = STACKTOP;
- $2 = (_i64Subtract(0,0,($0|0),($1|0))|0);
- $3 = tempRet0;
- $i$02 = 0;
- while(1) {
-  $4 = (($a) + ($i$02<<3)|0);
-  $5 = $4;
-  $6 = $5;
-  $7 = HEAP32[$6>>2]|0;
-  $8 = (($5) + 4)|0;
-  $9 = $8;
-  $10 = HEAP32[$9>>2]|0;
-  $11 = (($b) + ($i$02<<3)|0);
-  $12 = $11;
-  $13 = $12;
-  $14 = HEAP32[$13>>2]|0;
-  $15 = (($12) + 4)|0;
-  $16 = $15;
-  $17 = HEAP32[$16>>2]|0;
-  $18 = $14 ^ $7;
-  $19 = $17 ^ $10;
-  $20 = $18 & $2;
-  $21 = $19 & $3;
-  $22 = $20 ^ $7;
-  $21 ^ $10;
-  $23 = (_bitshift64Ashr(0,($22|0),32)|0);
-  $24 = tempRet0;
-  $25 = $4;
-  $26 = $25;
-  HEAP32[$26>>2] = $23;
-  $27 = (($25) + 4)|0;
-  $28 = $27;
-  HEAP32[$28>>2] = $24;
-  $29 = $11;
-  $30 = $29;
-  $31 = HEAP32[$30>>2]|0;
-  $32 = (($29) + 4)|0;
-  $33 = $32;
-  $34 = HEAP32[$33>>2]|0;
-  $35 = $20 ^ $31;
-  $21 ^ $34;
-  $36 = (_bitshift64Ashr(0,($35|0),32)|0);
-  $37 = tempRet0;
-  $38 = $11;
-  $39 = $38;
-  HEAP32[$39>>2] = $36;
-  $40 = (($38) + 4)|0;
-  $41 = $40;
-  HEAP32[$41>>2] = $37;
-  $42 = (($i$02) + 1)|0;
-  $exitcond = ($42|0)==(10);
-  if ($exitcond) {
-   break;
-  } else {
-   $i$02 = $42;
-  }
- }
- STACKTOP = sp;return;
-}
-function _fmonty($x2,$z2,$x3,$z3,$x,$z,$xprime,$zprime,$qmqp) {
- $x2 = $x2|0;
- $z2 = $z2|0;
- $x3 = $x3|0;
- $z3 = $z3|0;
- $x = $x|0;
- $z = $z|0;
- $xprime = $xprime|0;
- $zprime = $zprime|0;
- $qmqp = $qmqp|0;
- var $0 = 0, $origx = 0, $origxprime = 0, $xx = 0, $xxprime = 0, $xxxprime = 0, $zz = 0, $zzprime = 0, $zzz = 0, $zzzprime = 0, dest = 0, label = 0, sp = 0, src = 0, stop = 0;
- sp = STACKTOP;
- STACKTOP = STACKTOP + 1232|0;
- $origx = sp + 1144|0;
- $origxprime = sp + 1064|0;
- $zzz = sp + 912|0;
- $xx = sp + 760|0;
- $zz = sp + 608|0;
- $xxprime = sp + 456|0;
- $zzprime = sp + 304|0;
- $zzzprime = sp + 152|0;
- $xxxprime = sp;
- dest=$origx+0|0; src=$x+0|0; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
- _fsum($x,$z);
- _fdifference($z,$origx);
- dest=$origxprime+0|0; src=$xprime+0|0; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
- _fsum($xprime,$zprime);
- _fdifference($zprime,$origxprime);
- _fproduct($xxprime,$xprime,$z);
- _fproduct($zzprime,$x,$zprime);
- _freduce_degree($xxprime);
- _freduce_coefficients($xxprime);
- _freduce_degree($zzprime);
- _freduce_coefficients($zzprime);
- dest=$origxprime+0|0; src=$xxprime+0|0; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
- _fsum($xxprime,$zzprime);
- _fdifference($zzprime,$origxprime);
- _fsquare($xxxprime,$xxprime);
- _fsquare($zzzprime,$zzprime);
- _fproduct($zzprime,$zzzprime,$qmqp);
- _freduce_degree($zzprime);
- _freduce_coefficients($zzprime);
- dest=$x3+0|0; src=$xxxprime+0|0; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
- dest=$z3+0|0; src=$zzprime+0|0; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
- _fsquare($xx,$x);
- _fsquare($zz,$z);
- _fproduct($x2,$xx,$zz);
- _freduce_degree($x2);
- _freduce_coefficients($x2);
- _fdifference($zz,$xx);
- $0 = (($zzz) + 80|0);
- dest=$0+0|0; stop=dest+72|0; do { HEAP32[dest>>2]=0|0; dest=dest+4|0; } while ((dest|0) < (stop|0));
- _fscalar_product($zzz,$zz);
- _freduce_coefficients($zzz);
- _fsum($zzz,$xx);
- _fproduct($z2,$zz,$zzz);
- _freduce_degree($z2);
- _freduce_coefficients($z2);
- STACKTOP = sp;return;
-}
-function _fsquare($output,$in) {
- $output = $output|0;
- $in = $in|0;
- var $t = 0, dest = 0, label = 0, sp = 0, src = 0, stop = 0;
- sp = STACKTOP;
- STACKTOP = STACKTOP + 160|0;
- $t = sp;
- _fsquare_inner($t,$in);
- _freduce_degree($t);
- _freduce_coefficients($t);
- dest=$output+0|0; src=$t+0|0; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
- STACKTOP = sp;return;
+ $0 = $a ^ -1;
+ $1 = $0 ^ $b;
+ $2 = $1 << 16;
+ $3 = $2 & $1;
+ $4 = $3 << 8;
+ $5 = $4 & $3;
+ $6 = $5 << 4;
+ $7 = $6 & $5;
+ $8 = $7 << 2;
+ $9 = $8 & $7;
+ $10 = $9 << 1;
+ $11 = $10 & $9;
+ $12 = $11 >> 31;
+ return ($12|0);
 }
 function _fproduct($output,$in2,$in) {
  $output = $output|0;
@@ -6843,7 +7494,7 @@ function _fproduct($output,$in2,$in) {
  $27 = HEAP32[$26>>2]|0;
  $28 = (_bitshift64Ashr(0,($24|0),32)|0);
  $29 = tempRet0;
- $30 = (($in) + 8|0);
+ $30 = ((($in)) + 8|0);
  $31 = $30;
  $32 = $31;
  $33 = HEAP32[$32>>2]|0;
@@ -6854,7 +7505,7 @@ function _fproduct($output,$in2,$in) {
  $38 = tempRet0;
  $39 = (___muldi3(($37|0),($38|0),($28|0),($29|0))|0);
  $40 = tempRet0;
- $41 = (($in2) + 8|0);
+ $41 = ((($in2)) + 8|0);
  $42 = $41;
  $43 = $42;
  $44 = HEAP32[$43>>2]|0;
@@ -6875,7 +7526,7 @@ function _fproduct($output,$in2,$in) {
  $59 = tempRet0;
  $60 = (_i64Add(($58|0),($59|0),($39|0),($40|0))|0);
  $61 = tempRet0;
- $62 = (($output) + 8|0);
+ $62 = ((($output)) + 8|0);
  $63 = $62;
  $64 = $63;
  HEAP32[$64>>2] = $60;
@@ -6908,7 +7559,7 @@ function _fproduct($output,$in2,$in) {
  $90 = HEAP32[$89>>2]|0;
  $91 = (_bitshift64Ashr(0,($87|0),32)|0);
  $92 = tempRet0;
- $93 = (($in) + 16|0);
+ $93 = ((($in)) + 16|0);
  $94 = $93;
  $95 = $94;
  $96 = HEAP32[$95>>2]|0;
@@ -6921,7 +7572,7 @@ function _fproduct($output,$in2,$in) {
  $103 = tempRet0;
  $104 = (_i64Add(($102|0),($103|0),($83|0),($84|0))|0);
  $105 = tempRet0;
- $106 = (($in2) + 16|0);
+ $106 = ((($in2)) + 16|0);
  $107 = $106;
  $108 = $107;
  $109 = HEAP32[$108>>2]|0;
@@ -6942,7 +7593,7 @@ function _fproduct($output,$in2,$in) {
  $124 = tempRet0;
  $125 = (_i64Add(($104|0),($105|0),($123|0),($124|0))|0);
  $126 = tempRet0;
- $127 = (($output) + 16|0);
+ $127 = ((($output)) + 16|0);
  $128 = $127;
  $129 = $128;
  HEAP32[$129>>2] = $125;
@@ -6995,7 +7646,7 @@ function _fproduct($output,$in2,$in) {
  $175 = HEAP32[$174>>2]|0;
  $176 = (_bitshift64Ashr(0,($172|0),32)|0);
  $177 = tempRet0;
- $178 = (($in) + 24|0);
+ $178 = ((($in)) + 24|0);
  $179 = $178;
  $180 = $179;
  $181 = HEAP32[$180>>2]|0;
@@ -7008,7 +7659,7 @@ function _fproduct($output,$in2,$in) {
  $188 = tempRet0;
  $189 = (_i64Add(($168|0),($169|0),($187|0),($188|0))|0);
  $190 = tempRet0;
- $191 = (($in2) + 24|0);
+ $191 = ((($in2)) + 24|0);
  $192 = $191;
  $193 = $192;
  $194 = HEAP32[$193>>2]|0;
@@ -7029,7 +7680,7 @@ function _fproduct($output,$in2,$in) {
  $209 = tempRet0;
  $210 = (_i64Add(($189|0),($190|0),($208|0),($209|0))|0);
  $211 = tempRet0;
- $212 = (($output) + 24|0);
+ $212 = ((($output)) + 24|0);
  $213 = $212;
  $214 = $213;
  HEAP32[$214>>2] = $210;
@@ -7104,7 +7755,7 @@ function _fproduct($output,$in2,$in) {
  $282 = HEAP32[$281>>2]|0;
  $283 = (_bitshift64Ashr(0,($279|0),32)|0);
  $284 = tempRet0;
- $285 = (($in) + 32|0);
+ $285 = ((($in)) + 32|0);
  $286 = $285;
  $287 = $286;
  $288 = HEAP32[$287>>2]|0;
@@ -7117,7 +7768,7 @@ function _fproduct($output,$in2,$in) {
  $295 = tempRet0;
  $296 = (_i64Add(($275|0),($276|0),($294|0),($295|0))|0);
  $297 = tempRet0;
- $298 = (($in2) + 32|0);
+ $298 = ((($in2)) + 32|0);
  $299 = $298;
  $300 = $299;
  $301 = HEAP32[$300>>2]|0;
@@ -7138,7 +7789,7 @@ function _fproduct($output,$in2,$in) {
  $316 = tempRet0;
  $317 = (_i64Add(($296|0),($297|0),($315|0),($316|0))|0);
  $318 = tempRet0;
- $319 = (($output) + 32|0);
+ $319 = ((($output)) + 32|0);
  $320 = $319;
  $321 = $320;
  HEAP32[$321>>2] = $317;
@@ -7231,7 +7882,7 @@ function _fproduct($output,$in2,$in) {
  $407 = HEAP32[$406>>2]|0;
  $408 = (_bitshift64Ashr(0,($404|0),32)|0);
  $409 = tempRet0;
- $410 = (($in) + 40|0);
+ $410 = ((($in)) + 40|0);
  $411 = $410;
  $412 = $411;
  $413 = HEAP32[$412>>2]|0;
@@ -7244,7 +7895,7 @@ function _fproduct($output,$in2,$in) {
  $420 = tempRet0;
  $421 = (_i64Add(($400|0),($401|0),($419|0),($420|0))|0);
  $422 = tempRet0;
- $423 = (($in2) + 40|0);
+ $423 = ((($in2)) + 40|0);
  $424 = $423;
  $425 = $424;
  $426 = HEAP32[$425>>2]|0;
@@ -7265,7 +7916,7 @@ function _fproduct($output,$in2,$in) {
  $441 = tempRet0;
  $442 = (_i64Add(($421|0),($422|0),($440|0),($441|0))|0);
  $443 = tempRet0;
- $444 = (($output) + 40|0);
+ $444 = ((($output)) + 40|0);
  $445 = $444;
  $446 = $445;
  HEAP32[$446>>2] = $442;
@@ -7380,7 +8031,7 @@ function _fproduct($output,$in2,$in) {
  $554 = HEAP32[$553>>2]|0;
  $555 = (_bitshift64Ashr(0,($551|0),32)|0);
  $556 = tempRet0;
- $557 = (($in) + 48|0);
+ $557 = ((($in)) + 48|0);
  $558 = $557;
  $559 = $558;
  $560 = HEAP32[$559>>2]|0;
@@ -7393,7 +8044,7 @@ function _fproduct($output,$in2,$in) {
  $567 = tempRet0;
  $568 = (_i64Add(($547|0),($548|0),($566|0),($567|0))|0);
  $569 = tempRet0;
- $570 = (($in2) + 48|0);
+ $570 = ((($in2)) + 48|0);
  $571 = $570;
  $572 = $571;
  $573 = HEAP32[$572>>2]|0;
@@ -7414,7 +8065,7 @@ function _fproduct($output,$in2,$in) {
  $588 = tempRet0;
  $589 = (_i64Add(($568|0),($569|0),($587|0),($588|0))|0);
  $590 = tempRet0;
- $591 = (($output) + 48|0);
+ $591 = ((($output)) + 48|0);
  $592 = $591;
  $593 = $592;
  HEAP32[$593>>2] = $589;
@@ -7547,7 +8198,7 @@ function _fproduct($output,$in2,$in) {
  $719 = HEAP32[$718>>2]|0;
  $720 = (_bitshift64Ashr(0,($716|0),32)|0);
  $721 = tempRet0;
- $722 = (($in) + 56|0);
+ $722 = ((($in)) + 56|0);
  $723 = $722;
  $724 = $723;
  $725 = HEAP32[$724>>2]|0;
@@ -7560,7 +8211,7 @@ function _fproduct($output,$in2,$in) {
  $732 = tempRet0;
  $733 = (_i64Add(($712|0),($713|0),($731|0),($732|0))|0);
  $734 = tempRet0;
- $735 = (($in2) + 56|0);
+ $735 = ((($in2)) + 56|0);
  $736 = $735;
  $737 = $736;
  $738 = HEAP32[$737>>2]|0;
@@ -7581,7 +8232,7 @@ function _fproduct($output,$in2,$in) {
  $753 = tempRet0;
  $754 = (_i64Add(($733|0),($734|0),($752|0),($753|0))|0);
  $755 = tempRet0;
- $756 = (($output) + 56|0);
+ $756 = ((($output)) + 56|0);
  $757 = $756;
  $758 = $757;
  HEAP32[$758>>2] = $754;
@@ -7736,7 +8387,7 @@ function _fproduct($output,$in2,$in) {
  $906 = HEAP32[$905>>2]|0;
  $907 = (_bitshift64Ashr(0,($903|0),32)|0);
  $908 = tempRet0;
- $909 = (($in) + 64|0);
+ $909 = ((($in)) + 64|0);
  $910 = $909;
  $911 = $910;
  $912 = HEAP32[$911>>2]|0;
@@ -7749,7 +8400,7 @@ function _fproduct($output,$in2,$in) {
  $919 = tempRet0;
  $920 = (_i64Add(($899|0),($900|0),($918|0),($919|0))|0);
  $921 = tempRet0;
- $922 = (($in2) + 64|0);
+ $922 = ((($in2)) + 64|0);
  $923 = $922;
  $924 = $923;
  $925 = HEAP32[$924>>2]|0;
@@ -7770,7 +8421,7 @@ function _fproduct($output,$in2,$in) {
  $940 = tempRet0;
  $941 = (_i64Add(($920|0),($921|0),($939|0),($940|0))|0);
  $942 = tempRet0;
- $943 = (($output) + 64|0);
+ $943 = ((($output)) + 64|0);
  $944 = $943;
  $945 = $944;
  HEAP32[$945>>2] = $941;
@@ -7943,7 +8594,7 @@ function _fproduct($output,$in2,$in) {
  $1111 = HEAP32[$1110>>2]|0;
  $1112 = (_bitshift64Ashr(0,($1108|0),32)|0);
  $1113 = tempRet0;
- $1114 = (($in) + 72|0);
+ $1114 = ((($in)) + 72|0);
  $1115 = $1114;
  $1116 = $1115;
  $1117 = HEAP32[$1116>>2]|0;
@@ -7956,7 +8607,7 @@ function _fproduct($output,$in2,$in) {
  $1124 = tempRet0;
  $1125 = (_i64Add(($1104|0),($1105|0),($1123|0),($1124|0))|0);
  $1126 = tempRet0;
- $1127 = (($in2) + 72|0);
+ $1127 = ((($in2)) + 72|0);
  $1128 = $1127;
  $1129 = $1128;
  $1130 = HEAP32[$1129>>2]|0;
@@ -7977,7 +8628,7 @@ function _fproduct($output,$in2,$in) {
  $1145 = tempRet0;
  $1146 = (_i64Add(($1125|0),($1126|0),($1144|0),($1145|0))|0);
  $1147 = tempRet0;
- $1148 = (($output) + 72|0);
+ $1148 = ((($output)) + 72|0);
  $1149 = $1148;
  $1150 = $1149;
  HEAP32[$1150>>2] = $1146;
@@ -8164,7 +8815,7 @@ function _fproduct($output,$in2,$in) {
  $1330 = tempRet0;
  $1331 = (_i64Add(($1311|0),($1312|0),($1329|0),($1330|0))|0);
  $1332 = tempRet0;
- $1333 = (($output) + 80|0);
+ $1333 = ((($output)) + 80|0);
  $1334 = $1333;
  $1335 = $1334;
  HEAP32[$1335>>2] = $1331;
@@ -8329,7 +8980,7 @@ function _fproduct($output,$in2,$in) {
  $1493 = tempRet0;
  $1494 = (_i64Add(($1474|0),($1475|0),($1492|0),($1493|0))|0);
  $1495 = tempRet0;
- $1496 = (($output) + 88|0);
+ $1496 = ((($output)) + 88|0);
  $1497 = $1496;
  $1498 = $1497;
  HEAP32[$1498>>2] = $1494;
@@ -8476,7 +9127,7 @@ function _fproduct($output,$in2,$in) {
  $1638 = tempRet0;
  $1639 = (_i64Add(($1619|0),($1620|0),($1637|0),($1638|0))|0);
  $1640 = tempRet0;
- $1641 = (($output) + 96|0);
+ $1641 = ((($output)) + 96|0);
  $1642 = $1641;
  $1643 = $1642;
  HEAP32[$1643>>2] = $1639;
@@ -8601,7 +9252,7 @@ function _fproduct($output,$in2,$in) {
  $1761 = tempRet0;
  $1762 = (_i64Add(($1742|0),($1743|0),($1760|0),($1761|0))|0);
  $1763 = tempRet0;
- $1764 = (($output) + 104|0);
+ $1764 = ((($output)) + 104|0);
  $1765 = $1764;
  $1766 = $1765;
  HEAP32[$1766>>2] = $1762;
@@ -8708,7 +9359,7 @@ function _fproduct($output,$in2,$in) {
  $1866 = tempRet0;
  $1867 = (_i64Add(($1847|0),($1848|0),($1865|0),($1866|0))|0);
  $1868 = tempRet0;
- $1869 = (($output) + 112|0);
+ $1869 = ((($output)) + 112|0);
  $1870 = $1869;
  $1871 = $1870;
  HEAP32[$1871>>2] = $1867;
@@ -8793,7 +9444,7 @@ function _fproduct($output,$in2,$in) {
  $1949 = tempRet0;
  $1950 = (_i64Add(($1930|0),($1931|0),($1948|0),($1949|0))|0);
  $1951 = tempRet0;
- $1952 = (($output) + 120|0);
+ $1952 = ((($output)) + 120|0);
  $1953 = $1952;
  $1954 = $1953;
  HEAP32[$1954>>2] = $1950;
@@ -8860,7 +9511,7 @@ function _fproduct($output,$in2,$in) {
  $2014 = tempRet0;
  $2015 = (_i64Add(($2013|0),($2014|0),($1973|0),($1974|0))|0);
  $2016 = tempRet0;
- $2017 = (($output) + 128|0);
+ $2017 = ((($output)) + 128|0);
  $2018 = $2017;
  $2019 = $2018;
  HEAP32[$2019>>2] = $2015;
@@ -8905,7 +9556,7 @@ function _fproduct($output,$in2,$in) {
  $2057 = tempRet0;
  $2058 = (_i64Add(($2056|0),($2057|0),($2038|0),($2039|0))|0);
  $2059 = tempRet0;
- $2060 = (($output) + 136|0);
+ $2060 = ((($output)) + 136|0);
  $2061 = $2060;
  $2062 = $2061;
  HEAP32[$2062>>2] = $2058;
@@ -8930,14 +9581,14 @@ function _fproduct($output,$in2,$in) {
  $2080 = tempRet0;
  $2081 = (___muldi3(($2079|0),($2080|0),($2071|0),($2072|0))|0);
  $2082 = tempRet0;
- $2083 = (($output) + 144|0);
+ $2083 = ((($output)) + 144|0);
  $2084 = $2083;
  $2085 = $2084;
  HEAP32[$2085>>2] = $2081;
  $2086 = (($2084) + 4)|0;
  $2087 = $2086;
  HEAP32[$2087>>2] = $2082;
- STACKTOP = sp;return;
+ return;
 }
 function _freduce_degree($output) {
  $output = $output|0;
@@ -8958,7 +9609,7 @@ function _freduce_degree($output) {
  var $82 = 0, $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0;
  var sp = 0;
  sp = STACKTOP;
- $0 = (($output) + 144|0);
+ $0 = ((($output)) + 144|0);
  $1 = $0;
  $2 = $1;
  $3 = HEAP32[$2>>2]|0;
@@ -8967,7 +9618,7 @@ function _freduce_degree($output) {
  $6 = HEAP32[$5>>2]|0;
  $7 = (_bitshift64Shl(($3|0),($6|0),4)|0);
  $8 = tempRet0;
- $9 = (($output) + 64|0);
+ $9 = ((($output)) + 64|0);
  $10 = $9;
  $11 = $10;
  $12 = HEAP32[$11>>2]|0;
@@ -8994,7 +9645,7 @@ function _freduce_degree($output) {
  $32 = (($30) + 4)|0;
  $33 = $32;
  HEAP32[$33>>2] = $29;
- $34 = (($output) + 136|0);
+ $34 = ((($output)) + 136|0);
  $35 = $34;
  $36 = $35;
  $37 = HEAP32[$36>>2]|0;
@@ -9003,7 +9654,7 @@ function _freduce_degree($output) {
  $40 = HEAP32[$39>>2]|0;
  $41 = (_bitshift64Shl(($37|0),($40|0),4)|0);
  $42 = tempRet0;
- $43 = (($output) + 56|0);
+ $43 = ((($output)) + 56|0);
  $44 = $43;
  $45 = $44;
  $46 = HEAP32[$45>>2]|0;
@@ -9030,7 +9681,7 @@ function _freduce_degree($output) {
  $66 = (($64) + 4)|0;
  $67 = $66;
  HEAP32[$67>>2] = $63;
- $68 = (($output) + 128|0);
+ $68 = ((($output)) + 128|0);
  $69 = $68;
  $70 = $69;
  $71 = HEAP32[$70>>2]|0;
@@ -9039,7 +9690,7 @@ function _freduce_degree($output) {
  $74 = HEAP32[$73>>2]|0;
  $75 = (_bitshift64Shl(($71|0),($74|0),4)|0);
  $76 = tempRet0;
- $77 = (($output) + 48|0);
+ $77 = ((($output)) + 48|0);
  $78 = $77;
  $79 = $78;
  $80 = HEAP32[$79>>2]|0;
@@ -9066,7 +9717,7 @@ function _freduce_degree($output) {
  $100 = (($98) + 4)|0;
  $101 = $100;
  HEAP32[$101>>2] = $97;
- $102 = (($output) + 120|0);
+ $102 = ((($output)) + 120|0);
  $103 = $102;
  $104 = $103;
  $105 = HEAP32[$104>>2]|0;
@@ -9075,7 +9726,7 @@ function _freduce_degree($output) {
  $108 = HEAP32[$107>>2]|0;
  $109 = (_bitshift64Shl(($105|0),($108|0),4)|0);
  $110 = tempRet0;
- $111 = (($output) + 40|0);
+ $111 = ((($output)) + 40|0);
  $112 = $111;
  $113 = $112;
  $114 = HEAP32[$113>>2]|0;
@@ -9102,7 +9753,7 @@ function _freduce_degree($output) {
  $134 = (($132) + 4)|0;
  $135 = $134;
  HEAP32[$135>>2] = $131;
- $136 = (($output) + 112|0);
+ $136 = ((($output)) + 112|0);
  $137 = $136;
  $138 = $137;
  $139 = HEAP32[$138>>2]|0;
@@ -9111,7 +9762,7 @@ function _freduce_degree($output) {
  $142 = HEAP32[$141>>2]|0;
  $143 = (_bitshift64Shl(($139|0),($142|0),4)|0);
  $144 = tempRet0;
- $145 = (($output) + 32|0);
+ $145 = ((($output)) + 32|0);
  $146 = $145;
  $147 = $146;
  $148 = HEAP32[$147>>2]|0;
@@ -9138,7 +9789,7 @@ function _freduce_degree($output) {
  $168 = (($166) + 4)|0;
  $169 = $168;
  HEAP32[$169>>2] = $165;
- $170 = (($output) + 104|0);
+ $170 = ((($output)) + 104|0);
  $171 = $170;
  $172 = $171;
  $173 = HEAP32[$172>>2]|0;
@@ -9147,7 +9798,7 @@ function _freduce_degree($output) {
  $176 = HEAP32[$175>>2]|0;
  $177 = (_bitshift64Shl(($173|0),($176|0),4)|0);
  $178 = tempRet0;
- $179 = (($output) + 24|0);
+ $179 = ((($output)) + 24|0);
  $180 = $179;
  $181 = $180;
  $182 = HEAP32[$181>>2]|0;
@@ -9174,7 +9825,7 @@ function _freduce_degree($output) {
  $202 = (($200) + 4)|0;
  $203 = $202;
  HEAP32[$203>>2] = $199;
- $204 = (($output) + 96|0);
+ $204 = ((($output)) + 96|0);
  $205 = $204;
  $206 = $205;
  $207 = HEAP32[$206>>2]|0;
@@ -9183,7 +9834,7 @@ function _freduce_degree($output) {
  $210 = HEAP32[$209>>2]|0;
  $211 = (_bitshift64Shl(($207|0),($210|0),4)|0);
  $212 = tempRet0;
- $213 = (($output) + 16|0);
+ $213 = ((($output)) + 16|0);
  $214 = $213;
  $215 = $214;
  $216 = HEAP32[$215>>2]|0;
@@ -9210,7 +9861,7 @@ function _freduce_degree($output) {
  $236 = (($234) + 4)|0;
  $237 = $236;
  HEAP32[$237>>2] = $233;
- $238 = (($output) + 88|0);
+ $238 = ((($output)) + 88|0);
  $239 = $238;
  $240 = $239;
  $241 = HEAP32[$240>>2]|0;
@@ -9219,7 +9870,7 @@ function _freduce_degree($output) {
  $244 = HEAP32[$243>>2]|0;
  $245 = (_bitshift64Shl(($241|0),($244|0),4)|0);
  $246 = tempRet0;
- $247 = (($output) + 8|0);
+ $247 = ((($output)) + 8|0);
  $248 = $247;
  $249 = $248;
  $250 = HEAP32[$249>>2]|0;
@@ -9246,7 +9897,7 @@ function _freduce_degree($output) {
  $270 = (($268) + 4)|0;
  $271 = $270;
  HEAP32[$271>>2] = $267;
- $272 = (($output) + 80|0);
+ $272 = ((($output)) + 80|0);
  $273 = $272;
  $274 = $273;
  $275 = HEAP32[$274>>2]|0;
@@ -9275,7 +9926,7 @@ function _freduce_degree($output) {
  $297 = (($295) + 4)|0;
  $298 = $297;
  HEAP32[$298>>2] = $294;
- STACKTOP = sp;return;
+ return;
 }
 function _freduce_coefficients($output) {
  $output = $output|0;
@@ -9286,7 +9937,7 @@ function _freduce_coefficients($output) {
  var $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0, $83 = 0, $84 = 0;
  var $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, $i$01 = 0, label = 0, sp = 0;
  sp = STACKTOP;
- $0 = (($output) + 80|0);
+ $0 = ((($output)) + 80|0);
  $1 = $0;
  $2 = $1;
  HEAP32[$2>>2] = 0;
@@ -9411,7 +10062,7 @@ function _freduce_coefficients($output) {
  $101 = (($99) + 4)|0;
  $102 = $101;
  HEAP32[$102>>2] = $98;
- $103 = (($output) + 8|0);
+ $103 = ((($output)) + 8|0);
  $104 = $103;
  $105 = $104;
  $106 = HEAP32[$105>>2]|0;
@@ -9426,674 +10077,47 @@ function _freduce_coefficients($output) {
  $114 = (($112) + 4)|0;
  $115 = $114;
  HEAP32[$115>>2] = $111;
- STACKTOP = sp;return;
+ return;
 }
-function _s32_eq($a,$b) {
- $a = $a|0;
- $b = $b|0;
- var $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, label = 0, sp = 0;
+function _div_by_2_26($0,$1) {
+ $0 = $0|0;
+ $1 = $1|0;
+ var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, label = 0, sp = 0;
  sp = STACKTOP;
- $0 = $a ^ -1;
- $1 = $0 ^ $b;
- $2 = $1 << 16;
- $3 = $2 & $1;
- $4 = $3 << 8;
- $5 = $4 & $3;
- $6 = $5 << 4;
- $7 = $6 & $5;
- $8 = $7 << 2;
- $9 = $8 & $7;
- $10 = $9 << 1;
- $11 = $10 & $9;
- $12 = $11 >> 31;
- STACKTOP = sp;return ($12|0);
-}
-function _s32_gte($a) {
- $a = $a|0;
- var $0 = 0, $1 = 0, $2 = 0, label = 0, sp = 0;
- sp = STACKTOP;
- $0 = (($a) + -67108845)|0;
- $1 = $0 >> 31;
- $2 = $1 ^ -1;
- STACKTOP = sp;return ($2|0);
-}
-function _fsum($output,$in) {
- $output = $output|0;
- $in = $in|0;
- var $0 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0;
- var $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0;
- var $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0;
- var $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0;
- var $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0;
- var $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0, $197 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
- var $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0;
- var $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0;
- var $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0;
- var $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
- sp = STACKTOP;
- $0 = $output;
- $1 = $0;
- $2 = HEAP32[$1>>2]|0;
- $3 = (($0) + 4)|0;
- $4 = $3;
- $5 = HEAP32[$4>>2]|0;
- $6 = $in;
- $7 = $6;
- $8 = HEAP32[$7>>2]|0;
- $9 = (($6) + 4)|0;
- $10 = $9;
- $11 = HEAP32[$10>>2]|0;
- $12 = (_i64Add(($8|0),($11|0),($2|0),($5|0))|0);
- $13 = tempRet0;
- $14 = $output;
- $15 = $14;
- HEAP32[$15>>2] = $12;
- $16 = (($14) + 4)|0;
- $17 = $16;
- HEAP32[$17>>2] = $13;
- $18 = (($output) + 8|0);
- $19 = $18;
- $20 = $19;
- $21 = HEAP32[$20>>2]|0;
- $22 = (($19) + 4)|0;
- $23 = $22;
- $24 = HEAP32[$23>>2]|0;
- $25 = (($in) + 8|0);
- $26 = $25;
- $27 = $26;
- $28 = HEAP32[$27>>2]|0;
- $29 = (($26) + 4)|0;
- $30 = $29;
- $31 = HEAP32[$30>>2]|0;
- $32 = (_i64Add(($28|0),($31|0),($21|0),($24|0))|0);
- $33 = tempRet0;
- $34 = $18;
- $35 = $34;
- HEAP32[$35>>2] = $32;
- $36 = (($34) + 4)|0;
- $37 = $36;
- HEAP32[$37>>2] = $33;
- $38 = (($output) + 16|0);
- $39 = $38;
- $40 = $39;
- $41 = HEAP32[$40>>2]|0;
- $42 = (($39) + 4)|0;
- $43 = $42;
- $44 = HEAP32[$43>>2]|0;
- $45 = (($in) + 16|0);
- $46 = $45;
- $47 = $46;
- $48 = HEAP32[$47>>2]|0;
- $49 = (($46) + 4)|0;
- $50 = $49;
- $51 = HEAP32[$50>>2]|0;
- $52 = (_i64Add(($48|0),($51|0),($41|0),($44|0))|0);
- $53 = tempRet0;
- $54 = $38;
- $55 = $54;
- HEAP32[$55>>2] = $52;
- $56 = (($54) + 4)|0;
- $57 = $56;
- HEAP32[$57>>2] = $53;
- $58 = (($output) + 24|0);
- $59 = $58;
- $60 = $59;
- $61 = HEAP32[$60>>2]|0;
- $62 = (($59) + 4)|0;
- $63 = $62;
- $64 = HEAP32[$63>>2]|0;
- $65 = (($in) + 24|0);
- $66 = $65;
- $67 = $66;
- $68 = HEAP32[$67>>2]|0;
- $69 = (($66) + 4)|0;
- $70 = $69;
- $71 = HEAP32[$70>>2]|0;
- $72 = (_i64Add(($68|0),($71|0),($61|0),($64|0))|0);
- $73 = tempRet0;
- $74 = $58;
- $75 = $74;
- HEAP32[$75>>2] = $72;
- $76 = (($74) + 4)|0;
- $77 = $76;
- HEAP32[$77>>2] = $73;
- $78 = (($output) + 32|0);
- $79 = $78;
- $80 = $79;
- $81 = HEAP32[$80>>2]|0;
- $82 = (($79) + 4)|0;
- $83 = $82;
- $84 = HEAP32[$83>>2]|0;
- $85 = (($in) + 32|0);
- $86 = $85;
- $87 = $86;
- $88 = HEAP32[$87>>2]|0;
- $89 = (($86) + 4)|0;
- $90 = $89;
- $91 = HEAP32[$90>>2]|0;
- $92 = (_i64Add(($88|0),($91|0),($81|0),($84|0))|0);
- $93 = tempRet0;
- $94 = $78;
- $95 = $94;
- HEAP32[$95>>2] = $92;
- $96 = (($94) + 4)|0;
- $97 = $96;
- HEAP32[$97>>2] = $93;
- $98 = (($output) + 40|0);
- $99 = $98;
- $100 = $99;
- $101 = HEAP32[$100>>2]|0;
- $102 = (($99) + 4)|0;
- $103 = $102;
- $104 = HEAP32[$103>>2]|0;
- $105 = (($in) + 40|0);
- $106 = $105;
- $107 = $106;
- $108 = HEAP32[$107>>2]|0;
- $109 = (($106) + 4)|0;
- $110 = $109;
- $111 = HEAP32[$110>>2]|0;
- $112 = (_i64Add(($108|0),($111|0),($101|0),($104|0))|0);
- $113 = tempRet0;
- $114 = $98;
- $115 = $114;
- HEAP32[$115>>2] = $112;
- $116 = (($114) + 4)|0;
- $117 = $116;
- HEAP32[$117>>2] = $113;
- $118 = (($output) + 48|0);
- $119 = $118;
- $120 = $119;
- $121 = HEAP32[$120>>2]|0;
- $122 = (($119) + 4)|0;
- $123 = $122;
- $124 = HEAP32[$123>>2]|0;
- $125 = (($in) + 48|0);
- $126 = $125;
- $127 = $126;
- $128 = HEAP32[$127>>2]|0;
- $129 = (($126) + 4)|0;
- $130 = $129;
- $131 = HEAP32[$130>>2]|0;
- $132 = (_i64Add(($128|0),($131|0),($121|0),($124|0))|0);
- $133 = tempRet0;
- $134 = $118;
- $135 = $134;
- HEAP32[$135>>2] = $132;
- $136 = (($134) + 4)|0;
- $137 = $136;
- HEAP32[$137>>2] = $133;
- $138 = (($output) + 56|0);
- $139 = $138;
- $140 = $139;
- $141 = HEAP32[$140>>2]|0;
- $142 = (($139) + 4)|0;
- $143 = $142;
- $144 = HEAP32[$143>>2]|0;
- $145 = (($in) + 56|0);
- $146 = $145;
- $147 = $146;
- $148 = HEAP32[$147>>2]|0;
- $149 = (($146) + 4)|0;
- $150 = $149;
- $151 = HEAP32[$150>>2]|0;
- $152 = (_i64Add(($148|0),($151|0),($141|0),($144|0))|0);
- $153 = tempRet0;
- $154 = $138;
- $155 = $154;
- HEAP32[$155>>2] = $152;
- $156 = (($154) + 4)|0;
- $157 = $156;
- HEAP32[$157>>2] = $153;
- $158 = (($output) + 64|0);
- $159 = $158;
- $160 = $159;
- $161 = HEAP32[$160>>2]|0;
- $162 = (($159) + 4)|0;
- $163 = $162;
- $164 = HEAP32[$163>>2]|0;
- $165 = (($in) + 64|0);
- $166 = $165;
- $167 = $166;
- $168 = HEAP32[$167>>2]|0;
- $169 = (($166) + 4)|0;
- $170 = $169;
- $171 = HEAP32[$170>>2]|0;
- $172 = (_i64Add(($168|0),($171|0),($161|0),($164|0))|0);
- $173 = tempRet0;
- $174 = $158;
- $175 = $174;
- HEAP32[$175>>2] = $172;
- $176 = (($174) + 4)|0;
- $177 = $176;
- HEAP32[$177>>2] = $173;
- $178 = (($output) + 72|0);
- $179 = $178;
- $180 = $179;
- $181 = HEAP32[$180>>2]|0;
- $182 = (($179) + 4)|0;
- $183 = $182;
- $184 = HEAP32[$183>>2]|0;
- $185 = (($in) + 72|0);
- $186 = $185;
- $187 = $186;
- $188 = HEAP32[$187>>2]|0;
- $189 = (($186) + 4)|0;
- $190 = $189;
- $191 = HEAP32[$190>>2]|0;
- $192 = (_i64Add(($188|0),($191|0),($181|0),($184|0))|0);
- $193 = tempRet0;
- $194 = $178;
- $195 = $194;
- HEAP32[$195>>2] = $192;
- $196 = (($194) + 4)|0;
- $197 = $196;
- HEAP32[$197>>2] = $193;
- STACKTOP = sp;return;
-}
-function _fdifference($output,$in) {
- $output = $output|0;
- $in = $in|0;
- var $0 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0;
- var $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0;
- var $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0;
- var $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0;
- var $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0;
- var $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0, $197 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
- var $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0;
- var $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0;
- var $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0;
- var $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
- sp = STACKTOP;
- $0 = $in;
- $1 = $0;
- $2 = HEAP32[$1>>2]|0;
- $3 = (($0) + 4)|0;
- $4 = $3;
- $5 = HEAP32[$4>>2]|0;
- $6 = $output;
- $7 = $6;
- $8 = HEAP32[$7>>2]|0;
- $9 = (($6) + 4)|0;
- $10 = $9;
- $11 = HEAP32[$10>>2]|0;
- $12 = (_i64Subtract(($2|0),($5|0),($8|0),($11|0))|0);
- $13 = tempRet0;
- $14 = $output;
- $15 = $14;
- HEAP32[$15>>2] = $12;
- $16 = (($14) + 4)|0;
- $17 = $16;
- HEAP32[$17>>2] = $13;
- $18 = (($in) + 8|0);
- $19 = $18;
- $20 = $19;
- $21 = HEAP32[$20>>2]|0;
- $22 = (($19) + 4)|0;
- $23 = $22;
- $24 = HEAP32[$23>>2]|0;
- $25 = (($output) + 8|0);
- $26 = $25;
- $27 = $26;
- $28 = HEAP32[$27>>2]|0;
- $29 = (($26) + 4)|0;
- $30 = $29;
- $31 = HEAP32[$30>>2]|0;
- $32 = (_i64Subtract(($21|0),($24|0),($28|0),($31|0))|0);
- $33 = tempRet0;
- $34 = $25;
- $35 = $34;
- HEAP32[$35>>2] = $32;
- $36 = (($34) + 4)|0;
- $37 = $36;
- HEAP32[$37>>2] = $33;
- $38 = (($in) + 16|0);
- $39 = $38;
- $40 = $39;
- $41 = HEAP32[$40>>2]|0;
- $42 = (($39) + 4)|0;
- $43 = $42;
- $44 = HEAP32[$43>>2]|0;
- $45 = (($output) + 16|0);
- $46 = $45;
- $47 = $46;
- $48 = HEAP32[$47>>2]|0;
- $49 = (($46) + 4)|0;
- $50 = $49;
- $51 = HEAP32[$50>>2]|0;
- $52 = (_i64Subtract(($41|0),($44|0),($48|0),($51|0))|0);
- $53 = tempRet0;
- $54 = $45;
- $55 = $54;
- HEAP32[$55>>2] = $52;
- $56 = (($54) + 4)|0;
- $57 = $56;
- HEAP32[$57>>2] = $53;
- $58 = (($in) + 24|0);
- $59 = $58;
- $60 = $59;
- $61 = HEAP32[$60>>2]|0;
- $62 = (($59) + 4)|0;
- $63 = $62;
- $64 = HEAP32[$63>>2]|0;
- $65 = (($output) + 24|0);
- $66 = $65;
- $67 = $66;
- $68 = HEAP32[$67>>2]|0;
- $69 = (($66) + 4)|0;
- $70 = $69;
- $71 = HEAP32[$70>>2]|0;
- $72 = (_i64Subtract(($61|0),($64|0),($68|0),($71|0))|0);
- $73 = tempRet0;
- $74 = $65;
- $75 = $74;
- HEAP32[$75>>2] = $72;
- $76 = (($74) + 4)|0;
- $77 = $76;
- HEAP32[$77>>2] = $73;
- $78 = (($in) + 32|0);
- $79 = $78;
- $80 = $79;
- $81 = HEAP32[$80>>2]|0;
- $82 = (($79) + 4)|0;
- $83 = $82;
- $84 = HEAP32[$83>>2]|0;
- $85 = (($output) + 32|0);
- $86 = $85;
- $87 = $86;
- $88 = HEAP32[$87>>2]|0;
- $89 = (($86) + 4)|0;
- $90 = $89;
- $91 = HEAP32[$90>>2]|0;
- $92 = (_i64Subtract(($81|0),($84|0),($88|0),($91|0))|0);
- $93 = tempRet0;
- $94 = $85;
- $95 = $94;
- HEAP32[$95>>2] = $92;
- $96 = (($94) + 4)|0;
- $97 = $96;
- HEAP32[$97>>2] = $93;
- $98 = (($in) + 40|0);
- $99 = $98;
- $100 = $99;
- $101 = HEAP32[$100>>2]|0;
- $102 = (($99) + 4)|0;
- $103 = $102;
- $104 = HEAP32[$103>>2]|0;
- $105 = (($output) + 40|0);
- $106 = $105;
- $107 = $106;
- $108 = HEAP32[$107>>2]|0;
- $109 = (($106) + 4)|0;
- $110 = $109;
- $111 = HEAP32[$110>>2]|0;
- $112 = (_i64Subtract(($101|0),($104|0),($108|0),($111|0))|0);
- $113 = tempRet0;
- $114 = $105;
- $115 = $114;
- HEAP32[$115>>2] = $112;
- $116 = (($114) + 4)|0;
- $117 = $116;
- HEAP32[$117>>2] = $113;
- $118 = (($in) + 48|0);
- $119 = $118;
- $120 = $119;
- $121 = HEAP32[$120>>2]|0;
- $122 = (($119) + 4)|0;
- $123 = $122;
- $124 = HEAP32[$123>>2]|0;
- $125 = (($output) + 48|0);
- $126 = $125;
- $127 = $126;
- $128 = HEAP32[$127>>2]|0;
- $129 = (($126) + 4)|0;
- $130 = $129;
- $131 = HEAP32[$130>>2]|0;
- $132 = (_i64Subtract(($121|0),($124|0),($128|0),($131|0))|0);
- $133 = tempRet0;
- $134 = $125;
- $135 = $134;
- HEAP32[$135>>2] = $132;
- $136 = (($134) + 4)|0;
- $137 = $136;
- HEAP32[$137>>2] = $133;
- $138 = (($in) + 56|0);
- $139 = $138;
- $140 = $139;
- $141 = HEAP32[$140>>2]|0;
- $142 = (($139) + 4)|0;
- $143 = $142;
- $144 = HEAP32[$143>>2]|0;
- $145 = (($output) + 56|0);
- $146 = $145;
- $147 = $146;
- $148 = HEAP32[$147>>2]|0;
- $149 = (($146) + 4)|0;
- $150 = $149;
- $151 = HEAP32[$150>>2]|0;
- $152 = (_i64Subtract(($141|0),($144|0),($148|0),($151|0))|0);
- $153 = tempRet0;
- $154 = $145;
- $155 = $154;
- HEAP32[$155>>2] = $152;
- $156 = (($154) + 4)|0;
- $157 = $156;
- HEAP32[$157>>2] = $153;
- $158 = (($in) + 64|0);
- $159 = $158;
- $160 = $159;
- $161 = HEAP32[$160>>2]|0;
- $162 = (($159) + 4)|0;
- $163 = $162;
- $164 = HEAP32[$163>>2]|0;
- $165 = (($output) + 64|0);
- $166 = $165;
- $167 = $166;
- $168 = HEAP32[$167>>2]|0;
- $169 = (($166) + 4)|0;
- $170 = $169;
- $171 = HEAP32[$170>>2]|0;
- $172 = (_i64Subtract(($161|0),($164|0),($168|0),($171|0))|0);
- $173 = tempRet0;
- $174 = $165;
- $175 = $174;
- HEAP32[$175>>2] = $172;
- $176 = (($174) + 4)|0;
- $177 = $176;
- HEAP32[$177>>2] = $173;
- $178 = (($in) + 72|0);
- $179 = $178;
- $180 = $179;
- $181 = HEAP32[$180>>2]|0;
- $182 = (($179) + 4)|0;
- $183 = $182;
- $184 = HEAP32[$183>>2]|0;
- $185 = (($output) + 72|0);
- $186 = $185;
- $187 = $186;
- $188 = HEAP32[$187>>2]|0;
- $189 = (($186) + 4)|0;
- $190 = $189;
- $191 = HEAP32[$190>>2]|0;
- $192 = (_i64Subtract(($181|0),($184|0),($188|0),($191|0))|0);
- $193 = tempRet0;
- $194 = $185;
- $195 = $194;
- HEAP32[$195>>2] = $192;
- $196 = (($194) + 4)|0;
- $197 = $196;
- HEAP32[$197>>2] = $193;
- STACKTOP = sp;return;
-}
-function _fscalar_product($output,$in) {
- $output = $output|0;
- $in = $in|0;
- var $0 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0;
- var $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0;
- var $134 = 0, $135 = 0, $136 = 0, $137 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
- var $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0;
- var $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0;
- var $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0;
- var $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
- sp = STACKTOP;
- $0 = $in;
- $1 = $0;
- $2 = HEAP32[$1>>2]|0;
- $3 = (($0) + 4)|0;
- $4 = $3;
- $5 = HEAP32[$4>>2]|0;
- $6 = (___muldi3(($2|0),($5|0),121665,0)|0);
+ $2 = $1 >> 31;
+ $3 = $2 >>> 6;
+ $4 = (_i64Add(($3|0),0,($0|0),($1|0))|0);
+ $5 = tempRet0;
+ $6 = (_bitshift64Ashr(($4|0),($5|0),26)|0);
  $7 = tempRet0;
- $8 = $output;
- $9 = $8;
- HEAP32[$9>>2] = $6;
- $10 = (($8) + 4)|0;
- $11 = $10;
- HEAP32[$11>>2] = $7;
- $12 = (($in) + 8|0);
- $13 = $12;
- $14 = $13;
- $15 = HEAP32[$14>>2]|0;
- $16 = (($13) + 4)|0;
- $17 = $16;
- $18 = HEAP32[$17>>2]|0;
- $19 = (___muldi3(($15|0),($18|0),121665,0)|0);
- $20 = tempRet0;
- $21 = (($output) + 8|0);
- $22 = $21;
- $23 = $22;
- HEAP32[$23>>2] = $19;
- $24 = (($22) + 4)|0;
- $25 = $24;
- HEAP32[$25>>2] = $20;
- $26 = (($in) + 16|0);
- $27 = $26;
- $28 = $27;
- $29 = HEAP32[$28>>2]|0;
- $30 = (($27) + 4)|0;
- $31 = $30;
- $32 = HEAP32[$31>>2]|0;
- $33 = (___muldi3(($29|0),($32|0),121665,0)|0);
- $34 = tempRet0;
- $35 = (($output) + 16|0);
- $36 = $35;
- $37 = $36;
- HEAP32[$37>>2] = $33;
- $38 = (($36) + 4)|0;
- $39 = $38;
- HEAP32[$39>>2] = $34;
- $40 = (($in) + 24|0);
- $41 = $40;
- $42 = $41;
- $43 = HEAP32[$42>>2]|0;
- $44 = (($41) + 4)|0;
- $45 = $44;
- $46 = HEAP32[$45>>2]|0;
- $47 = (___muldi3(($43|0),($46|0),121665,0)|0);
- $48 = tempRet0;
- $49 = (($output) + 24|0);
- $50 = $49;
- $51 = $50;
- HEAP32[$51>>2] = $47;
- $52 = (($50) + 4)|0;
- $53 = $52;
- HEAP32[$53>>2] = $48;
- $54 = (($in) + 32|0);
- $55 = $54;
- $56 = $55;
- $57 = HEAP32[$56>>2]|0;
- $58 = (($55) + 4)|0;
- $59 = $58;
- $60 = HEAP32[$59>>2]|0;
- $61 = (___muldi3(($57|0),($60|0),121665,0)|0);
- $62 = tempRet0;
- $63 = (($output) + 32|0);
- $64 = $63;
- $65 = $64;
- HEAP32[$65>>2] = $61;
- $66 = (($64) + 4)|0;
- $67 = $66;
- HEAP32[$67>>2] = $62;
- $68 = (($in) + 40|0);
- $69 = $68;
- $70 = $69;
- $71 = HEAP32[$70>>2]|0;
- $72 = (($69) + 4)|0;
- $73 = $72;
- $74 = HEAP32[$73>>2]|0;
- $75 = (___muldi3(($71|0),($74|0),121665,0)|0);
- $76 = tempRet0;
- $77 = (($output) + 40|0);
- $78 = $77;
- $79 = $78;
- HEAP32[$79>>2] = $75;
- $80 = (($78) + 4)|0;
- $81 = $80;
- HEAP32[$81>>2] = $76;
- $82 = (($in) + 48|0);
- $83 = $82;
- $84 = $83;
- $85 = HEAP32[$84>>2]|0;
- $86 = (($83) + 4)|0;
- $87 = $86;
- $88 = HEAP32[$87>>2]|0;
- $89 = (___muldi3(($85|0),($88|0),121665,0)|0);
- $90 = tempRet0;
- $91 = (($output) + 48|0);
- $92 = $91;
- $93 = $92;
- HEAP32[$93>>2] = $89;
- $94 = (($92) + 4)|0;
- $95 = $94;
- HEAP32[$95>>2] = $90;
- $96 = (($in) + 56|0);
- $97 = $96;
- $98 = $97;
- $99 = HEAP32[$98>>2]|0;
- $100 = (($97) + 4)|0;
- $101 = $100;
- $102 = HEAP32[$101>>2]|0;
- $103 = (___muldi3(($99|0),($102|0),121665,0)|0);
- $104 = tempRet0;
- $105 = (($output) + 56|0);
- $106 = $105;
- $107 = $106;
- HEAP32[$107>>2] = $103;
- $108 = (($106) + 4)|0;
- $109 = $108;
- HEAP32[$109>>2] = $104;
- $110 = (($in) + 64|0);
- $111 = $110;
- $112 = $111;
- $113 = HEAP32[$112>>2]|0;
- $114 = (($111) + 4)|0;
- $115 = $114;
- $116 = HEAP32[$115>>2]|0;
- $117 = (___muldi3(($113|0),($116|0),121665,0)|0);
- $118 = tempRet0;
- $119 = (($output) + 64|0);
- $120 = $119;
- $121 = $120;
- HEAP32[$121>>2] = $117;
- $122 = (($120) + 4)|0;
- $123 = $122;
- HEAP32[$123>>2] = $118;
- $124 = (($in) + 72|0);
- $125 = $124;
- $126 = $125;
- $127 = HEAP32[$126>>2]|0;
- $128 = (($125) + 4)|0;
- $129 = $128;
- $130 = HEAP32[$129>>2]|0;
- $131 = (___muldi3(($127|0),($130|0),121665,0)|0);
- $132 = tempRet0;
- $133 = (($output) + 72|0);
- $134 = $133;
- $135 = $134;
- HEAP32[$135>>2] = $131;
- $136 = (($134) + 4)|0;
- $137 = $136;
- HEAP32[$137>>2] = $132;
+ tempRet0 = ($7);
+ return ($6|0);
+}
+function _div_by_2_25($0,$1) {
+ $0 = $0|0;
+ $1 = $1|0;
+ var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $2 = $1 >> 31;
+ $3 = $2 >>> 7;
+ $4 = (_i64Add(($3|0),0,($0|0),($1|0))|0);
+ $5 = tempRet0;
+ $6 = (_bitshift64Ashr(($4|0),($5|0),25)|0);
+ $7 = tempRet0;
+ tempRet0 = ($7);
+ return ($6|0);
+}
+function _fsquare($output,$in) {
+ $output = $output|0;
+ $in = $in|0;
+ var $t = 0, dest = 0, label = 0, sp = 0, src = 0, stop = 0;
+ sp = STACKTOP;
+ STACKTOP = STACKTOP + 160|0;
+ $t = sp;
+ _fsquare_inner($t,$in);
+ _freduce_degree($t);
+ _freduce_coefficients($t);
+ dest=$output; src=$t; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
  STACKTOP = sp;return;
 }
 function _fsquare_inner($output,$in) {
@@ -10181,7 +10205,7 @@ function _fsquare_inner($output,$in) {
  $19 = HEAP32[$18>>2]|0;
  $20 = (_bitshift64Ashr(0,($16|0),31)|0);
  $21 = tempRet0;
- $22 = (($in) + 8|0);
+ $22 = ((($in)) + 8|0);
  $23 = $22;
  $24 = $23;
  $25 = HEAP32[$24>>2]|0;
@@ -10192,7 +10216,7 @@ function _fsquare_inner($output,$in) {
  $30 = tempRet0;
  $31 = (___muldi3(($29|0),($30|0),($20|0),($21|0))|0);
  $32 = tempRet0;
- $33 = (($output) + 8|0);
+ $33 = ((($output)) + 8|0);
  $34 = $33;
  $35 = $34;
  HEAP32[$35>>2] = $31;
@@ -10217,7 +10241,7 @@ function _fsquare_inner($output,$in) {
  $53 = HEAP32[$52>>2]|0;
  $54 = (_bitshift64Ashr(0,($50|0),32)|0);
  $55 = tempRet0;
- $56 = (($in) + 16|0);
+ $56 = ((($in)) + 16|0);
  $57 = $56;
  $58 = $57;
  $59 = HEAP32[$58>>2]|0;
@@ -10232,7 +10256,7 @@ function _fsquare_inner($output,$in) {
  $68 = tempRet0;
  $69 = (_bitshift64Shl(($67|0),($68|0),1)|0);
  $70 = tempRet0;
- $71 = (($output) + 16|0);
+ $71 = ((($output)) + 16|0);
  $72 = $71;
  $73 = $72;
  HEAP32[$73>>2] = $69;
@@ -10265,7 +10289,7 @@ function _fsquare_inner($output,$in) {
  $99 = HEAP32[$98>>2]|0;
  $100 = (_bitshift64Ashr(0,($96|0),32)|0);
  $101 = tempRet0;
- $102 = (($in) + 24|0);
+ $102 = ((($in)) + 24|0);
  $103 = $102;
  $104 = $103;
  $105 = HEAP32[$104>>2]|0;
@@ -10280,7 +10304,7 @@ function _fsquare_inner($output,$in) {
  $114 = tempRet0;
  $115 = (_bitshift64Shl(($113|0),($114|0),1)|0);
  $116 = tempRet0;
- $117 = (($output) + 24|0);
+ $117 = ((($output)) + 24|0);
  $118 = $117;
  $119 = $118;
  HEAP32[$119>>2] = $115;
@@ -10325,7 +10349,7 @@ function _fsquare_inner($output,$in) {
  $157 = HEAP32[$156>>2]|0;
  $158 = (_bitshift64Ashr(0,($154|0),31)|0);
  $159 = tempRet0;
- $160 = (($in) + 32|0);
+ $160 = ((($in)) + 32|0);
  $161 = $160;
  $162 = $161;
  $163 = HEAP32[$162>>2]|0;
@@ -10338,7 +10362,7 @@ function _fsquare_inner($output,$in) {
  $170 = tempRet0;
  $171 = (_i64Add(($150|0),($151|0),($169|0),($170|0))|0);
  $172 = tempRet0;
- $173 = (($output) + 32|0);
+ $173 = ((($output)) + 32|0);
  $174 = $173;
  $175 = $174;
  HEAP32[$175>>2] = $171;
@@ -10391,7 +10415,7 @@ function _fsquare_inner($output,$in) {
  $221 = HEAP32[$220>>2]|0;
  $222 = (_bitshift64Ashr(0,($218|0),32)|0);
  $223 = tempRet0;
- $224 = (($in) + 40|0);
+ $224 = ((($in)) + 40|0);
  $225 = $224;
  $226 = $225;
  $227 = HEAP32[$226>>2]|0;
@@ -10406,7 +10430,7 @@ function _fsquare_inner($output,$in) {
  $236 = tempRet0;
  $237 = (_bitshift64Shl(($235|0),($236|0),1)|0);
  $238 = tempRet0;
- $239 = (($output) + 40|0);
+ $239 = ((($output)) + 40|0);
  $240 = $239;
  $241 = $240;
  HEAP32[$241>>2] = $237;
@@ -10451,7 +10475,7 @@ function _fsquare_inner($output,$in) {
  $279 = HEAP32[$278>>2]|0;
  $280 = (_bitshift64Ashr(0,($276|0),32)|0);
  $281 = tempRet0;
- $282 = (($in) + 48|0);
+ $282 = ((($in)) + 48|0);
  $283 = $282;
  $284 = $283;
  $285 = HEAP32[$284>>2]|0;
@@ -10486,7 +10510,7 @@ function _fsquare_inner($output,$in) {
  $314 = tempRet0;
  $315 = (_bitshift64Shl(($313|0),($314|0),1)|0);
  $316 = tempRet0;
- $317 = (($output) + 48|0);
+ $317 = ((($output)) + 48|0);
  $318 = $317;
  $319 = $318;
  HEAP32[$319>>2] = $315;
@@ -10559,7 +10583,7 @@ function _fsquare_inner($output,$in) {
  $385 = HEAP32[$384>>2]|0;
  $386 = (_bitshift64Ashr(0,($382|0),32)|0);
  $387 = tempRet0;
- $388 = (($in) + 56|0);
+ $388 = ((($in)) + 56|0);
  $389 = $388;
  $390 = $389;
  $391 = HEAP32[$390>>2]|0;
@@ -10574,7 +10598,7 @@ function _fsquare_inner($output,$in) {
  $400 = tempRet0;
  $401 = (_bitshift64Shl(($399|0),($400|0),1)|0);
  $402 = tempRet0;
- $403 = (($output) + 56|0);
+ $403 = ((($output)) + 56|0);
  $404 = $403;
  $405 = $404;
  HEAP32[$405>>2] = $401;
@@ -10617,7 +10641,7 @@ function _fsquare_inner($output,$in) {
  $441 = HEAP32[$440>>2]|0;
  $442 = (_bitshift64Ashr(0,($438|0),32)|0);
  $443 = tempRet0;
- $444 = (($in) + 64|0);
+ $444 = ((($in)) + 64|0);
  $445 = $444;
  $446 = $445;
  $447 = HEAP32[$446>>2]|0;
@@ -10676,7 +10700,7 @@ function _fsquare_inner($output,$in) {
  $500 = tempRet0;
  $501 = (_i64Add(($499|0),($500|0),($416|0),($417|0))|0);
  $502 = tempRet0;
- $503 = (($output) + 64|0);
+ $503 = ((($output)) + 64|0);
  $504 = $503;
  $505 = $504;
  HEAP32[$505>>2] = $501;
@@ -10769,7 +10793,7 @@ function _fsquare_inner($output,$in) {
  $591 = HEAP32[$590>>2]|0;
  $592 = (_bitshift64Ashr(0,($588|0),32)|0);
  $593 = tempRet0;
- $594 = (($in) + 72|0);
+ $594 = ((($in)) + 72|0);
  $595 = $594;
  $596 = $595;
  $597 = HEAP32[$596>>2]|0;
@@ -10784,7 +10808,7 @@ function _fsquare_inner($output,$in) {
  $606 = tempRet0;
  $607 = (_bitshift64Shl(($605|0),($606|0),1)|0);
  $608 = tempRet0;
- $609 = (($output) + 72|0);
+ $609 = ((($output)) + 72|0);
  $610 = $609;
  $611 = $610;
  HEAP32[$611>>2] = $607;
@@ -10885,7 +10909,7 @@ function _fsquare_inner($output,$in) {
  $705 = tempRet0;
  $706 = (_bitshift64Shl(($704|0),($705|0),1)|0);
  $707 = tempRet0;
- $708 = (($output) + 80|0);
+ $708 = ((($output)) + 80|0);
  $709 = $708;
  $710 = $709;
  HEAP32[$710>>2] = $706;
@@ -10972,7 +10996,7 @@ function _fsquare_inner($output,$in) {
  $790 = tempRet0;
  $791 = (_bitshift64Shl(($789|0),($790|0),1)|0);
  $792 = tempRet0;
- $793 = (($output) + 88|0);
+ $793 = ((($output)) + 88|0);
  $794 = $793;
  $795 = $794;
  HEAP32[$795>>2] = $791;
@@ -11053,7 +11077,7 @@ function _fsquare_inner($output,$in) {
  $869 = tempRet0;
  $870 = (_i64Add(($868|0),($869|0),($806|0),($807|0))|0);
  $871 = tempRet0;
- $872 = (($output) + 96|0);
+ $872 = ((($output)) + 96|0);
  $873 = $872;
  $874 = $873;
  HEAP32[$874>>2] = $870;
@@ -11120,7 +11144,7 @@ function _fsquare_inner($output,$in) {
  $934 = tempRet0;
  $935 = (_bitshift64Shl(($933|0),($934|0),1)|0);
  $936 = tempRet0;
- $937 = (($output) + 104|0);
+ $937 = ((($output)) + 104|0);
  $938 = $937;
  $939 = $938;
  HEAP32[$939>>2] = $935;
@@ -11179,7 +11203,7 @@ function _fsquare_inner($output,$in) {
  $991 = tempRet0;
  $992 = (_bitshift64Shl(($990|0),($991|0),1)|0);
  $993 = tempRet0;
- $994 = (($output) + 112|0);
+ $994 = ((($output)) + 112|0);
  $995 = $994;
  $996 = $995;
  HEAP32[$996>>2] = $992;
@@ -11226,7 +11250,7 @@ function _fsquare_inner($output,$in) {
  $1036 = tempRet0;
  $1037 = (_bitshift64Shl(($1035|0),($1036|0),1)|0);
  $1038 = tempRet0;
- $1039 = (($output) + 120|0);
+ $1039 = ((($output)) + 120|0);
  $1040 = $1039;
  $1041 = $1040;
  HEAP32[$1041>>2] = $1037;
@@ -11263,7 +11287,7 @@ function _fsquare_inner($output,$in) {
  $1071 = tempRet0;
  $1072 = (_i64Add(($1070|0),($1071|0),($1052|0),($1053|0))|0);
  $1073 = tempRet0;
- $1074 = (($output) + 128|0);
+ $1074 = ((($output)) + 128|0);
  $1075 = $1074;
  $1076 = $1075;
  HEAP32[$1076>>2] = $1072;
@@ -11288,7 +11312,7 @@ function _fsquare_inner($output,$in) {
  $1094 = tempRet0;
  $1095 = (___muldi3(($1093|0),($1094|0),($1085|0),($1086|0))|0);
  $1096 = tempRet0;
- $1097 = (($output) + 136|0);
+ $1097 = ((($output)) + 136|0);
  $1098 = $1097;
  $1099 = $1098;
  HEAP32[$1099>>2] = $1095;
@@ -11307,58 +11331,796 @@ function _fsquare_inner($output,$in) {
  $1111 = tempRet0;
  $1112 = (___muldi3(($1110|0),($1111|0),($1108|0),($1109|0))|0);
  $1113 = tempRet0;
- $1114 = (($output) + 144|0);
+ $1114 = ((($output)) + 144|0);
  $1115 = $1114;
  $1116 = $1115;
  HEAP32[$1116>>2] = $1112;
  $1117 = (($1115) + 4)|0;
  $1118 = $1117;
  HEAP32[$1118>>2] = $1113;
+ return;
+}
+function _swap_conditional($a,$b,$0,$1) {
+ $a = $a|0;
+ $b = $b|0;
+ $0 = $0|0;
+ $1 = $1|0;
+ var $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
+ var $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0;
+ var $9 = 0, $exitcond = 0, $i$02 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $2 = (_i64Subtract(0,0,($0|0),($1|0))|0);
+ $3 = tempRet0;
+ $i$02 = 0;
+ while(1) {
+  $4 = (($a) + ($i$02<<3)|0);
+  $5 = $4;
+  $6 = $5;
+  $7 = HEAP32[$6>>2]|0;
+  $8 = (($5) + 4)|0;
+  $9 = $8;
+  $10 = HEAP32[$9>>2]|0;
+  $11 = (($b) + ($i$02<<3)|0);
+  $12 = $11;
+  $13 = $12;
+  $14 = HEAP32[$13>>2]|0;
+  $15 = (($12) + 4)|0;
+  $16 = $15;
+  $17 = HEAP32[$16>>2]|0;
+  $18 = $14 ^ $7;
+  $19 = $17 ^ $10;
+  $20 = $18 & $2;
+  $21 = $19 & $3;
+  $22 = $20 ^ $7;
+  $21 ^ $10;
+  $23 = (_bitshift64Ashr(0,($22|0),32)|0);
+  $24 = tempRet0;
+  $25 = $4;
+  $26 = $25;
+  HEAP32[$26>>2] = $23;
+  $27 = (($25) + 4)|0;
+  $28 = $27;
+  HEAP32[$28>>2] = $24;
+  $29 = $11;
+  $30 = $29;
+  $31 = HEAP32[$30>>2]|0;
+  $32 = (($29) + 4)|0;
+  $33 = $32;
+  $34 = HEAP32[$33>>2]|0;
+  $35 = $20 ^ $31;
+  $21 ^ $34;
+  $36 = (_bitshift64Ashr(0,($35|0),32)|0);
+  $37 = tempRet0;
+  $38 = $11;
+  $39 = $38;
+  HEAP32[$39>>2] = $36;
+  $40 = (($38) + 4)|0;
+  $41 = $40;
+  HEAP32[$41>>2] = $37;
+  $42 = (($i$02) + 1)|0;
+  $exitcond = ($42|0)==(10);
+  if ($exitcond) {
+   break;
+  } else {
+   $i$02 = $42;
+  }
+ }
+ return;
+}
+function _fmonty($x2,$z2,$x3,$z3,$x,$z,$xprime,$zprime,$qmqp) {
+ $x2 = $x2|0;
+ $z2 = $z2|0;
+ $x3 = $x3|0;
+ $z3 = $z3|0;
+ $x = $x|0;
+ $z = $z|0;
+ $xprime = $xprime|0;
+ $zprime = $zprime|0;
+ $qmqp = $qmqp|0;
+ var $0 = 0, $origx = 0, $origxprime = 0, $xx = 0, $xxprime = 0, $xxxprime = 0, $zz = 0, $zzprime = 0, $zzz = 0, $zzzprime = 0, dest = 0, label = 0, sp = 0, src = 0, stop = 0;
+ sp = STACKTOP;
+ STACKTOP = STACKTOP + 1232|0;
+ $origx = sp + 1144|0;
+ $origxprime = sp + 1064|0;
+ $zzz = sp + 912|0;
+ $xx = sp + 760|0;
+ $zz = sp + 608|0;
+ $xxprime = sp + 456|0;
+ $zzprime = sp + 304|0;
+ $zzzprime = sp + 152|0;
+ $xxxprime = sp;
+ dest=$origx; src=$x; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
+ _fsum($x,$z);
+ _fdifference($z,$origx);
+ dest=$origxprime; src=$xprime; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
+ _fsum($xprime,$zprime);
+ _fdifference($zprime,$origxprime);
+ _fproduct($xxprime,$xprime,$z);
+ _fproduct($zzprime,$x,$zprime);
+ _freduce_degree($xxprime);
+ _freduce_coefficients($xxprime);
+ _freduce_degree($zzprime);
+ _freduce_coefficients($zzprime);
+ dest=$origxprime; src=$xxprime; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
+ _fsum($xxprime,$zzprime);
+ _fdifference($zzprime,$origxprime);
+ _fsquare($xxxprime,$xxprime);
+ _fsquare($zzzprime,$zzprime);
+ _fproduct($zzprime,$zzzprime,$qmqp);
+ _freduce_degree($zzprime);
+ _freduce_coefficients($zzprime);
+ dest=$x3; src=$xxxprime; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
+ dest=$z3; src=$zzprime; stop=dest+80|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
+ _fsquare($xx,$x);
+ _fsquare($zz,$z);
+ _fproduct($x2,$xx,$zz);
+ _freduce_degree($x2);
+ _freduce_coefficients($x2);
+ _fdifference($zz,$xx);
+ $0 = ((($zzz)) + 80|0);
+ dest=$0; stop=dest+72|0; do { HEAP32[dest>>2]=0|0; dest=dest+4|0; } while ((dest|0) < (stop|0));
+ _fscalar_product($zzz,$zz);
+ _freduce_coefficients($zzz);
+ _fsum($zzz,$xx);
+ _fproduct($z2,$zz,$zzz);
+ _freduce_degree($z2);
+ _freduce_coefficients($z2);
  STACKTOP = sp;return;
 }
-function _div_by_2_26($0,$1) {
- $0 = $0|0;
- $1 = $1|0;
- var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, label = 0, sp = 0;
+function _fsum($output,$in) {
+ $output = $output|0;
+ $in = $in|0;
+ var $0 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0;
+ var $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0;
+ var $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0;
+ var $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0;
+ var $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0;
+ var $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0, $197 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
+ var $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0;
+ var $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0;
+ var $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0;
+ var $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
  sp = STACKTOP;
- $2 = $1 >> 31;
- $3 = $2 >>> 6;
- $4 = (_i64Add(($3|0),0,($0|0),($1|0))|0);
- $5 = tempRet0;
- $6 = (_bitshift64Ashr(($4|0),($5|0),26)|0);
- $7 = tempRet0;
- tempRet0 = $7;
- STACKTOP = sp;return ($6|0);
+ $0 = $output;
+ $1 = $0;
+ $2 = HEAP32[$1>>2]|0;
+ $3 = (($0) + 4)|0;
+ $4 = $3;
+ $5 = HEAP32[$4>>2]|0;
+ $6 = $in;
+ $7 = $6;
+ $8 = HEAP32[$7>>2]|0;
+ $9 = (($6) + 4)|0;
+ $10 = $9;
+ $11 = HEAP32[$10>>2]|0;
+ $12 = (_i64Add(($8|0),($11|0),($2|0),($5|0))|0);
+ $13 = tempRet0;
+ $14 = $output;
+ $15 = $14;
+ HEAP32[$15>>2] = $12;
+ $16 = (($14) + 4)|0;
+ $17 = $16;
+ HEAP32[$17>>2] = $13;
+ $18 = ((($output)) + 8|0);
+ $19 = $18;
+ $20 = $19;
+ $21 = HEAP32[$20>>2]|0;
+ $22 = (($19) + 4)|0;
+ $23 = $22;
+ $24 = HEAP32[$23>>2]|0;
+ $25 = ((($in)) + 8|0);
+ $26 = $25;
+ $27 = $26;
+ $28 = HEAP32[$27>>2]|0;
+ $29 = (($26) + 4)|0;
+ $30 = $29;
+ $31 = HEAP32[$30>>2]|0;
+ $32 = (_i64Add(($28|0),($31|0),($21|0),($24|0))|0);
+ $33 = tempRet0;
+ $34 = $18;
+ $35 = $34;
+ HEAP32[$35>>2] = $32;
+ $36 = (($34) + 4)|0;
+ $37 = $36;
+ HEAP32[$37>>2] = $33;
+ $38 = ((($output)) + 16|0);
+ $39 = $38;
+ $40 = $39;
+ $41 = HEAP32[$40>>2]|0;
+ $42 = (($39) + 4)|0;
+ $43 = $42;
+ $44 = HEAP32[$43>>2]|0;
+ $45 = ((($in)) + 16|0);
+ $46 = $45;
+ $47 = $46;
+ $48 = HEAP32[$47>>2]|0;
+ $49 = (($46) + 4)|0;
+ $50 = $49;
+ $51 = HEAP32[$50>>2]|0;
+ $52 = (_i64Add(($48|0),($51|0),($41|0),($44|0))|0);
+ $53 = tempRet0;
+ $54 = $38;
+ $55 = $54;
+ HEAP32[$55>>2] = $52;
+ $56 = (($54) + 4)|0;
+ $57 = $56;
+ HEAP32[$57>>2] = $53;
+ $58 = ((($output)) + 24|0);
+ $59 = $58;
+ $60 = $59;
+ $61 = HEAP32[$60>>2]|0;
+ $62 = (($59) + 4)|0;
+ $63 = $62;
+ $64 = HEAP32[$63>>2]|0;
+ $65 = ((($in)) + 24|0);
+ $66 = $65;
+ $67 = $66;
+ $68 = HEAP32[$67>>2]|0;
+ $69 = (($66) + 4)|0;
+ $70 = $69;
+ $71 = HEAP32[$70>>2]|0;
+ $72 = (_i64Add(($68|0),($71|0),($61|0),($64|0))|0);
+ $73 = tempRet0;
+ $74 = $58;
+ $75 = $74;
+ HEAP32[$75>>2] = $72;
+ $76 = (($74) + 4)|0;
+ $77 = $76;
+ HEAP32[$77>>2] = $73;
+ $78 = ((($output)) + 32|0);
+ $79 = $78;
+ $80 = $79;
+ $81 = HEAP32[$80>>2]|0;
+ $82 = (($79) + 4)|0;
+ $83 = $82;
+ $84 = HEAP32[$83>>2]|0;
+ $85 = ((($in)) + 32|0);
+ $86 = $85;
+ $87 = $86;
+ $88 = HEAP32[$87>>2]|0;
+ $89 = (($86) + 4)|0;
+ $90 = $89;
+ $91 = HEAP32[$90>>2]|0;
+ $92 = (_i64Add(($88|0),($91|0),($81|0),($84|0))|0);
+ $93 = tempRet0;
+ $94 = $78;
+ $95 = $94;
+ HEAP32[$95>>2] = $92;
+ $96 = (($94) + 4)|0;
+ $97 = $96;
+ HEAP32[$97>>2] = $93;
+ $98 = ((($output)) + 40|0);
+ $99 = $98;
+ $100 = $99;
+ $101 = HEAP32[$100>>2]|0;
+ $102 = (($99) + 4)|0;
+ $103 = $102;
+ $104 = HEAP32[$103>>2]|0;
+ $105 = ((($in)) + 40|0);
+ $106 = $105;
+ $107 = $106;
+ $108 = HEAP32[$107>>2]|0;
+ $109 = (($106) + 4)|0;
+ $110 = $109;
+ $111 = HEAP32[$110>>2]|0;
+ $112 = (_i64Add(($108|0),($111|0),($101|0),($104|0))|0);
+ $113 = tempRet0;
+ $114 = $98;
+ $115 = $114;
+ HEAP32[$115>>2] = $112;
+ $116 = (($114) + 4)|0;
+ $117 = $116;
+ HEAP32[$117>>2] = $113;
+ $118 = ((($output)) + 48|0);
+ $119 = $118;
+ $120 = $119;
+ $121 = HEAP32[$120>>2]|0;
+ $122 = (($119) + 4)|0;
+ $123 = $122;
+ $124 = HEAP32[$123>>2]|0;
+ $125 = ((($in)) + 48|0);
+ $126 = $125;
+ $127 = $126;
+ $128 = HEAP32[$127>>2]|0;
+ $129 = (($126) + 4)|0;
+ $130 = $129;
+ $131 = HEAP32[$130>>2]|0;
+ $132 = (_i64Add(($128|0),($131|0),($121|0),($124|0))|0);
+ $133 = tempRet0;
+ $134 = $118;
+ $135 = $134;
+ HEAP32[$135>>2] = $132;
+ $136 = (($134) + 4)|0;
+ $137 = $136;
+ HEAP32[$137>>2] = $133;
+ $138 = ((($output)) + 56|0);
+ $139 = $138;
+ $140 = $139;
+ $141 = HEAP32[$140>>2]|0;
+ $142 = (($139) + 4)|0;
+ $143 = $142;
+ $144 = HEAP32[$143>>2]|0;
+ $145 = ((($in)) + 56|0);
+ $146 = $145;
+ $147 = $146;
+ $148 = HEAP32[$147>>2]|0;
+ $149 = (($146) + 4)|0;
+ $150 = $149;
+ $151 = HEAP32[$150>>2]|0;
+ $152 = (_i64Add(($148|0),($151|0),($141|0),($144|0))|0);
+ $153 = tempRet0;
+ $154 = $138;
+ $155 = $154;
+ HEAP32[$155>>2] = $152;
+ $156 = (($154) + 4)|0;
+ $157 = $156;
+ HEAP32[$157>>2] = $153;
+ $158 = ((($output)) + 64|0);
+ $159 = $158;
+ $160 = $159;
+ $161 = HEAP32[$160>>2]|0;
+ $162 = (($159) + 4)|0;
+ $163 = $162;
+ $164 = HEAP32[$163>>2]|0;
+ $165 = ((($in)) + 64|0);
+ $166 = $165;
+ $167 = $166;
+ $168 = HEAP32[$167>>2]|0;
+ $169 = (($166) + 4)|0;
+ $170 = $169;
+ $171 = HEAP32[$170>>2]|0;
+ $172 = (_i64Add(($168|0),($171|0),($161|0),($164|0))|0);
+ $173 = tempRet0;
+ $174 = $158;
+ $175 = $174;
+ HEAP32[$175>>2] = $172;
+ $176 = (($174) + 4)|0;
+ $177 = $176;
+ HEAP32[$177>>2] = $173;
+ $178 = ((($output)) + 72|0);
+ $179 = $178;
+ $180 = $179;
+ $181 = HEAP32[$180>>2]|0;
+ $182 = (($179) + 4)|0;
+ $183 = $182;
+ $184 = HEAP32[$183>>2]|0;
+ $185 = ((($in)) + 72|0);
+ $186 = $185;
+ $187 = $186;
+ $188 = HEAP32[$187>>2]|0;
+ $189 = (($186) + 4)|0;
+ $190 = $189;
+ $191 = HEAP32[$190>>2]|0;
+ $192 = (_i64Add(($188|0),($191|0),($181|0),($184|0))|0);
+ $193 = tempRet0;
+ $194 = $178;
+ $195 = $194;
+ HEAP32[$195>>2] = $192;
+ $196 = (($194) + 4)|0;
+ $197 = $196;
+ HEAP32[$197>>2] = $193;
+ return;
 }
-function _div_by_2_25($0,$1) {
- $0 = $0|0;
- $1 = $1|0;
- var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, label = 0, sp = 0;
+function _fdifference($output,$in) {
+ $output = $output|0;
+ $in = $in|0;
+ var $0 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0;
+ var $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0;
+ var $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0;
+ var $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0;
+ var $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0;
+ var $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0, $197 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
+ var $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0;
+ var $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0;
+ var $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0;
+ var $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
  sp = STACKTOP;
- $2 = $1 >> 31;
- $3 = $2 >>> 7;
- $4 = (_i64Add(($3|0),0,($0|0),($1|0))|0);
- $5 = tempRet0;
- $6 = (_bitshift64Ashr(($4|0),($5|0),25)|0);
+ $0 = $in;
+ $1 = $0;
+ $2 = HEAP32[$1>>2]|0;
+ $3 = (($0) + 4)|0;
+ $4 = $3;
+ $5 = HEAP32[$4>>2]|0;
+ $6 = $output;
+ $7 = $6;
+ $8 = HEAP32[$7>>2]|0;
+ $9 = (($6) + 4)|0;
+ $10 = $9;
+ $11 = HEAP32[$10>>2]|0;
+ $12 = (_i64Subtract(($2|0),($5|0),($8|0),($11|0))|0);
+ $13 = tempRet0;
+ $14 = $output;
+ $15 = $14;
+ HEAP32[$15>>2] = $12;
+ $16 = (($14) + 4)|0;
+ $17 = $16;
+ HEAP32[$17>>2] = $13;
+ $18 = ((($in)) + 8|0);
+ $19 = $18;
+ $20 = $19;
+ $21 = HEAP32[$20>>2]|0;
+ $22 = (($19) + 4)|0;
+ $23 = $22;
+ $24 = HEAP32[$23>>2]|0;
+ $25 = ((($output)) + 8|0);
+ $26 = $25;
+ $27 = $26;
+ $28 = HEAP32[$27>>2]|0;
+ $29 = (($26) + 4)|0;
+ $30 = $29;
+ $31 = HEAP32[$30>>2]|0;
+ $32 = (_i64Subtract(($21|0),($24|0),($28|0),($31|0))|0);
+ $33 = tempRet0;
+ $34 = $25;
+ $35 = $34;
+ HEAP32[$35>>2] = $32;
+ $36 = (($34) + 4)|0;
+ $37 = $36;
+ HEAP32[$37>>2] = $33;
+ $38 = ((($in)) + 16|0);
+ $39 = $38;
+ $40 = $39;
+ $41 = HEAP32[$40>>2]|0;
+ $42 = (($39) + 4)|0;
+ $43 = $42;
+ $44 = HEAP32[$43>>2]|0;
+ $45 = ((($output)) + 16|0);
+ $46 = $45;
+ $47 = $46;
+ $48 = HEAP32[$47>>2]|0;
+ $49 = (($46) + 4)|0;
+ $50 = $49;
+ $51 = HEAP32[$50>>2]|0;
+ $52 = (_i64Subtract(($41|0),($44|0),($48|0),($51|0))|0);
+ $53 = tempRet0;
+ $54 = $45;
+ $55 = $54;
+ HEAP32[$55>>2] = $52;
+ $56 = (($54) + 4)|0;
+ $57 = $56;
+ HEAP32[$57>>2] = $53;
+ $58 = ((($in)) + 24|0);
+ $59 = $58;
+ $60 = $59;
+ $61 = HEAP32[$60>>2]|0;
+ $62 = (($59) + 4)|0;
+ $63 = $62;
+ $64 = HEAP32[$63>>2]|0;
+ $65 = ((($output)) + 24|0);
+ $66 = $65;
+ $67 = $66;
+ $68 = HEAP32[$67>>2]|0;
+ $69 = (($66) + 4)|0;
+ $70 = $69;
+ $71 = HEAP32[$70>>2]|0;
+ $72 = (_i64Subtract(($61|0),($64|0),($68|0),($71|0))|0);
+ $73 = tempRet0;
+ $74 = $65;
+ $75 = $74;
+ HEAP32[$75>>2] = $72;
+ $76 = (($74) + 4)|0;
+ $77 = $76;
+ HEAP32[$77>>2] = $73;
+ $78 = ((($in)) + 32|0);
+ $79 = $78;
+ $80 = $79;
+ $81 = HEAP32[$80>>2]|0;
+ $82 = (($79) + 4)|0;
+ $83 = $82;
+ $84 = HEAP32[$83>>2]|0;
+ $85 = ((($output)) + 32|0);
+ $86 = $85;
+ $87 = $86;
+ $88 = HEAP32[$87>>2]|0;
+ $89 = (($86) + 4)|0;
+ $90 = $89;
+ $91 = HEAP32[$90>>2]|0;
+ $92 = (_i64Subtract(($81|0),($84|0),($88|0),($91|0))|0);
+ $93 = tempRet0;
+ $94 = $85;
+ $95 = $94;
+ HEAP32[$95>>2] = $92;
+ $96 = (($94) + 4)|0;
+ $97 = $96;
+ HEAP32[$97>>2] = $93;
+ $98 = ((($in)) + 40|0);
+ $99 = $98;
+ $100 = $99;
+ $101 = HEAP32[$100>>2]|0;
+ $102 = (($99) + 4)|0;
+ $103 = $102;
+ $104 = HEAP32[$103>>2]|0;
+ $105 = ((($output)) + 40|0);
+ $106 = $105;
+ $107 = $106;
+ $108 = HEAP32[$107>>2]|0;
+ $109 = (($106) + 4)|0;
+ $110 = $109;
+ $111 = HEAP32[$110>>2]|0;
+ $112 = (_i64Subtract(($101|0),($104|0),($108|0),($111|0))|0);
+ $113 = tempRet0;
+ $114 = $105;
+ $115 = $114;
+ HEAP32[$115>>2] = $112;
+ $116 = (($114) + 4)|0;
+ $117 = $116;
+ HEAP32[$117>>2] = $113;
+ $118 = ((($in)) + 48|0);
+ $119 = $118;
+ $120 = $119;
+ $121 = HEAP32[$120>>2]|0;
+ $122 = (($119) + 4)|0;
+ $123 = $122;
+ $124 = HEAP32[$123>>2]|0;
+ $125 = ((($output)) + 48|0);
+ $126 = $125;
+ $127 = $126;
+ $128 = HEAP32[$127>>2]|0;
+ $129 = (($126) + 4)|0;
+ $130 = $129;
+ $131 = HEAP32[$130>>2]|0;
+ $132 = (_i64Subtract(($121|0),($124|0),($128|0),($131|0))|0);
+ $133 = tempRet0;
+ $134 = $125;
+ $135 = $134;
+ HEAP32[$135>>2] = $132;
+ $136 = (($134) + 4)|0;
+ $137 = $136;
+ HEAP32[$137>>2] = $133;
+ $138 = ((($in)) + 56|0);
+ $139 = $138;
+ $140 = $139;
+ $141 = HEAP32[$140>>2]|0;
+ $142 = (($139) + 4)|0;
+ $143 = $142;
+ $144 = HEAP32[$143>>2]|0;
+ $145 = ((($output)) + 56|0);
+ $146 = $145;
+ $147 = $146;
+ $148 = HEAP32[$147>>2]|0;
+ $149 = (($146) + 4)|0;
+ $150 = $149;
+ $151 = HEAP32[$150>>2]|0;
+ $152 = (_i64Subtract(($141|0),($144|0),($148|0),($151|0))|0);
+ $153 = tempRet0;
+ $154 = $145;
+ $155 = $154;
+ HEAP32[$155>>2] = $152;
+ $156 = (($154) + 4)|0;
+ $157 = $156;
+ HEAP32[$157>>2] = $153;
+ $158 = ((($in)) + 64|0);
+ $159 = $158;
+ $160 = $159;
+ $161 = HEAP32[$160>>2]|0;
+ $162 = (($159) + 4)|0;
+ $163 = $162;
+ $164 = HEAP32[$163>>2]|0;
+ $165 = ((($output)) + 64|0);
+ $166 = $165;
+ $167 = $166;
+ $168 = HEAP32[$167>>2]|0;
+ $169 = (($166) + 4)|0;
+ $170 = $169;
+ $171 = HEAP32[$170>>2]|0;
+ $172 = (_i64Subtract(($161|0),($164|0),($168|0),($171|0))|0);
+ $173 = tempRet0;
+ $174 = $165;
+ $175 = $174;
+ HEAP32[$175>>2] = $172;
+ $176 = (($174) + 4)|0;
+ $177 = $176;
+ HEAP32[$177>>2] = $173;
+ $178 = ((($in)) + 72|0);
+ $179 = $178;
+ $180 = $179;
+ $181 = HEAP32[$180>>2]|0;
+ $182 = (($179) + 4)|0;
+ $183 = $182;
+ $184 = HEAP32[$183>>2]|0;
+ $185 = ((($output)) + 72|0);
+ $186 = $185;
+ $187 = $186;
+ $188 = HEAP32[$187>>2]|0;
+ $189 = (($186) + 4)|0;
+ $190 = $189;
+ $191 = HEAP32[$190>>2]|0;
+ $192 = (_i64Subtract(($181|0),($184|0),($188|0),($191|0))|0);
+ $193 = tempRet0;
+ $194 = $185;
+ $195 = $194;
+ HEAP32[$195>>2] = $192;
+ $196 = (($194) + 4)|0;
+ $197 = $196;
+ HEAP32[$197>>2] = $193;
+ return;
+}
+function _fscalar_product($output,$in) {
+ $output = $output|0;
+ $in = $in|0;
+ var $0 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0;
+ var $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0;
+ var $134 = 0, $135 = 0, $136 = 0, $137 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
+ var $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0;
+ var $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0;
+ var $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0;
+ var $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $0 = $in;
+ $1 = $0;
+ $2 = HEAP32[$1>>2]|0;
+ $3 = (($0) + 4)|0;
+ $4 = $3;
+ $5 = HEAP32[$4>>2]|0;
+ $6 = (___muldi3(($2|0),($5|0),121665,0)|0);
  $7 = tempRet0;
- tempRet0 = $7;
- STACKTOP = sp;return ($6|0);
+ $8 = $output;
+ $9 = $8;
+ HEAP32[$9>>2] = $6;
+ $10 = (($8) + 4)|0;
+ $11 = $10;
+ HEAP32[$11>>2] = $7;
+ $12 = ((($in)) + 8|0);
+ $13 = $12;
+ $14 = $13;
+ $15 = HEAP32[$14>>2]|0;
+ $16 = (($13) + 4)|0;
+ $17 = $16;
+ $18 = HEAP32[$17>>2]|0;
+ $19 = (___muldi3(($15|0),($18|0),121665,0)|0);
+ $20 = tempRet0;
+ $21 = ((($output)) + 8|0);
+ $22 = $21;
+ $23 = $22;
+ HEAP32[$23>>2] = $19;
+ $24 = (($22) + 4)|0;
+ $25 = $24;
+ HEAP32[$25>>2] = $20;
+ $26 = ((($in)) + 16|0);
+ $27 = $26;
+ $28 = $27;
+ $29 = HEAP32[$28>>2]|0;
+ $30 = (($27) + 4)|0;
+ $31 = $30;
+ $32 = HEAP32[$31>>2]|0;
+ $33 = (___muldi3(($29|0),($32|0),121665,0)|0);
+ $34 = tempRet0;
+ $35 = ((($output)) + 16|0);
+ $36 = $35;
+ $37 = $36;
+ HEAP32[$37>>2] = $33;
+ $38 = (($36) + 4)|0;
+ $39 = $38;
+ HEAP32[$39>>2] = $34;
+ $40 = ((($in)) + 24|0);
+ $41 = $40;
+ $42 = $41;
+ $43 = HEAP32[$42>>2]|0;
+ $44 = (($41) + 4)|0;
+ $45 = $44;
+ $46 = HEAP32[$45>>2]|0;
+ $47 = (___muldi3(($43|0),($46|0),121665,0)|0);
+ $48 = tempRet0;
+ $49 = ((($output)) + 24|0);
+ $50 = $49;
+ $51 = $50;
+ HEAP32[$51>>2] = $47;
+ $52 = (($50) + 4)|0;
+ $53 = $52;
+ HEAP32[$53>>2] = $48;
+ $54 = ((($in)) + 32|0);
+ $55 = $54;
+ $56 = $55;
+ $57 = HEAP32[$56>>2]|0;
+ $58 = (($55) + 4)|0;
+ $59 = $58;
+ $60 = HEAP32[$59>>2]|0;
+ $61 = (___muldi3(($57|0),($60|0),121665,0)|0);
+ $62 = tempRet0;
+ $63 = ((($output)) + 32|0);
+ $64 = $63;
+ $65 = $64;
+ HEAP32[$65>>2] = $61;
+ $66 = (($64) + 4)|0;
+ $67 = $66;
+ HEAP32[$67>>2] = $62;
+ $68 = ((($in)) + 40|0);
+ $69 = $68;
+ $70 = $69;
+ $71 = HEAP32[$70>>2]|0;
+ $72 = (($69) + 4)|0;
+ $73 = $72;
+ $74 = HEAP32[$73>>2]|0;
+ $75 = (___muldi3(($71|0),($74|0),121665,0)|0);
+ $76 = tempRet0;
+ $77 = ((($output)) + 40|0);
+ $78 = $77;
+ $79 = $78;
+ HEAP32[$79>>2] = $75;
+ $80 = (($78) + 4)|0;
+ $81 = $80;
+ HEAP32[$81>>2] = $76;
+ $82 = ((($in)) + 48|0);
+ $83 = $82;
+ $84 = $83;
+ $85 = HEAP32[$84>>2]|0;
+ $86 = (($83) + 4)|0;
+ $87 = $86;
+ $88 = HEAP32[$87>>2]|0;
+ $89 = (___muldi3(($85|0),($88|0),121665,0)|0);
+ $90 = tempRet0;
+ $91 = ((($output)) + 48|0);
+ $92 = $91;
+ $93 = $92;
+ HEAP32[$93>>2] = $89;
+ $94 = (($92) + 4)|0;
+ $95 = $94;
+ HEAP32[$95>>2] = $90;
+ $96 = ((($in)) + 56|0);
+ $97 = $96;
+ $98 = $97;
+ $99 = HEAP32[$98>>2]|0;
+ $100 = (($97) + 4)|0;
+ $101 = $100;
+ $102 = HEAP32[$101>>2]|0;
+ $103 = (___muldi3(($99|0),($102|0),121665,0)|0);
+ $104 = tempRet0;
+ $105 = ((($output)) + 56|0);
+ $106 = $105;
+ $107 = $106;
+ HEAP32[$107>>2] = $103;
+ $108 = (($106) + 4)|0;
+ $109 = $108;
+ HEAP32[$109>>2] = $104;
+ $110 = ((($in)) + 64|0);
+ $111 = $110;
+ $112 = $111;
+ $113 = HEAP32[$112>>2]|0;
+ $114 = (($111) + 4)|0;
+ $115 = $114;
+ $116 = HEAP32[$115>>2]|0;
+ $117 = (___muldi3(($113|0),($116|0),121665,0)|0);
+ $118 = tempRet0;
+ $119 = ((($output)) + 64|0);
+ $120 = $119;
+ $121 = $120;
+ HEAP32[$121>>2] = $117;
+ $122 = (($120) + 4)|0;
+ $123 = $122;
+ HEAP32[$123>>2] = $118;
+ $124 = ((($in)) + 72|0);
+ $125 = $124;
+ $126 = $125;
+ $127 = HEAP32[$126>>2]|0;
+ $128 = (($125) + 4)|0;
+ $129 = $128;
+ $130 = HEAP32[$129>>2]|0;
+ $131 = (___muldi3(($127|0),($130|0),121665,0)|0);
+ $132 = tempRet0;
+ $133 = ((($output)) + 72|0);
+ $134 = $133;
+ $135 = $134;
+ HEAP32[$135>>2] = $131;
+ $136 = (($134) + 4)|0;
+ $137 = $136;
+ HEAP32[$137>>2] = $132;
+ return;
 }
 function _crypto_sign_ed25519_ref10_fe_0($h) {
  $h = $h|0;
  var dest = 0, label = 0, sp = 0, stop = 0;
  sp = STACKTOP;
- dest=$h+0|0; stop=dest+40|0; do { HEAP32[dest>>2]=0|0; dest=dest+4|0; } while ((dest|0) < (stop|0));
- STACKTOP = sp;return;
+ dest=$h; stop=dest+40|0; do { HEAP32[dest>>2]=0|0; dest=dest+4|0; } while ((dest|0) < (stop|0));
+ return;
 }
 function _crypto_sign_ed25519_ref10_fe_1($h) {
  $h = $h|0;
  var $0 = 0, dest = 0, label = 0, sp = 0, stop = 0;
  sp = STACKTOP;
  HEAP32[$h>>2] = 1;
- $0 = (($h) + 4|0);
- dest=$0+0|0; stop=dest+36|0; do { HEAP32[dest>>2]=0|0; dest=dest+4|0; } while ((dest|0) < (stop|0));
- STACKTOP = sp;return;
+ $0 = ((($h)) + 4|0);
+ dest=$0; stop=dest+36|0; do { HEAP32[dest>>2]=0|0; dest=dest+4|0; } while ((dest|0) < (stop|0));
+ return;
 }
 function _crypto_sign_ed25519_ref10_fe_add($h,$f,$g) {
  $h = $h|0;
@@ -11369,42 +12131,42 @@ function _crypto_sign_ed25519_ref10_fe_add($h,$f,$g) {
  var $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = HEAP32[$f>>2]|0;
- $1 = (($f) + 4|0);
+ $1 = ((($f)) + 4|0);
  $2 = HEAP32[$1>>2]|0;
- $3 = (($f) + 8|0);
+ $3 = ((($f)) + 8|0);
  $4 = HEAP32[$3>>2]|0;
- $5 = (($f) + 12|0);
+ $5 = ((($f)) + 12|0);
  $6 = HEAP32[$5>>2]|0;
- $7 = (($f) + 16|0);
+ $7 = ((($f)) + 16|0);
  $8 = HEAP32[$7>>2]|0;
- $9 = (($f) + 20|0);
+ $9 = ((($f)) + 20|0);
  $10 = HEAP32[$9>>2]|0;
- $11 = (($f) + 24|0);
+ $11 = ((($f)) + 24|0);
  $12 = HEAP32[$11>>2]|0;
- $13 = (($f) + 28|0);
+ $13 = ((($f)) + 28|0);
  $14 = HEAP32[$13>>2]|0;
- $15 = (($f) + 32|0);
+ $15 = ((($f)) + 32|0);
  $16 = HEAP32[$15>>2]|0;
- $17 = (($f) + 36|0);
+ $17 = ((($f)) + 36|0);
  $18 = HEAP32[$17>>2]|0;
  $19 = HEAP32[$g>>2]|0;
- $20 = (($g) + 4|0);
+ $20 = ((($g)) + 4|0);
  $21 = HEAP32[$20>>2]|0;
- $22 = (($g) + 8|0);
+ $22 = ((($g)) + 8|0);
  $23 = HEAP32[$22>>2]|0;
- $24 = (($g) + 12|0);
+ $24 = ((($g)) + 12|0);
  $25 = HEAP32[$24>>2]|0;
- $26 = (($g) + 16|0);
+ $26 = ((($g)) + 16|0);
  $27 = HEAP32[$26>>2]|0;
- $28 = (($g) + 20|0);
+ $28 = ((($g)) + 20|0);
  $29 = HEAP32[$28>>2]|0;
- $30 = (($g) + 24|0);
+ $30 = ((($g)) + 24|0);
  $31 = HEAP32[$30>>2]|0;
- $32 = (($g) + 28|0);
+ $32 = ((($g)) + 28|0);
  $33 = HEAP32[$32>>2]|0;
- $34 = (($g) + 32|0);
+ $34 = ((($g)) + 32|0);
  $35 = HEAP32[$34>>2]|0;
- $36 = (($g) + 36|0);
+ $36 = ((($g)) + 36|0);
  $37 = HEAP32[$36>>2]|0;
  $38 = (($19) + ($0))|0;
  $39 = (($21) + ($2))|0;
@@ -11417,25 +12179,25 @@ function _crypto_sign_ed25519_ref10_fe_add($h,$f,$g) {
  $46 = (($35) + ($16))|0;
  $47 = (($37) + ($18))|0;
  HEAP32[$h>>2] = $38;
- $48 = (($h) + 4|0);
+ $48 = ((($h)) + 4|0);
  HEAP32[$48>>2] = $39;
- $49 = (($h) + 8|0);
+ $49 = ((($h)) + 8|0);
  HEAP32[$49>>2] = $40;
- $50 = (($h) + 12|0);
+ $50 = ((($h)) + 12|0);
  HEAP32[$50>>2] = $41;
- $51 = (($h) + 16|0);
+ $51 = ((($h)) + 16|0);
  HEAP32[$51>>2] = $42;
- $52 = (($h) + 20|0);
+ $52 = ((($h)) + 20|0);
  HEAP32[$52>>2] = $43;
- $53 = (($h) + 24|0);
+ $53 = ((($h)) + 24|0);
  HEAP32[$53>>2] = $44;
- $54 = (($h) + 28|0);
+ $54 = ((($h)) + 28|0);
  HEAP32[$54>>2] = $45;
- $55 = (($h) + 32|0);
+ $55 = ((($h)) + 32|0);
  HEAP32[$55>>2] = $46;
- $56 = (($h) + 36|0);
+ $56 = ((($h)) + 36|0);
  HEAP32[$56>>2] = $47;
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_fe_cmov($f,$g,$b) {
  $f = $f|0;
@@ -11447,42 +12209,42 @@ function _crypto_sign_ed25519_ref10_fe_cmov($f,$g,$b) {
  var $63 = 0, $64 = 0, $65 = 0, $66 = 0, $67 = 0, $68 = 0, $7 = 0, $8 = 0, $9 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = HEAP32[$f>>2]|0;
- $1 = (($f) + 4|0);
+ $1 = ((($f)) + 4|0);
  $2 = HEAP32[$1>>2]|0;
- $3 = (($f) + 8|0);
+ $3 = ((($f)) + 8|0);
  $4 = HEAP32[$3>>2]|0;
- $5 = (($f) + 12|0);
+ $5 = ((($f)) + 12|0);
  $6 = HEAP32[$5>>2]|0;
- $7 = (($f) + 16|0);
+ $7 = ((($f)) + 16|0);
  $8 = HEAP32[$7>>2]|0;
- $9 = (($f) + 20|0);
+ $9 = ((($f)) + 20|0);
  $10 = HEAP32[$9>>2]|0;
- $11 = (($f) + 24|0);
+ $11 = ((($f)) + 24|0);
  $12 = HEAP32[$11>>2]|0;
- $13 = (($f) + 28|0);
+ $13 = ((($f)) + 28|0);
  $14 = HEAP32[$13>>2]|0;
- $15 = (($f) + 32|0);
+ $15 = ((($f)) + 32|0);
  $16 = HEAP32[$15>>2]|0;
- $17 = (($f) + 36|0);
+ $17 = ((($f)) + 36|0);
  $18 = HEAP32[$17>>2]|0;
  $19 = HEAP32[$g>>2]|0;
- $20 = (($g) + 4|0);
+ $20 = ((($g)) + 4|0);
  $21 = HEAP32[$20>>2]|0;
- $22 = (($g) + 8|0);
+ $22 = ((($g)) + 8|0);
  $23 = HEAP32[$22>>2]|0;
- $24 = (($g) + 12|0);
+ $24 = ((($g)) + 12|0);
  $25 = HEAP32[$24>>2]|0;
- $26 = (($g) + 16|0);
+ $26 = ((($g)) + 16|0);
  $27 = HEAP32[$26>>2]|0;
- $28 = (($g) + 20|0);
+ $28 = ((($g)) + 20|0);
  $29 = HEAP32[$28>>2]|0;
- $30 = (($g) + 24|0);
+ $30 = ((($g)) + 24|0);
  $31 = HEAP32[$30>>2]|0;
- $32 = (($g) + 28|0);
+ $32 = ((($g)) + 28|0);
  $33 = HEAP32[$32>>2]|0;
- $34 = (($g) + 32|0);
+ $34 = ((($g)) + 32|0);
  $35 = HEAP32[$34>>2]|0;
- $36 = (($g) + 36|0);
+ $36 = ((($g)) + 36|0);
  $37 = HEAP32[$36>>2]|0;
  $38 = $19 ^ $0;
  $39 = $21 ^ $2;
@@ -11525,7 +12287,7 @@ function _crypto_sign_ed25519_ref10_fe_cmov($f,$g,$b) {
  HEAP32[$15>>2] = $67;
  $68 = $58 ^ $18;
  HEAP32[$17>>2] = $68;
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_fe_copy($h,$f) {
  $h = $h|0;
@@ -11534,44 +12296,44 @@ function _crypto_sign_ed25519_ref10_fe_copy($h,$f) {
  var $27 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = HEAP32[$f>>2]|0;
- $1 = (($f) + 4|0);
+ $1 = ((($f)) + 4|0);
  $2 = HEAP32[$1>>2]|0;
- $3 = (($f) + 8|0);
+ $3 = ((($f)) + 8|0);
  $4 = HEAP32[$3>>2]|0;
- $5 = (($f) + 12|0);
+ $5 = ((($f)) + 12|0);
  $6 = HEAP32[$5>>2]|0;
- $7 = (($f) + 16|0);
+ $7 = ((($f)) + 16|0);
  $8 = HEAP32[$7>>2]|0;
- $9 = (($f) + 20|0);
+ $9 = ((($f)) + 20|0);
  $10 = HEAP32[$9>>2]|0;
- $11 = (($f) + 24|0);
+ $11 = ((($f)) + 24|0);
  $12 = HEAP32[$11>>2]|0;
- $13 = (($f) + 28|0);
+ $13 = ((($f)) + 28|0);
  $14 = HEAP32[$13>>2]|0;
- $15 = (($f) + 32|0);
+ $15 = ((($f)) + 32|0);
  $16 = HEAP32[$15>>2]|0;
- $17 = (($f) + 36|0);
+ $17 = ((($f)) + 36|0);
  $18 = HEAP32[$17>>2]|0;
  HEAP32[$h>>2] = $0;
- $19 = (($h) + 4|0);
+ $19 = ((($h)) + 4|0);
  HEAP32[$19>>2] = $2;
- $20 = (($h) + 8|0);
+ $20 = ((($h)) + 8|0);
  HEAP32[$20>>2] = $4;
- $21 = (($h) + 12|0);
+ $21 = ((($h)) + 12|0);
  HEAP32[$21>>2] = $6;
- $22 = (($h) + 16|0);
+ $22 = ((($h)) + 16|0);
  HEAP32[$22>>2] = $8;
- $23 = (($h) + 20|0);
+ $23 = ((($h)) + 20|0);
  HEAP32[$23>>2] = $10;
- $24 = (($h) + 24|0);
+ $24 = ((($h)) + 24|0);
  HEAP32[$24>>2] = $12;
- $25 = (($h) + 28|0);
+ $25 = ((($h)) + 28|0);
  HEAP32[$25>>2] = $14;
- $26 = (($h) + 32|0);
+ $26 = ((($h)) + 32|0);
  HEAP32[$26>>2] = $16;
- $27 = (($h) + 36|0);
+ $27 = ((($h)) + 36|0);
  HEAP32[$27>>2] = $18;
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_fe_frombytes($h,$s) {
  $h = $h|0;
@@ -11579,53 +12341,53 @@ function _crypto_sign_ed25519_ref10_fe_frombytes($h,$s) {
  var $0 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0;
  var $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0;
  var $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0;
- var $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0, $29 = 0;
- var $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0, $47 = 0;
- var $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0, $65 = 0;
- var $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0, $83 = 0;
- var $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
+ var $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
+ var $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0;
+ var $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0;
+ var $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0;
+ var $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = (_load_4($s)|0);
  $1 = tempRet0;
- $2 = (($s) + 4|0);
+ $2 = ((($s)) + 4|0);
  $3 = (_load_3($2)|0);
  $4 = tempRet0;
  $5 = (_bitshift64Shl(($3|0),($4|0),6)|0);
  $6 = tempRet0;
- $7 = (($s) + 7|0);
+ $7 = ((($s)) + 7|0);
  $8 = (_load_3($7)|0);
  $9 = tempRet0;
  $10 = (_bitshift64Shl(($8|0),($9|0),5)|0);
  $11 = tempRet0;
- $12 = (($s) + 10|0);
+ $12 = ((($s)) + 10|0);
  $13 = (_load_3($12)|0);
  $14 = tempRet0;
  $15 = (_bitshift64Shl(($13|0),($14|0),3)|0);
  $16 = tempRet0;
- $17 = (($s) + 13|0);
+ $17 = ((($s)) + 13|0);
  $18 = (_load_3($17)|0);
  $19 = tempRet0;
  $20 = (_bitshift64Shl(($18|0),($19|0),2)|0);
  $21 = tempRet0;
- $22 = (($s) + 16|0);
+ $22 = ((($s)) + 16|0);
  $23 = (_load_4($22)|0);
  $24 = tempRet0;
- $25 = (($s) + 20|0);
+ $25 = ((($s)) + 20|0);
  $26 = (_load_3($25)|0);
  $27 = tempRet0;
  $28 = (_bitshift64Shl(($26|0),($27|0),7)|0);
  $29 = tempRet0;
- $30 = (($s) + 23|0);
+ $30 = ((($s)) + 23|0);
  $31 = (_load_3($30)|0);
  $32 = tempRet0;
  $33 = (_bitshift64Shl(($31|0),($32|0),5)|0);
  $34 = tempRet0;
- $35 = (($s) + 26|0);
+ $35 = ((($s)) + 26|0);
  $36 = (_load_3($35)|0);
  $37 = tempRet0;
  $38 = (_bitshift64Shl(($36|0),($37|0),4)|0);
  $39 = tempRet0;
- $40 = (($s) + 29|0);
+ $40 = ((($s)) + 29|0);
  $41 = (_load_3($40)|0);
  $42 = tempRet0;
  $43 = (_bitshift64Shl(($41|0),($42|0),2)|0);
@@ -11635,124 +12397,125 @@ function _crypto_sign_ed25519_ref10_fe_frombytes($h,$s) {
  $47 = tempRet0;
  $48 = (_bitshift64Lshr(($46|0),($47|0),25)|0);
  $49 = tempRet0;
- $50 = (___muldi3(($48|0),($49|0),19,0)|0);
+ $50 = (_i64Subtract(0,0,($48|0),($49|0))|0);
  $51 = tempRet0;
- $52 = (_i64Add(($50|0),($51|0),($0|0),($1|0))|0);
- $53 = tempRet0;
- $54 = (_bitshift64Shl(($48|0),($49|0),25)|0);
- $55 = tempRet0;
- $56 = (_i64Add(($5|0),($6|0),16777216,0)|0);
- $57 = tempRet0;
- $58 = (_bitshift64Ashr(($56|0),($57|0),25)|0);
- $59 = tempRet0;
- $60 = (_i64Add(($58|0),($59|0),($10|0),($11|0))|0);
- $61 = tempRet0;
- $62 = (_bitshift64Shl(($58|0),($59|0),25)|0);
- $63 = tempRet0;
- $64 = (_i64Subtract(($5|0),($6|0),($62|0),($63|0))|0);
- $65 = tempRet0;
- $66 = (_i64Add(($15|0),($16|0),16777216,0)|0);
- $67 = tempRet0;
- $68 = (_bitshift64Ashr(($66|0),($67|0),25)|0);
- $69 = tempRet0;
- $70 = (_i64Add(($68|0),($69|0),($20|0),($21|0))|0);
- $71 = tempRet0;
- $72 = (_bitshift64Shl(($68|0),($69|0),25)|0);
- $73 = tempRet0;
- $74 = (_i64Subtract(($15|0),($16|0),($72|0),($73|0))|0);
- $75 = tempRet0;
- $76 = (_i64Add(($23|0),($24|0),16777216,0)|0);
- $77 = tempRet0;
- $78 = (_bitshift64Ashr(($76|0),($77|0),25)|0);
- $79 = tempRet0;
- $80 = (_i64Add(($28|0),($29|0),($78|0),($79|0))|0);
- $81 = tempRet0;
- $82 = (_bitshift64Shl(($78|0),($79|0),25)|0);
- $83 = tempRet0;
- $84 = (_i64Subtract(($23|0),($24|0),($82|0),($83|0))|0);
- $85 = tempRet0;
- $86 = (_i64Add(($33|0),($34|0),16777216,0)|0);
- $87 = tempRet0;
- $88 = (_bitshift64Ashr(($86|0),($87|0),25)|0);
- $89 = tempRet0;
- $90 = (_i64Add(($88|0),($89|0),($38|0),($39|0))|0);
- $91 = tempRet0;
- $92 = (_bitshift64Shl(($88|0),($89|0),25)|0);
- $93 = tempRet0;
- $94 = (_i64Add(($52|0),($53|0),33554432,0)|0);
- $95 = tempRet0;
- $96 = (_bitshift64Ashr(($94|0),($95|0),26)|0);
- $97 = tempRet0;
- $98 = (_i64Add(($64|0),($65|0),($96|0),($97|0))|0);
- $99 = tempRet0;
- $100 = (_bitshift64Shl(($96|0),($97|0),26)|0);
- $101 = tempRet0;
- $102 = (_i64Subtract(($52|0),($53|0),($100|0),($101|0))|0);
- $103 = tempRet0;
- $104 = (_i64Add(($60|0),($61|0),33554432,0)|0);
- $105 = tempRet0;
- $106 = (_bitshift64Ashr(($104|0),($105|0),26)|0);
- $107 = tempRet0;
- $108 = (_i64Add(($74|0),($75|0),($106|0),($107|0))|0);
- $109 = tempRet0;
- $110 = (_bitshift64Shl(($106|0),($107|0),26)|0);
- $111 = tempRet0;
- $112 = (_i64Subtract(($60|0),($61|0),($110|0),($111|0))|0);
- $113 = tempRet0;
- $114 = (_i64Add(($70|0),($71|0),33554432,0)|0);
- $115 = tempRet0;
- $116 = (_bitshift64Ashr(($114|0),($115|0),26)|0);
- $117 = tempRet0;
- $118 = (_i64Add(($84|0),($85|0),($116|0),($117|0))|0);
- $119 = tempRet0;
- $120 = (_bitshift64Shl(($116|0),($117|0),26)|0);
- $121 = tempRet0;
- $122 = (_i64Subtract(($70|0),($71|0),($120|0),($121|0))|0);
- $123 = tempRet0;
- $124 = (_i64Add(($80|0),($81|0),33554432,0)|0);
- $125 = tempRet0;
- $126 = (_bitshift64Ashr(($124|0),($125|0),26)|0);
- $127 = tempRet0;
- $128 = (_i64Add(($126|0),($127|0),($33|0),($34|0))|0);
- $129 = tempRet0;
- $130 = (_i64Subtract(($128|0),($129|0),($92|0),($93|0))|0);
- $131 = tempRet0;
- $132 = (_bitshift64Shl(($126|0),($127|0),26)|0);
- $133 = tempRet0;
- $134 = (_i64Subtract(($80|0),($81|0),($132|0),($133|0))|0);
- $135 = tempRet0;
- $136 = (_i64Add(($90|0),($91|0),33554432,0)|0);
- $137 = tempRet0;
- $138 = (_bitshift64Ashr(($136|0),($137|0),26)|0);
- $139 = tempRet0;
- $140 = (_i64Add(($138|0),($139|0),($45|0),0)|0);
- $141 = tempRet0;
- $142 = (_i64Subtract(($140|0),($141|0),($54|0),($55|0))|0);
- $143 = tempRet0;
- $144 = (_bitshift64Shl(($138|0),($139|0),26)|0);
- $145 = tempRet0;
- $146 = (_i64Subtract(($90|0),($91|0),($144|0),($145|0))|0);
- $147 = tempRet0;
- HEAP32[$h>>2] = $102;
- $148 = (($h) + 4|0);
- HEAP32[$148>>2] = $98;
- $149 = (($h) + 8|0);
- HEAP32[$149>>2] = $112;
- $150 = (($h) + 12|0);
- HEAP32[$150>>2] = $108;
- $151 = (($h) + 16|0);
- HEAP32[$151>>2] = $122;
- $152 = (($h) + 20|0);
- HEAP32[$152>>2] = $118;
- $153 = (($h) + 24|0);
- HEAP32[$153>>2] = $134;
- $154 = (($h) + 28|0);
- HEAP32[$154>>2] = $130;
- $155 = (($h) + 32|0);
- HEAP32[$155>>2] = $146;
- $156 = (($h) + 36|0);
- HEAP32[$156>>2] = $142;
- STACKTOP = sp;return;
+ $52 = $50 & 19;
+ $53 = (_i64Add(($52|0),0,($0|0),($1|0))|0);
+ $54 = tempRet0;
+ $55 = (_bitshift64Shl(($48|0),($49|0),25)|0);
+ $56 = tempRet0;
+ $57 = (_i64Add(($5|0),($6|0),16777216,0)|0);
+ $58 = tempRet0;
+ $59 = (_bitshift64Ashr(($57|0),($58|0),25)|0);
+ $60 = tempRet0;
+ $61 = (_i64Add(($59|0),($60|0),($10|0),($11|0))|0);
+ $62 = tempRet0;
+ $63 = (_bitshift64Shl(($59|0),($60|0),25)|0);
+ $64 = tempRet0;
+ $65 = (_i64Subtract(($5|0),($6|0),($63|0),($64|0))|0);
+ $66 = tempRet0;
+ $67 = (_i64Add(($15|0),($16|0),16777216,0)|0);
+ $68 = tempRet0;
+ $69 = (_bitshift64Ashr(($67|0),($68|0),25)|0);
+ $70 = tempRet0;
+ $71 = (_i64Add(($69|0),($70|0),($20|0),($21|0))|0);
+ $72 = tempRet0;
+ $73 = (_bitshift64Shl(($69|0),($70|0),25)|0);
+ $74 = tempRet0;
+ $75 = (_i64Subtract(($15|0),($16|0),($73|0),($74|0))|0);
+ $76 = tempRet0;
+ $77 = (_i64Add(($23|0),($24|0),16777216,0)|0);
+ $78 = tempRet0;
+ $79 = (_bitshift64Ashr(($77|0),($78|0),25)|0);
+ $80 = tempRet0;
+ $81 = (_i64Add(($28|0),($29|0),($79|0),($80|0))|0);
+ $82 = tempRet0;
+ $83 = (_bitshift64Shl(($79|0),($80|0),25)|0);
+ $84 = tempRet0;
+ $85 = (_i64Subtract(($23|0),($24|0),($83|0),($84|0))|0);
+ $86 = tempRet0;
+ $87 = (_i64Add(($33|0),($34|0),16777216,0)|0);
+ $88 = tempRet0;
+ $89 = (_bitshift64Ashr(($87|0),($88|0),25)|0);
+ $90 = tempRet0;
+ $91 = (_i64Add(($89|0),($90|0),($38|0),($39|0))|0);
+ $92 = tempRet0;
+ $93 = (_bitshift64Shl(($89|0),($90|0),25)|0);
+ $94 = tempRet0;
+ $95 = (_i64Add(($53|0),($54|0),33554432,0)|0);
+ $96 = tempRet0;
+ $97 = (_bitshift64Ashr(($95|0),($96|0),26)|0);
+ $98 = tempRet0;
+ $99 = (_i64Add(($65|0),($66|0),($97|0),($98|0))|0);
+ $100 = tempRet0;
+ $101 = (_bitshift64Shl(($97|0),($98|0),26)|0);
+ $102 = tempRet0;
+ $103 = (_i64Subtract(($53|0),($54|0),($101|0),($102|0))|0);
+ $104 = tempRet0;
+ $105 = (_i64Add(($61|0),($62|0),33554432,0)|0);
+ $106 = tempRet0;
+ $107 = (_bitshift64Ashr(($105|0),($106|0),26)|0);
+ $108 = tempRet0;
+ $109 = (_i64Add(($75|0),($76|0),($107|0),($108|0))|0);
+ $110 = tempRet0;
+ $111 = (_bitshift64Shl(($107|0),($108|0),26)|0);
+ $112 = tempRet0;
+ $113 = (_i64Subtract(($61|0),($62|0),($111|0),($112|0))|0);
+ $114 = tempRet0;
+ $115 = (_i64Add(($71|0),($72|0),33554432,0)|0);
+ $116 = tempRet0;
+ $117 = (_bitshift64Ashr(($115|0),($116|0),26)|0);
+ $118 = tempRet0;
+ $119 = (_i64Add(($85|0),($86|0),($117|0),($118|0))|0);
+ $120 = tempRet0;
+ $121 = (_bitshift64Shl(($117|0),($118|0),26)|0);
+ $122 = tempRet0;
+ $123 = (_i64Subtract(($71|0),($72|0),($121|0),($122|0))|0);
+ $124 = tempRet0;
+ $125 = (_i64Add(($81|0),($82|0),33554432,0)|0);
+ $126 = tempRet0;
+ $127 = (_bitshift64Ashr(($125|0),($126|0),26)|0);
+ $128 = tempRet0;
+ $129 = (_i64Add(($127|0),($128|0),($33|0),($34|0))|0);
+ $130 = tempRet0;
+ $131 = (_i64Subtract(($129|0),($130|0),($93|0),($94|0))|0);
+ $132 = tempRet0;
+ $133 = (_bitshift64Shl(($127|0),($128|0),26)|0);
+ $134 = tempRet0;
+ $135 = (_i64Subtract(($81|0),($82|0),($133|0),($134|0))|0);
+ $136 = tempRet0;
+ $137 = (_i64Add(($91|0),($92|0),33554432,0)|0);
+ $138 = tempRet0;
+ $139 = (_bitshift64Ashr(($137|0),($138|0),26)|0);
+ $140 = tempRet0;
+ $141 = (_i64Add(($139|0),($140|0),($45|0),0)|0);
+ $142 = tempRet0;
+ $143 = (_i64Subtract(($141|0),($142|0),($55|0),($56|0))|0);
+ $144 = tempRet0;
+ $145 = (_bitshift64Shl(($139|0),($140|0),26)|0);
+ $146 = tempRet0;
+ $147 = (_i64Subtract(($91|0),($92|0),($145|0),($146|0))|0);
+ $148 = tempRet0;
+ HEAP32[$h>>2] = $103;
+ $149 = ((($h)) + 4|0);
+ HEAP32[$149>>2] = $99;
+ $150 = ((($h)) + 8|0);
+ HEAP32[$150>>2] = $113;
+ $151 = ((($h)) + 12|0);
+ HEAP32[$151>>2] = $109;
+ $152 = ((($h)) + 16|0);
+ HEAP32[$152>>2] = $123;
+ $153 = ((($h)) + 20|0);
+ HEAP32[$153>>2] = $119;
+ $154 = ((($h)) + 24|0);
+ HEAP32[$154>>2] = $135;
+ $155 = ((($h)) + 28|0);
+ HEAP32[$155>>2] = $131;
+ $156 = ((($h)) + 32|0);
+ HEAP32[$156>>2] = $147;
+ $157 = ((($h)) + 36|0);
+ HEAP32[$157>>2] = $143;
+ return;
 }
 function _load_4($in) {
  $in = $in|0;
@@ -11761,28 +12524,28 @@ function _load_4($in) {
  sp = STACKTOP;
  $0 = HEAP8[$in>>0]|0;
  $1 = $0&255;
- $2 = (($in) + 1|0);
+ $2 = ((($in)) + 1|0);
  $3 = HEAP8[$2>>0]|0;
  $4 = $3&255;
  $5 = (_bitshift64Shl(($4|0),0,8)|0);
  $6 = tempRet0;
  $7 = $5 | $1;
- $8 = (($in) + 2|0);
+ $8 = ((($in)) + 2|0);
  $9 = HEAP8[$8>>0]|0;
  $10 = $9&255;
  $11 = (_bitshift64Shl(($10|0),0,16)|0);
  $12 = tempRet0;
  $13 = $7 | $11;
  $14 = $6 | $12;
- $15 = (($in) + 3|0);
+ $15 = ((($in)) + 3|0);
  $16 = HEAP8[$15>>0]|0;
  $17 = $16&255;
  $18 = (_bitshift64Shl(($17|0),0,24)|0);
  $19 = tempRet0;
  $20 = $13 | $18;
  $21 = $14 | $19;
- tempRet0 = $21;
- STACKTOP = sp;return ($20|0);
+ tempRet0 = ($21);
+ return ($20|0);
 }
 function _load_3($in) {
  $in = $in|0;
@@ -11790,21 +12553,21 @@ function _load_3($in) {
  sp = STACKTOP;
  $0 = HEAP8[$in>>0]|0;
  $1 = $0&255;
- $2 = (($in) + 1|0);
+ $2 = ((($in)) + 1|0);
  $3 = HEAP8[$2>>0]|0;
  $4 = $3&255;
  $5 = (_bitshift64Shl(($4|0),0,8)|0);
  $6 = tempRet0;
  $7 = $5 | $1;
- $8 = (($in) + 2|0);
+ $8 = ((($in)) + 2|0);
  $9 = HEAP8[$8>>0]|0;
  $10 = $9&255;
  $11 = (_bitshift64Shl(($10|0),0,16)|0);
  $12 = tempRet0;
  $13 = $7 | $11;
  $14 = $6 | $12;
- tempRet0 = $14;
- STACKTOP = sp;return ($13|0);
+ tempRet0 = ($14);
+ return ($13|0);
 }
 function _crypto_sign_ed25519_ref10_fe_invert($out,$z) {
  $out = $out|0;
@@ -11938,7 +12701,7 @@ function _crypto_sign_ed25519_ref10_fe_isnonzero($f) {
  STACKTOP = STACKTOP + 32|0;
  $s = sp;
  _crypto_sign_ed25519_ref10_fe_tobytes($s,$f);
- $0 = (_crypto_verify_32_ref($s,8)|0);
+ $0 = (_crypto_verify_32_ref($s,33172)|0);
  STACKTOP = sp;return ($0|0);
 }
 function _crypto_sign_ed25519_ref10_fe_mul($h,$f,$g) {
@@ -11979,42 +12742,42 @@ function _crypto_sign_ed25519_ref10_fe_mul($h,$f,$g) {
  var $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = HEAP32[$f>>2]|0;
- $1 = (($f) + 4|0);
+ $1 = ((($f)) + 4|0);
  $2 = HEAP32[$1>>2]|0;
- $3 = (($f) + 8|0);
+ $3 = ((($f)) + 8|0);
  $4 = HEAP32[$3>>2]|0;
- $5 = (($f) + 12|0);
+ $5 = ((($f)) + 12|0);
  $6 = HEAP32[$5>>2]|0;
- $7 = (($f) + 16|0);
+ $7 = ((($f)) + 16|0);
  $8 = HEAP32[$7>>2]|0;
- $9 = (($f) + 20|0);
+ $9 = ((($f)) + 20|0);
  $10 = HEAP32[$9>>2]|0;
- $11 = (($f) + 24|0);
+ $11 = ((($f)) + 24|0);
  $12 = HEAP32[$11>>2]|0;
- $13 = (($f) + 28|0);
+ $13 = ((($f)) + 28|0);
  $14 = HEAP32[$13>>2]|0;
- $15 = (($f) + 32|0);
+ $15 = ((($f)) + 32|0);
  $16 = HEAP32[$15>>2]|0;
- $17 = (($f) + 36|0);
+ $17 = ((($f)) + 36|0);
  $18 = HEAP32[$17>>2]|0;
  $19 = HEAP32[$g>>2]|0;
- $20 = (($g) + 4|0);
+ $20 = ((($g)) + 4|0);
  $21 = HEAP32[$20>>2]|0;
- $22 = (($g) + 8|0);
+ $22 = ((($g)) + 8|0);
  $23 = HEAP32[$22>>2]|0;
- $24 = (($g) + 12|0);
+ $24 = ((($g)) + 12|0);
  $25 = HEAP32[$24>>2]|0;
- $26 = (($g) + 16|0);
+ $26 = ((($g)) + 16|0);
  $27 = HEAP32[$26>>2]|0;
- $28 = (($g) + 20|0);
+ $28 = ((($g)) + 20|0);
  $29 = HEAP32[$28>>2]|0;
- $30 = (($g) + 24|0);
+ $30 = ((($g)) + 24|0);
  $31 = HEAP32[$30>>2]|0;
- $32 = (($g) + 28|0);
+ $32 = ((($g)) + 28|0);
  $33 = HEAP32[$32>>2]|0;
- $34 = (($g) + 32|0);
+ $34 = ((($g)) + 32|0);
  $35 = HEAP32[$34>>2]|0;
- $36 = (($g) + 36|0);
+ $36 = ((($g)) + 36|0);
  $37 = HEAP32[$36>>2]|0;
  $38 = ($21*19)|0;
  $39 = ($23*19)|0;
@@ -12601,25 +13364,25 @@ function _crypto_sign_ed25519_ref10_fe_mul($h,$f,$g) {
  $620 = (_i64Subtract(($606|0),($607|0),($618|0),($619|0))|0);
  $621 = tempRet0;
  HEAP32[$h>>2] = $620;
- $622 = (($h) + 4|0);
+ $622 = ((($h)) + 4|0);
  HEAP32[$622>>2] = $616;
- $623 = (($h) + 8|0);
+ $623 = ((($h)) + 8|0);
  HEAP32[$623>>2] = $494;
- $624 = (($h) + 12|0);
+ $624 = ((($h)) + 12|0);
  HEAP32[$624>>2] = $532;
- $625 = (($h) + 16|0);
+ $625 = ((($h)) + 16|0);
  HEAP32[$625>>2] = $570;
- $626 = (($h) + 20|0);
+ $626 = ((($h)) + 20|0);
  HEAP32[$626>>2] = $566;
- $627 = (($h) + 24|0);
+ $627 = ((($h)) + 24|0);
  HEAP32[$627>>2] = $522;
- $628 = (($h) + 28|0);
+ $628 = ((($h)) + 28|0);
  HEAP32[$628>>2] = $560;
- $629 = (($h) + 32|0);
+ $629 = ((($h)) + 32|0);
  HEAP32[$629>>2] = $598;
- $630 = (($h) + 36|0);
+ $630 = ((($h)) + 36|0);
  HEAP32[$630>>2] = $610;
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_fe_neg($h,$f) {
  $h = $h|0;
@@ -12628,23 +13391,23 @@ function _crypto_sign_ed25519_ref10_fe_neg($h,$f) {
  var $27 = 0, $28 = 0, $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = HEAP32[$f>>2]|0;
- $1 = (($f) + 4|0);
+ $1 = ((($f)) + 4|0);
  $2 = HEAP32[$1>>2]|0;
- $3 = (($f) + 8|0);
+ $3 = ((($f)) + 8|0);
  $4 = HEAP32[$3>>2]|0;
- $5 = (($f) + 12|0);
+ $5 = ((($f)) + 12|0);
  $6 = HEAP32[$5>>2]|0;
- $7 = (($f) + 16|0);
+ $7 = ((($f)) + 16|0);
  $8 = HEAP32[$7>>2]|0;
- $9 = (($f) + 20|0);
+ $9 = ((($f)) + 20|0);
  $10 = HEAP32[$9>>2]|0;
- $11 = (($f) + 24|0);
+ $11 = ((($f)) + 24|0);
  $12 = HEAP32[$11>>2]|0;
- $13 = (($f) + 28|0);
+ $13 = ((($f)) + 28|0);
  $14 = HEAP32[$13>>2]|0;
- $15 = (($f) + 32|0);
+ $15 = ((($f)) + 32|0);
  $16 = HEAP32[$15>>2]|0;
- $17 = (($f) + 36|0);
+ $17 = ((($f)) + 36|0);
  $18 = HEAP32[$17>>2]|0;
  $19 = (0 - ($0))|0;
  $20 = (0 - ($2))|0;
@@ -12657,25 +13420,25 @@ function _crypto_sign_ed25519_ref10_fe_neg($h,$f) {
  $27 = (0 - ($16))|0;
  $28 = (0 - ($18))|0;
  HEAP32[$h>>2] = $19;
- $29 = (($h) + 4|0);
+ $29 = ((($h)) + 4|0);
  HEAP32[$29>>2] = $20;
- $30 = (($h) + 8|0);
+ $30 = ((($h)) + 8|0);
  HEAP32[$30>>2] = $21;
- $31 = (($h) + 12|0);
+ $31 = ((($h)) + 12|0);
  HEAP32[$31>>2] = $22;
- $32 = (($h) + 16|0);
+ $32 = ((($h)) + 16|0);
  HEAP32[$32>>2] = $23;
- $33 = (($h) + 20|0);
+ $33 = ((($h)) + 20|0);
  HEAP32[$33>>2] = $24;
- $34 = (($h) + 24|0);
+ $34 = ((($h)) + 24|0);
  HEAP32[$34>>2] = $25;
- $35 = (($h) + 28|0);
+ $35 = ((($h)) + 28|0);
  HEAP32[$35>>2] = $26;
- $36 = (($h) + 32|0);
+ $36 = ((($h)) + 32|0);
  HEAP32[$36>>2] = $27;
- $37 = (($h) + 36|0);
+ $37 = ((($h)) + 36|0);
  HEAP32[$37>>2] = $28;
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_fe_pow22523($out,$z) {
  $out = $out|0;
@@ -12812,23 +13575,23 @@ function _crypto_sign_ed25519_ref10_fe_sq($h,$f) {
  var $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = HEAP32[$f>>2]|0;
- $1 = (($f) + 4|0);
+ $1 = ((($f)) + 4|0);
  $2 = HEAP32[$1>>2]|0;
- $3 = (($f) + 8|0);
+ $3 = ((($f)) + 8|0);
  $4 = HEAP32[$3>>2]|0;
- $5 = (($f) + 12|0);
+ $5 = ((($f)) + 12|0);
  $6 = HEAP32[$5>>2]|0;
- $7 = (($f) + 16|0);
+ $7 = ((($f)) + 16|0);
  $8 = HEAP32[$7>>2]|0;
- $9 = (($f) + 20|0);
+ $9 = ((($f)) + 20|0);
  $10 = HEAP32[$9>>2]|0;
- $11 = (($f) + 24|0);
+ $11 = ((($f)) + 24|0);
  $12 = HEAP32[$11>>2]|0;
- $13 = (($f) + 28|0);
+ $13 = ((($f)) + 28|0);
  $14 = HEAP32[$13>>2]|0;
- $15 = (($f) + 32|0);
+ $15 = ((($f)) + 32|0);
  $16 = HEAP32[$15>>2]|0;
- $17 = (($f) + 36|0);
+ $17 = ((($f)) + 36|0);
  $18 = HEAP32[$17>>2]|0;
  $19 = $0 << 1;
  $20 = $2 << 1;
@@ -13212,25 +13975,25 @@ function _crypto_sign_ed25519_ref10_fe_sq($h,$f) {
  $398 = (_i64Subtract(($384|0),($385|0),($396|0),($397|0))|0);
  $399 = tempRet0;
  HEAP32[$h>>2] = $398;
- $400 = (($h) + 4|0);
+ $400 = ((($h)) + 4|0);
  HEAP32[$400>>2] = $394;
- $401 = (($h) + 8|0);
+ $401 = ((($h)) + 8|0);
  HEAP32[$401>>2] = $300;
- $402 = (($h) + 12|0);
+ $402 = ((($h)) + 12|0);
  HEAP32[$402>>2] = $328;
- $403 = (($h) + 16|0);
+ $403 = ((($h)) + 16|0);
  HEAP32[$403>>2] = $358;
- $404 = (($h) + 20|0);
+ $404 = ((($h)) + 20|0);
  HEAP32[$404>>2] = $354;
- $405 = (($h) + 24|0);
+ $405 = ((($h)) + 24|0);
  HEAP32[$405>>2] = $318;
- $406 = (($h) + 28|0);
+ $406 = ((($h)) + 28|0);
  HEAP32[$406>>2] = $348;
- $407 = (($h) + 32|0);
+ $407 = ((($h)) + 32|0);
  HEAP32[$407>>2] = $376;
- $408 = (($h) + 36|0);
+ $408 = ((($h)) + 36|0);
  HEAP32[$408>>2] = $388;
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_fe_sq2($h,$f) {
  $h = $h|0;
@@ -13259,23 +14022,23 @@ function _crypto_sign_ed25519_ref10_fe_sq2($h,$f) {
  var $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = HEAP32[$f>>2]|0;
- $1 = (($f) + 4|0);
+ $1 = ((($f)) + 4|0);
  $2 = HEAP32[$1>>2]|0;
- $3 = (($f) + 8|0);
+ $3 = ((($f)) + 8|0);
  $4 = HEAP32[$3>>2]|0;
- $5 = (($f) + 12|0);
+ $5 = ((($f)) + 12|0);
  $6 = HEAP32[$5>>2]|0;
- $7 = (($f) + 16|0);
+ $7 = ((($f)) + 16|0);
  $8 = HEAP32[$7>>2]|0;
- $9 = (($f) + 20|0);
+ $9 = ((($f)) + 20|0);
  $10 = HEAP32[$9>>2]|0;
- $11 = (($f) + 24|0);
+ $11 = ((($f)) + 24|0);
  $12 = HEAP32[$11>>2]|0;
- $13 = (($f) + 28|0);
+ $13 = ((($f)) + 28|0);
  $14 = HEAP32[$13>>2]|0;
- $15 = (($f) + 32|0);
+ $15 = ((($f)) + 32|0);
  $16 = HEAP32[$15>>2]|0;
- $17 = (($f) + 36|0);
+ $17 = ((($f)) + 36|0);
  $18 = HEAP32[$17>>2]|0;
  $19 = $0 << 1;
  $20 = $2 << 1;
@@ -13679,25 +14442,25 @@ function _crypto_sign_ed25519_ref10_fe_sq2($h,$f) {
  $418 = (_i64Subtract(($404|0),($405|0),($416|0),($417|0))|0);
  $419 = tempRet0;
  HEAP32[$h>>2] = $418;
- $420 = (($h) + 4|0);
+ $420 = ((($h)) + 4|0);
  HEAP32[$420>>2] = $414;
- $421 = (($h) + 8|0);
+ $421 = ((($h)) + 8|0);
  HEAP32[$421>>2] = $346;
- $422 = (($h) + 12|0);
+ $422 = ((($h)) + 12|0);
  HEAP32[$422>>2] = $366;
- $423 = (($h) + 16|0);
+ $423 = ((($h)) + 16|0);
  HEAP32[$423>>2] = $386;
- $424 = (($h) + 20|0);
+ $424 = ((($h)) + 20|0);
  HEAP32[$424>>2] = $382;
- $425 = (($h) + 24|0);
+ $425 = ((($h)) + 24|0);
  HEAP32[$425>>2] = $356;
- $426 = (($h) + 28|0);
+ $426 = ((($h)) + 28|0);
  HEAP32[$426>>2] = $376;
- $427 = (($h) + 32|0);
+ $427 = ((($h)) + 32|0);
  HEAP32[$427>>2] = $396;
- $428 = (($h) + 36|0);
+ $428 = ((($h)) + 36|0);
  HEAP32[$428>>2] = $408;
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_fe_sub($h,$f,$g) {
  $h = $h|0;
@@ -13708,42 +14471,42 @@ function _crypto_sign_ed25519_ref10_fe_sub($h,$f,$g) {
  var $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = HEAP32[$f>>2]|0;
- $1 = (($f) + 4|0);
+ $1 = ((($f)) + 4|0);
  $2 = HEAP32[$1>>2]|0;
- $3 = (($f) + 8|0);
+ $3 = ((($f)) + 8|0);
  $4 = HEAP32[$3>>2]|0;
- $5 = (($f) + 12|0);
+ $5 = ((($f)) + 12|0);
  $6 = HEAP32[$5>>2]|0;
- $7 = (($f) + 16|0);
+ $7 = ((($f)) + 16|0);
  $8 = HEAP32[$7>>2]|0;
- $9 = (($f) + 20|0);
+ $9 = ((($f)) + 20|0);
  $10 = HEAP32[$9>>2]|0;
- $11 = (($f) + 24|0);
+ $11 = ((($f)) + 24|0);
  $12 = HEAP32[$11>>2]|0;
- $13 = (($f) + 28|0);
+ $13 = ((($f)) + 28|0);
  $14 = HEAP32[$13>>2]|0;
- $15 = (($f) + 32|0);
+ $15 = ((($f)) + 32|0);
  $16 = HEAP32[$15>>2]|0;
- $17 = (($f) + 36|0);
+ $17 = ((($f)) + 36|0);
  $18 = HEAP32[$17>>2]|0;
  $19 = HEAP32[$g>>2]|0;
- $20 = (($g) + 4|0);
+ $20 = ((($g)) + 4|0);
  $21 = HEAP32[$20>>2]|0;
- $22 = (($g) + 8|0);
+ $22 = ((($g)) + 8|0);
  $23 = HEAP32[$22>>2]|0;
- $24 = (($g) + 12|0);
+ $24 = ((($g)) + 12|0);
  $25 = HEAP32[$24>>2]|0;
- $26 = (($g) + 16|0);
+ $26 = ((($g)) + 16|0);
  $27 = HEAP32[$26>>2]|0;
- $28 = (($g) + 20|0);
+ $28 = ((($g)) + 20|0);
  $29 = HEAP32[$28>>2]|0;
- $30 = (($g) + 24|0);
+ $30 = ((($g)) + 24|0);
  $31 = HEAP32[$30>>2]|0;
- $32 = (($g) + 28|0);
+ $32 = ((($g)) + 28|0);
  $33 = HEAP32[$32>>2]|0;
- $34 = (($g) + 32|0);
+ $34 = ((($g)) + 32|0);
  $35 = HEAP32[$34>>2]|0;
- $36 = (($g) + 36|0);
+ $36 = ((($g)) + 36|0);
  $37 = HEAP32[$36>>2]|0;
  $38 = (($0) - ($19))|0;
  $39 = (($2) - ($21))|0;
@@ -13756,25 +14519,25 @@ function _crypto_sign_ed25519_ref10_fe_sub($h,$f,$g) {
  $46 = (($16) - ($35))|0;
  $47 = (($18) - ($37))|0;
  HEAP32[$h>>2] = $38;
- $48 = (($h) + 4|0);
+ $48 = ((($h)) + 4|0);
  HEAP32[$48>>2] = $39;
- $49 = (($h) + 8|0);
+ $49 = ((($h)) + 8|0);
  HEAP32[$49>>2] = $40;
- $50 = (($h) + 12|0);
+ $50 = ((($h)) + 12|0);
  HEAP32[$50>>2] = $41;
- $51 = (($h) + 16|0);
+ $51 = ((($h)) + 16|0);
  HEAP32[$51>>2] = $42;
- $52 = (($h) + 20|0);
+ $52 = ((($h)) + 20|0);
  HEAP32[$52>>2] = $43;
- $53 = (($h) + 24|0);
+ $53 = ((($h)) + 24|0);
  HEAP32[$53>>2] = $44;
- $54 = (($h) + 28|0);
+ $54 = ((($h)) + 28|0);
  HEAP32[$54>>2] = $45;
- $55 = (($h) + 32|0);
+ $55 = ((($h)) + 32|0);
  HEAP32[$55>>2] = $46;
- $56 = (($h) + 36|0);
+ $56 = ((($h)) + 36|0);
  HEAP32[$56>>2] = $47;
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_fe_tobytes($s,$h) {
  $s = $s|0;
@@ -13791,23 +14554,23 @@ function _crypto_sign_ed25519_ref10_fe_tobytes($s,$h) {
  var $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = HEAP32[$h>>2]|0;
- $1 = (($h) + 4|0);
+ $1 = ((($h)) + 4|0);
  $2 = HEAP32[$1>>2]|0;
- $3 = (($h) + 8|0);
+ $3 = ((($h)) + 8|0);
  $4 = HEAP32[$3>>2]|0;
- $5 = (($h) + 12|0);
+ $5 = ((($h)) + 12|0);
  $6 = HEAP32[$5>>2]|0;
- $7 = (($h) + 16|0);
+ $7 = ((($h)) + 16|0);
  $8 = HEAP32[$7>>2]|0;
- $9 = (($h) + 20|0);
+ $9 = ((($h)) + 20|0);
  $10 = HEAP32[$9>>2]|0;
- $11 = (($h) + 24|0);
+ $11 = ((($h)) + 24|0);
  $12 = HEAP32[$11>>2]|0;
- $13 = (($h) + 28|0);
+ $13 = ((($h)) + 28|0);
  $14 = HEAP32[$13>>2]|0;
- $15 = (($h) + 32|0);
+ $15 = ((($h)) + 32|0);
  $16 = HEAP32[$15>>2]|0;
- $17 = (($h) + 36|0);
+ $17 = ((($h)) + 36|0);
  $18 = HEAP32[$17>>2]|0;
  $19 = ($18*19)|0;
  $20 = (($19) + 16777216)|0;
@@ -13875,144 +14638,144 @@ function _crypto_sign_ed25519_ref10_fe_tobytes($s,$h) {
  HEAP8[$s>>0] = $81;
  $82 = $47 >>> 8;
  $83 = $82&255;
- $84 = (($s) + 1|0);
+ $84 = ((($s)) + 1|0);
  HEAP8[$84>>0] = $83;
  $85 = $47 >>> 16;
  $86 = $85&255;
- $87 = (($s) + 2|0);
+ $87 = ((($s)) + 2|0);
  HEAP8[$87>>0] = $86;
  $88 = $47 >>> 24;
  $89 = $51 << 2;
  $90 = $89 | $88;
  $91 = $90&255;
- $92 = (($s) + 3|0);
+ $92 = ((($s)) + 3|0);
  HEAP8[$92>>0] = $91;
  $93 = $51 >>> 6;
  $94 = $93&255;
- $95 = (($s) + 4|0);
+ $95 = ((($s)) + 4|0);
  HEAP8[$95>>0] = $94;
  $96 = $51 >>> 14;
  $97 = $96&255;
- $98 = (($s) + 5|0);
+ $98 = ((($s)) + 5|0);
  HEAP8[$98>>0] = $97;
  $99 = $51 >>> 22;
  $100 = $55 << 3;
  $101 = $100 | $99;
  $102 = $101&255;
- $103 = (($s) + 6|0);
+ $103 = ((($s)) + 6|0);
  HEAP8[$103>>0] = $102;
  $104 = $55 >>> 5;
  $105 = $104&255;
- $106 = (($s) + 7|0);
+ $106 = ((($s)) + 7|0);
  HEAP8[$106>>0] = $105;
  $107 = $55 >>> 13;
  $108 = $107&255;
- $109 = (($s) + 8|0);
+ $109 = ((($s)) + 8|0);
  HEAP8[$109>>0] = $108;
  $110 = $55 >>> 21;
  $111 = $59 << 5;
  $112 = $111 | $110;
  $113 = $112&255;
- $114 = (($s) + 9|0);
+ $114 = ((($s)) + 9|0);
  HEAP8[$114>>0] = $113;
  $115 = $59 >>> 3;
  $116 = $115&255;
- $117 = (($s) + 10|0);
+ $117 = ((($s)) + 10|0);
  HEAP8[$117>>0] = $116;
  $118 = $59 >>> 11;
  $119 = $118&255;
- $120 = (($s) + 11|0);
+ $120 = ((($s)) + 11|0);
  HEAP8[$120>>0] = $119;
  $121 = $59 >>> 19;
  $122 = $63 << 6;
  $123 = $122 | $121;
  $124 = $123&255;
- $125 = (($s) + 12|0);
+ $125 = ((($s)) + 12|0);
  HEAP8[$125>>0] = $124;
  $126 = $63 >>> 2;
  $127 = $126&255;
- $128 = (($s) + 13|0);
+ $128 = ((($s)) + 13|0);
  HEAP8[$128>>0] = $127;
  $129 = $63 >>> 10;
  $130 = $129&255;
- $131 = (($s) + 14|0);
+ $131 = ((($s)) + 14|0);
  HEAP8[$131>>0] = $130;
  $132 = $63 >>> 18;
  $133 = $132&255;
- $134 = (($s) + 15|0);
+ $134 = ((($s)) + 15|0);
  HEAP8[$134>>0] = $133;
  $135 = $67&255;
- $136 = (($s) + 16|0);
+ $136 = ((($s)) + 16|0);
  HEAP8[$136>>0] = $135;
  $137 = $67 >>> 8;
  $138 = $137&255;
- $139 = (($s) + 17|0);
+ $139 = ((($s)) + 17|0);
  HEAP8[$139>>0] = $138;
  $140 = $67 >>> 16;
  $141 = $140&255;
- $142 = (($s) + 18|0);
+ $142 = ((($s)) + 18|0);
  HEAP8[$142>>0] = $141;
  $143 = $67 >>> 24;
  $144 = $71 << 1;
  $145 = $144 | $143;
  $146 = $145&255;
- $147 = (($s) + 19|0);
+ $147 = ((($s)) + 19|0);
  HEAP8[$147>>0] = $146;
  $148 = $71 >>> 7;
  $149 = $148&255;
- $150 = (($s) + 20|0);
+ $150 = ((($s)) + 20|0);
  HEAP8[$150>>0] = $149;
  $151 = $71 >>> 15;
  $152 = $151&255;
- $153 = (($s) + 21|0);
+ $153 = ((($s)) + 21|0);
  HEAP8[$153>>0] = $152;
  $154 = $71 >>> 23;
  $155 = $75 << 3;
  $156 = $155 | $154;
  $157 = $156&255;
- $158 = (($s) + 22|0);
+ $158 = ((($s)) + 22|0);
  HEAP8[$158>>0] = $157;
  $159 = $75 >>> 5;
  $160 = $159&255;
- $161 = (($s) + 23|0);
+ $161 = ((($s)) + 23|0);
  HEAP8[$161>>0] = $160;
  $162 = $75 >>> 13;
  $163 = $162&255;
- $164 = (($s) + 24|0);
+ $164 = ((($s)) + 24|0);
  HEAP8[$164>>0] = $163;
  $165 = $75 >>> 21;
  $166 = $79 << 4;
  $167 = $166 | $165;
  $168 = $167&255;
- $169 = (($s) + 25|0);
+ $169 = ((($s)) + 25|0);
  HEAP8[$169>>0] = $168;
  $170 = $79 >>> 4;
  $171 = $170&255;
- $172 = (($s) + 26|0);
+ $172 = ((($s)) + 26|0);
  HEAP8[$172>>0] = $171;
  $173 = $79 >>> 12;
  $174 = $173&255;
- $175 = (($s) + 27|0);
+ $175 = ((($s)) + 27|0);
  HEAP8[$175>>0] = $174;
  $176 = $79 >>> 20;
  $177 = $80 << 6;
  $178 = $176 | $177;
  $179 = $178&255;
- $180 = (($s) + 28|0);
+ $180 = ((($s)) + 28|0);
  HEAP8[$180>>0] = $179;
  $181 = $77 >>> 2;
  $182 = $181&255;
- $183 = (($s) + 29|0);
+ $183 = ((($s)) + 29|0);
  HEAP8[$183>>0] = $182;
  $184 = $77 >>> 10;
  $185 = $184&255;
- $186 = (($s) + 30|0);
+ $186 = ((($s)) + 30|0);
  HEAP8[$186>>0] = $185;
  $187 = $80 >>> 18;
  $188 = $187&255;
- $189 = (($s) + 31|0);
+ $189 = ((($s)) + 31|0);
  HEAP8[$189>>0] = $188;
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_ge_add($r,$p,$q) {
  $r = $r|0;
@@ -14022,20 +14785,20 @@ function _crypto_sign_ed25519_ref10_ge_add($r,$p,$q) {
  sp = STACKTOP;
  STACKTOP = STACKTOP + 48|0;
  $t0 = sp;
- $0 = (($p) + 40|0);
+ $0 = ((($p)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_add($r,$0,$p);
- $1 = (($r) + 40|0);
+ $1 = ((($r)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_sub($1,$0,$p);
- $2 = (($r) + 80|0);
+ $2 = ((($r)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_mul($2,$r,$q);
- $3 = (($q) + 40|0);
+ $3 = ((($q)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_mul($1,$1,$3);
- $4 = (($r) + 120|0);
- $5 = (($q) + 120|0);
- $6 = (($p) + 120|0);
+ $4 = ((($r)) + 120|0);
+ $5 = ((($q)) + 120|0);
+ $6 = ((($p)) + 120|0);
  _crypto_sign_ed25519_ref10_fe_mul($4,$5,$6);
- $7 = (($p) + 80|0);
- $8 = (($q) + 80|0);
+ $7 = ((($p)) + 80|0);
+ $8 = ((($q)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_mul($r,$7,$8);
  _crypto_sign_ed25519_ref10_fe_add($t0,$r,$r);
  _crypto_sign_ed25519_ref10_fe_sub($r,$2,$1);
@@ -14067,60 +14830,60 @@ function _crypto_sign_ed25519_ref10_ge_double_scalarmult_vartime($r,$a,$A,$b) {
  _crypto_sign_ed25519_ref10_ge_p1p1_to_p3($A2,$t);
  _crypto_sign_ed25519_ref10_ge_add($t,$A2,$Ai);
  _crypto_sign_ed25519_ref10_ge_p1p1_to_p3($u,$t);
- $0 = (($Ai) + 160|0);
+ $0 = ((($Ai)) + 160|0);
  _crypto_sign_ed25519_ref10_ge_p3_to_cached($0,$u);
  _crypto_sign_ed25519_ref10_ge_add($t,$A2,$0);
  _crypto_sign_ed25519_ref10_ge_p1p1_to_p3($u,$t);
- $1 = (($Ai) + 320|0);
+ $1 = ((($Ai)) + 320|0);
  _crypto_sign_ed25519_ref10_ge_p3_to_cached($1,$u);
  _crypto_sign_ed25519_ref10_ge_add($t,$A2,$1);
  _crypto_sign_ed25519_ref10_ge_p1p1_to_p3($u,$t);
- $2 = (($Ai) + 480|0);
+ $2 = ((($Ai)) + 480|0);
  _crypto_sign_ed25519_ref10_ge_p3_to_cached($2,$u);
  _crypto_sign_ed25519_ref10_ge_add($t,$A2,$2);
  _crypto_sign_ed25519_ref10_ge_p1p1_to_p3($u,$t);
- $3 = (($Ai) + 640|0);
+ $3 = ((($Ai)) + 640|0);
  _crypto_sign_ed25519_ref10_ge_p3_to_cached($3,$u);
  _crypto_sign_ed25519_ref10_ge_add($t,$A2,$3);
  _crypto_sign_ed25519_ref10_ge_p1p1_to_p3($u,$t);
- $4 = (($Ai) + 800|0);
+ $4 = ((($Ai)) + 800|0);
  _crypto_sign_ed25519_ref10_ge_p3_to_cached($4,$u);
  _crypto_sign_ed25519_ref10_ge_add($t,$A2,$4);
  _crypto_sign_ed25519_ref10_ge_p1p1_to_p3($u,$t);
- $5 = (($Ai) + 960|0);
+ $5 = ((($Ai)) + 960|0);
  _crypto_sign_ed25519_ref10_ge_p3_to_cached($5,$u);
  _crypto_sign_ed25519_ref10_ge_add($t,$A2,$5);
  _crypto_sign_ed25519_ref10_ge_p1p1_to_p3($u,$t);
- $6 = (($Ai) + 1120|0);
+ $6 = ((($Ai)) + 1120|0);
  _crypto_sign_ed25519_ref10_ge_p3_to_cached($6,$u);
  _crypto_sign_ed25519_ref10_ge_p2_0($r);
  $i$02 = 255;
  while(1) {
-  $8 = (($aslide) + ($i$02)|0);
-  $9 = HEAP8[$8>>0]|0;
-  $10 = ($9<<24>>24)==(0);
-  if (!($10)) {
+  $7 = (($aslide) + ($i$02)|0);
+  $8 = HEAP8[$7>>0]|0;
+  $9 = ($8<<24>>24)==(0);
+  if (!($9)) {
    $i$0$lcssa = $i$02;
    break;
   }
-  $11 = (($bslide) + ($i$02)|0);
-  $12 = HEAP8[$11>>0]|0;
-  $13 = ($12<<24>>24)==(0);
+  $10 = (($bslide) + ($i$02)|0);
+  $11 = HEAP8[$10>>0]|0;
+  $12 = ($11<<24>>24)==(0);
+  if (!($12)) {
+   $i$0$lcssa = $i$02;
+   break;
+  }
   $14 = (($i$02) + -1)|0;
-  if (!($13)) {
-   $i$0$lcssa = $i$02;
-   break;
-  }
-  $7 = ($i$02|0)>(0);
-  if ($7) {
+  $15 = ($i$02|0)>(0);
+  if ($15) {
    $i$02 = $14;
   } else {
    $i$0$lcssa = $14;
    break;
   }
  }
- $15 = ($i$0$lcssa|0)>(-1);
- if ($15) {
+ $13 = ($i$0$lcssa|0)>(-1);
+ if ($13) {
   $i$11 = $i$0$lcssa;
  } else {
   STACKTOP = sp;return;
@@ -14156,7 +14919,7 @@ function _crypto_sign_ed25519_ref10_ge_double_scalarmult_vartime($r,$a,$A,$b) {
    $31 = HEAP8[$28>>0]|0;
    $32 = $31 << 24 >> 24;
    $33 = (($32|0) / 2)&-1;
-   $34 = (40 + (($33*120)|0)|0);
+   $34 = (712 + (($33*120)|0)|0);
    _crypto_sign_ed25519_ref10_ge_madd($t,$u,$34);
   } else {
    $35 = ($29<<24>>24)<(0);
@@ -14165,7 +14928,7 @@ function _crypto_sign_ed25519_ref10_ge_double_scalarmult_vartime($r,$a,$A,$b) {
     $36 = HEAP8[$28>>0]|0;
     $37 = $36 << 24 >> 24;
     $38 = (($37|0) / -2)&-1;
-    $39 = (40 + (($38*120)|0)|0);
+    $39 = (712 + (($38*120)|0)|0);
     _crypto_sign_ed25519_ref10_ge_msub($t,$u,$39);
    }
   }
@@ -14183,40 +14946,40 @@ function _crypto_sign_ed25519_ref10_ge_double_scalarmult_vartime($r,$a,$A,$b) {
 function _slide($r,$a) {
  $r = $r|0;
  $a = $a|0;
- var $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0;
- var $27 = 0, $28 = 0, $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $b$03 = 0, $exitcond = 0, $exitcond10 = 0;
- var $i$08 = 0, $i$15 = 0, $k$01 = 0, label = 0, sp = 0;
+ var $$lcssa = 0, $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0;
+ var $26 = 0, $27 = 0, $28 = 0, $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $b$03 = 0, $exitcond = 0, $exitcond9 = 0;
+ var $i$07 = 0, $i$14 = 0, $k$02 = 0, label = 0, sp = 0;
  sp = STACKTOP;
- $i$08 = 0;
+ $i$07 = 0;
  while(1) {
-  $0 = $i$08 >> 3;
+  $0 = $i$07 >> 3;
   $1 = (($a) + ($0)|0);
   $2 = HEAP8[$1>>0]|0;
   $3 = $2&255;
-  $4 = $i$08 & 7;
+  $4 = $i$07 & 7;
   $5 = $3 >>> $4;
   $6 = $5 & 1;
   $7 = $6&255;
-  $8 = (($r) + ($i$08)|0);
+  $8 = (($r) + ($i$07)|0);
   HEAP8[$8>>0] = $7;
-  $9 = (($i$08) + 1)|0;
-  $exitcond10 = ($9|0)==(256);
-  if ($exitcond10) {
-   $i$15 = 0;
+  $9 = (($i$07) + 1)|0;
+  $exitcond9 = ($9|0)==(256);
+  if ($exitcond9) {
+   $i$14 = 0;
    break;
   } else {
-   $i$08 = $9;
+   $i$07 = $9;
   }
  }
  while(1) {
-  $10 = (($r) + ($i$15)|0);
+  $10 = (($r) + ($i$14)|0);
   $11 = HEAP8[$10>>0]|0;
   $12 = ($11<<24>>24)==(0);
   L5: do {
    if (!($12)) {
     $b$03 = 1;
     while(1) {
-     $13 = (($b$03) + ($i$15))|0;
+     $13 = (($b$03) + ($i$14))|0;
      $14 = ($13|0)<(256);
      if (!($14)) {
       break L5;
@@ -14245,48 +15008,46 @@ function _slide($r,$a) {
        }
        $27 = $25&255;
        HEAP8[$10>>0] = $27;
-       $28 = ($13|0)<(256);
-       if ($28) {
-        $k$01 = $13;
-        while(1) {
-         $29 = (($r) + ($k$01)|0);
-         $30 = HEAP8[$29>>0]|0;
-         $31 = ($30<<24>>24)==(0);
-         if ($31) {
-          break;
-         }
-         HEAP8[$29>>0] = 0;
-         $32 = (($k$01) + 1)|0;
-         $33 = ($32|0)<(256);
-         if ($33) {
-          $k$01 = $32;
-         } else {
-          break L9;
-         }
+       $k$02 = $13;
+       while(1) {
+        $28 = (($r) + ($k$02)|0);
+        $29 = HEAP8[$28>>0]|0;
+        $30 = ($29<<24>>24)==(0);
+        if ($30) {
+         $$lcssa = $28;
+         break;
         }
-        HEAP8[$29>>0] = 1;
+        HEAP8[$28>>0] = 0;
+        $31 = (($k$02) + 1)|0;
+        $32 = ($31|0)<(256);
+        if ($32) {
+         $k$02 = $31;
+        } else {
+         break L9;
+        }
        }
+       HEAP8[$$lcssa>>0] = 1;
       }
      } while(0);
-     $34 = (($b$03) + 1)|0;
-     $35 = ($34|0)<(7);
-     if ($35) {
-      $b$03 = $34;
+     $33 = (($b$03) + 1)|0;
+     $34 = ($33|0)<(7);
+     if ($34) {
+      $b$03 = $33;
      } else {
       break;
      }
     }
    }
   } while(0);
-  $36 = (($i$15) + 1)|0;
-  $exitcond = ($36|0)==(256);
+  $35 = (($i$14) + 1)|0;
+  $exitcond = ($35|0)==(256);
   if ($exitcond) {
    break;
   } else {
-   $i$15 = $36;
+   $i$14 = $35;
   }
  }
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_ge_frombytes_negate_vartime($h,$s) {
  $h = $h|0;
@@ -14300,12 +15061,12 @@ function _crypto_sign_ed25519_ref10_ge_frombytes_negate_vartime($h,$s) {
  $v3 = sp + 80|0;
  $vxx = sp + 40|0;
  $check = sp;
- $0 = (($h) + 40|0);
+ $0 = ((($h)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_frombytes($0,$s);
- $1 = (($h) + 80|0);
+ $1 = ((($h)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_1($1);
  _crypto_sign_ed25519_ref10_fe_sq($u,$0);
- _crypto_sign_ed25519_ref10_fe_mul($v,$u,1000);
+ _crypto_sign_ed25519_ref10_fe_mul($v,$u,1672);
  _crypto_sign_ed25519_ref10_fe_sub($u,$u,$1);
  _crypto_sign_ed25519_ref10_fe_add($v,$v,$1);
  _crypto_sign_ed25519_ref10_fe_sq($v3,$v);
@@ -14327,7 +15088,7 @@ function _crypto_sign_ed25519_ref10_ge_frombytes_negate_vartime($h,$s) {
    $4 = (_crypto_sign_ed25519_ref10_fe_isnonzero($check)|0);
    $5 = ($4|0)==(0);
    if ($5) {
-    _crypto_sign_ed25519_ref10_fe_mul($h,$h,1040);
+    _crypto_sign_ed25519_ref10_fe_mul($h,$h,1712);
     break;
    } else {
     $$0 = -1;
@@ -14336,7 +15097,7 @@ function _crypto_sign_ed25519_ref10_ge_frombytes_negate_vartime($h,$s) {
   }
  } while(0);
  $6 = (_crypto_sign_ed25519_ref10_fe_isnegative($h)|0);
- $7 = (($s) + 31|0);
+ $7 = ((($s)) + 31|0);
  $8 = HEAP8[$7>>0]|0;
  $9 = $8&255;
  $10 = $9 >>> 7;
@@ -14344,7 +15105,7 @@ function _crypto_sign_ed25519_ref10_ge_frombytes_negate_vartime($h,$s) {
  if ($11) {
   _crypto_sign_ed25519_ref10_fe_neg($h,$h);
  }
- $12 = (($h) + 120|0);
+ $12 = ((($h)) + 120|0);
  _crypto_sign_ed25519_ref10_fe_mul($12,$h,$0);
  $$0 = 0;
  STACKTOP = sp;return ($$0|0);
@@ -14357,19 +15118,19 @@ function _crypto_sign_ed25519_ref10_ge_madd($r,$p,$q) {
  sp = STACKTOP;
  STACKTOP = STACKTOP + 48|0;
  $t0 = sp;
- $0 = (($p) + 40|0);
+ $0 = ((($p)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_add($r,$0,$p);
- $1 = (($r) + 40|0);
+ $1 = ((($r)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_sub($1,$0,$p);
- $2 = (($r) + 80|0);
+ $2 = ((($r)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_mul($2,$r,$q);
- $3 = (($q) + 40|0);
+ $3 = ((($q)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_mul($1,$1,$3);
- $4 = (($r) + 120|0);
- $5 = (($q) + 80|0);
- $6 = (($p) + 120|0);
+ $4 = ((($r)) + 120|0);
+ $5 = ((($q)) + 80|0);
+ $6 = ((($p)) + 120|0);
  _crypto_sign_ed25519_ref10_fe_mul($4,$5,$6);
- $7 = (($p) + 80|0);
+ $7 = ((($p)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_add($t0,$7,$7);
  _crypto_sign_ed25519_ref10_fe_sub($r,$2,$1);
  _crypto_sign_ed25519_ref10_fe_add($1,$2,$1);
@@ -14385,19 +15146,19 @@ function _crypto_sign_ed25519_ref10_ge_msub($r,$p,$q) {
  sp = STACKTOP;
  STACKTOP = STACKTOP + 48|0;
  $t0 = sp;
- $0 = (($p) + 40|0);
+ $0 = ((($p)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_add($r,$0,$p);
- $1 = (($r) + 40|0);
+ $1 = ((($r)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_sub($1,$0,$p);
- $2 = (($r) + 80|0);
- $3 = (($q) + 40|0);
+ $2 = ((($r)) + 80|0);
+ $3 = ((($q)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_mul($2,$r,$3);
  _crypto_sign_ed25519_ref10_fe_mul($1,$1,$q);
- $4 = (($r) + 120|0);
- $5 = (($q) + 80|0);
- $6 = (($p) + 120|0);
+ $4 = ((($r)) + 120|0);
+ $5 = ((($q)) + 80|0);
+ $6 = ((($p)) + 120|0);
  _crypto_sign_ed25519_ref10_fe_mul($4,$5,$6);
- $7 = (($p) + 80|0);
+ $7 = ((($p)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_add($t0,$7,$7);
  _crypto_sign_ed25519_ref10_fe_sub($r,$2,$1);
  _crypto_sign_ed25519_ref10_fe_add($1,$2,$1);
@@ -14410,43 +15171,43 @@ function _crypto_sign_ed25519_ref10_ge_p1p1_to_p2($r,$p) {
  $p = $p|0;
  var $0 = 0, $1 = 0, $2 = 0, $3 = 0, $4 = 0, label = 0, sp = 0;
  sp = STACKTOP;
- $0 = (($p) + 120|0);
+ $0 = ((($p)) + 120|0);
  _crypto_sign_ed25519_ref10_fe_mul($r,$p,$0);
- $1 = (($r) + 40|0);
- $2 = (($p) + 40|0);
- $3 = (($p) + 80|0);
+ $1 = ((($r)) + 40|0);
+ $2 = ((($p)) + 40|0);
+ $3 = ((($p)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_mul($1,$2,$3);
- $4 = (($r) + 80|0);
+ $4 = ((($r)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_mul($4,$3,$0);
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_ge_p1p1_to_p3($r,$p) {
  $r = $r|0;
  $p = $p|0;
  var $0 = 0, $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, label = 0, sp = 0;
  sp = STACKTOP;
- $0 = (($p) + 120|0);
+ $0 = ((($p)) + 120|0);
  _crypto_sign_ed25519_ref10_fe_mul($r,$p,$0);
- $1 = (($r) + 40|0);
- $2 = (($p) + 40|0);
- $3 = (($p) + 80|0);
+ $1 = ((($r)) + 40|0);
+ $2 = ((($p)) + 40|0);
+ $3 = ((($p)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_mul($1,$2,$3);
- $4 = (($r) + 80|0);
+ $4 = ((($r)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_mul($4,$3,$0);
- $5 = (($r) + 120|0);
+ $5 = ((($r)) + 120|0);
  _crypto_sign_ed25519_ref10_fe_mul($5,$p,$2);
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_ge_p2_0($h) {
  $h = $h|0;
  var $0 = 0, $1 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  _crypto_sign_ed25519_ref10_fe_0($h);
- $0 = (($h) + 40|0);
+ $0 = ((($h)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_1($0);
- $1 = (($h) + 80|0);
+ $1 = ((($h)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_1($1);
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_ge_p2_dbl($r,$p) {
  $r = $r|0;
@@ -14456,13 +15217,13 @@ function _crypto_sign_ed25519_ref10_ge_p2_dbl($r,$p) {
  STACKTOP = STACKTOP + 48|0;
  $t0 = sp;
  _crypto_sign_ed25519_ref10_fe_sq($r,$p);
- $0 = (($r) + 80|0);
- $1 = (($p) + 40|0);
+ $0 = ((($r)) + 80|0);
+ $1 = ((($p)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_sq($0,$1);
- $2 = (($r) + 120|0);
- $3 = (($p) + 80|0);
+ $2 = ((($r)) + 120|0);
+ $3 = ((($p)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_sq2($2,$3);
- $4 = (($r) + 40|0);
+ $4 = ((($r)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_add($4,$p,$1);
  _crypto_sign_ed25519_ref10_fe_sq($t0,$4);
  _crypto_sign_ed25519_ref10_fe_add($4,$0,$r);
@@ -14476,13 +15237,13 @@ function _crypto_sign_ed25519_ref10_ge_p3_0($h) {
  var $0 = 0, $1 = 0, $2 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  _crypto_sign_ed25519_ref10_fe_0($h);
- $0 = (($h) + 40|0);
+ $0 = ((($h)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_1($0);
- $1 = (($h) + 80|0);
+ $1 = ((($h)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_1($1);
- $2 = (($h) + 120|0);
+ $2 = ((($h)) + 120|0);
  _crypto_sign_ed25519_ref10_fe_0($2);
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_ge_p3_dbl($r,$p) {
  $r = $r|0;
@@ -14500,17 +15261,17 @@ function _crypto_sign_ed25519_ref10_ge_p3_to_cached($r,$p) {
  $p = $p|0;
  var $0 = 0, $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, label = 0, sp = 0;
  sp = STACKTOP;
- $0 = (($p) + 40|0);
+ $0 = ((($p)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_add($r,$0,$p);
- $1 = (($r) + 40|0);
+ $1 = ((($r)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_sub($1,$0,$p);
- $2 = (($r) + 80|0);
- $3 = (($p) + 80|0);
+ $2 = ((($r)) + 80|0);
+ $3 = ((($p)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_copy($2,$3);
- $4 = (($r) + 120|0);
- $5 = (($p) + 120|0);
- _crypto_sign_ed25519_ref10_fe_mul($4,$5,1080);
- STACKTOP = sp;return;
+ $4 = ((($r)) + 120|0);
+ $5 = ((($p)) + 120|0);
+ _crypto_sign_ed25519_ref10_fe_mul($4,$5,1752);
+ return;
 }
 function _crypto_sign_ed25519_ref10_ge_p3_to_p2($r,$p) {
  $r = $r|0;
@@ -14518,13 +15279,13 @@ function _crypto_sign_ed25519_ref10_ge_p3_to_p2($r,$p) {
  var $0 = 0, $1 = 0, $2 = 0, $3 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  _crypto_sign_ed25519_ref10_fe_copy($r,$p);
- $0 = (($r) + 40|0);
- $1 = (($p) + 40|0);
+ $0 = ((($r)) + 40|0);
+ $1 = ((($p)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_copy($0,$1);
- $2 = (($r) + 80|0);
- $3 = (($p) + 80|0);
+ $2 = ((($r)) + 80|0);
+ $3 = ((($p)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_copy($2,$3);
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_ge_p3_tobytes($s,$h) {
  $s = $s|0;
@@ -14535,15 +15296,15 @@ function _crypto_sign_ed25519_ref10_ge_p3_tobytes($s,$h) {
  $recip = sp + 80|0;
  $x = sp + 40|0;
  $y = sp;
- $0 = (($h) + 80|0);
+ $0 = ((($h)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_invert($recip,$0);
  _crypto_sign_ed25519_ref10_fe_mul($x,$h,$recip);
- $1 = (($h) + 40|0);
+ $1 = ((($h)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_mul($y,$1,$recip);
  _crypto_sign_ed25519_ref10_fe_tobytes($s,$y);
  $2 = (_crypto_sign_ed25519_ref10_fe_isnegative($x)|0);
  $3 = $2 << 7;
- $4 = (($s) + 31|0);
+ $4 = ((($s)) + 31|0);
  $5 = HEAP8[$4>>0]|0;
  $6 = $5&255;
  $7 = $6 ^ $3;
@@ -14556,18 +15317,18 @@ function _crypto_sign_ed25519_ref10_ge_precomp_0($h) {
  var $0 = 0, $1 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  _crypto_sign_ed25519_ref10_fe_1($h);
- $0 = (($h) + 40|0);
+ $0 = ((($h)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_1($0);
- $1 = (($h) + 80|0);
+ $1 = ((($h)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_0($1);
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_ge_scalarmult_base($h,$a) {
  $h = $h|0;
  $a = $a|0;
- var $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0;
- var $27 = 0, $28 = 0, $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $carry$04 = 0, $e = 0, $exitcond = 0, $exitcond7 = 0;
- var $i$06 = 0, $i$15 = 0, $i$23 = 0, $i$32 = 0, $r = 0, $s = 0, $sext = 0, $sext1 = 0, $t = 0, label = 0, sp = 0;
+ var $$lcssa = 0, $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0;
+ var $26 = 0, $27 = 0, $28 = 0, $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $carry$04 = 0, $e = 0, $exitcond = 0;
+ var $exitcond7 = 0, $i$06 = 0, $i$15 = 0, $i$23 = 0, $i$32 = 0, $r = 0, $s = 0, $sext = 0, $sext1 = 0, $t = 0, label = 0, sp = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 464|0;
  $e = sp + 400|0;
@@ -14613,15 +15374,16 @@ function _crypto_sign_ed25519_ref10_ge_scalarmult_base($h,$a) {
   $20 = (($i$15) + 1)|0;
   $exitcond = ($20|0)==(63);
   if ($exitcond) {
+   $$lcssa = $16;
    break;
   } else {
    $carry$04 = $16;$i$15 = $20;
   }
  }
- $21 = (($e) + 63|0);
+ $21 = ((($e)) + 63|0);
  $22 = HEAP8[$21>>0]|0;
  $23 = $22&255;
- $24 = (($23) + ($16))|0;
+ $24 = (($23) + ($$lcssa))|0;
  $25 = $24&255;
  HEAP8[$21>>0] = $25;
  _crypto_sign_ed25519_ref10_ge_p3_0($h);
@@ -14630,7 +15392,7 @@ function _crypto_sign_ed25519_ref10_ge_scalarmult_base($h,$a) {
   $26 = (($i$23|0) / 2)&-1;
   $27 = (($e) + ($i$23)|0);
   $28 = HEAP8[$27>>0]|0;
-  _select($t,$26,$28);
+  _select60($t,$26,$28);
   _crypto_sign_ed25519_ref10_ge_madd($r,$h,$t);
   _crypto_sign_ed25519_ref10_ge_p1p1_to_p3($h,$r);
   $29 = (($i$23) + 2)|0;
@@ -14654,7 +15416,7 @@ function _crypto_sign_ed25519_ref10_ge_scalarmult_base($h,$a) {
   $31 = (($i$32|0) / 2)&-1;
   $32 = (($e) + ($i$32)|0);
   $33 = HEAP8[$32>>0]|0;
-  _select($t,$31,$33);
+  _select60($t,$31,$33);
   _crypto_sign_ed25519_ref10_ge_madd($r,$h,$t);
   _crypto_sign_ed25519_ref10_ge_p1p1_to_p3($h,$r);
   $34 = (($i$32) + 2)|0;
@@ -14667,7 +15429,7 @@ function _crypto_sign_ed25519_ref10_ge_scalarmult_base($h,$a) {
  }
  STACKTOP = sp;return;
 }
-function _select($t,$pos,$b) {
+function _select60($t,$pos,$b) {
  $t = $t|0;
  $pos = $pos|0;
  $b = $b|0;
@@ -14685,36 +15447,36 @@ function _select($t,$pos,$b) {
  $6 = (($1) - ($5))|0;
  $7 = $6&255;
  _crypto_sign_ed25519_ref10_ge_precomp_0($t);
- $8 = (1120 + (($pos*960)|0)|0);
+ $8 = (1792 + (($pos*960)|0)|0);
  $9 = (_equal($7,1)|0);
  _cmov($t,$8,$9);
- $10 = ((1120 + (($pos*960)|0)|0) + 120|0);
+ $10 = (((1792 + (($pos*960)|0)|0)) + 120|0);
  $11 = (_equal($7,2)|0);
  _cmov($t,$10,$11);
- $12 = ((1120 + (($pos*960)|0)|0) + 240|0);
+ $12 = (((1792 + (($pos*960)|0)|0)) + 240|0);
  $13 = (_equal($7,3)|0);
  _cmov($t,$12,$13);
- $14 = ((1120 + (($pos*960)|0)|0) + 360|0);
+ $14 = (((1792 + (($pos*960)|0)|0)) + 360|0);
  $15 = (_equal($7,4)|0);
  _cmov($t,$14,$15);
- $16 = ((1120 + (($pos*960)|0)|0) + 480|0);
+ $16 = (((1792 + (($pos*960)|0)|0)) + 480|0);
  $17 = (_equal($7,5)|0);
  _cmov($t,$16,$17);
- $18 = ((1120 + (($pos*960)|0)|0) + 600|0);
+ $18 = (((1792 + (($pos*960)|0)|0)) + 600|0);
  $19 = (_equal($7,6)|0);
  _cmov($t,$18,$19);
- $20 = ((1120 + (($pos*960)|0)|0) + 720|0);
+ $20 = (((1792 + (($pos*960)|0)|0)) + 720|0);
  $21 = (_equal($7,7)|0);
  _cmov($t,$20,$21);
- $22 = ((1120 + (($pos*960)|0)|0) + 840|0);
+ $22 = (((1792 + (($pos*960)|0)|0)) + 840|0);
  $23 = (_equal($7,8)|0);
  _cmov($t,$22,$23);
- $24 = (($t) + 40|0);
+ $24 = ((($t)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_copy($minust,$24);
- $25 = (($minust) + 40|0);
+ $25 = ((($minust)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_copy($25,$t);
- $26 = (($minust) + 80|0);
- $27 = (($t) + 80|0);
+ $26 = ((($minust)) + 80|0);
+ $27 = ((($t)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_neg($26,$27);
  _cmov($t,$minust,$0);
  STACKTOP = sp;return;
@@ -14729,7 +15491,7 @@ function _negative($b) {
  $3 = (_bitshift64Lshr(($0|0),($2|0),63)|0);
  $4 = tempRet0;
  $5 = $3&255;
- STACKTOP = sp;return ($5|0);
+ return ($5|0);
 }
 function _equal($b,$c) {
  $b = $b|0;
@@ -14741,7 +15503,7 @@ function _equal($b,$c) {
  $2 = (($1) + -1)|0;
  $3 = $2 >>> 31;
  $4 = $3&255;
- STACKTOP = sp;return ($4|0);
+ return ($4|0);
 }
 function _cmov($t,$u,$b) {
  $t = $t|0;
@@ -14751,13 +15513,13 @@ function _cmov($t,$u,$b) {
  sp = STACKTOP;
  $0 = $b&255;
  _crypto_sign_ed25519_ref10_fe_cmov($t,$u,$0);
- $1 = (($t) + 40|0);
- $2 = (($u) + 40|0);
+ $1 = ((($t)) + 40|0);
+ $2 = ((($u)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_cmov($1,$2,$0);
- $3 = (($t) + 80|0);
- $4 = (($u) + 80|0);
+ $3 = ((($t)) + 80|0);
+ $4 = ((($u)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_cmov($3,$4,$0);
- STACKTOP = sp;return;
+ return;
 }
 function _crypto_sign_ed25519_ref10_ge_sub($r,$p,$q) {
  $r = $r|0;
@@ -14767,20 +15529,20 @@ function _crypto_sign_ed25519_ref10_ge_sub($r,$p,$q) {
  sp = STACKTOP;
  STACKTOP = STACKTOP + 48|0;
  $t0 = sp;
- $0 = (($p) + 40|0);
+ $0 = ((($p)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_add($r,$0,$p);
- $1 = (($r) + 40|0);
+ $1 = ((($r)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_sub($1,$0,$p);
- $2 = (($r) + 80|0);
- $3 = (($q) + 40|0);
+ $2 = ((($r)) + 80|0);
+ $3 = ((($q)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_mul($2,$r,$3);
  _crypto_sign_ed25519_ref10_fe_mul($1,$1,$q);
- $4 = (($r) + 120|0);
- $5 = (($q) + 120|0);
- $6 = (($p) + 120|0);
+ $4 = ((($r)) + 120|0);
+ $5 = ((($q)) + 120|0);
+ $6 = ((($p)) + 120|0);
  _crypto_sign_ed25519_ref10_fe_mul($4,$5,$6);
- $7 = (($p) + 80|0);
- $8 = (($q) + 80|0);
+ $7 = ((($p)) + 80|0);
+ $8 = ((($q)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_mul($r,$7,$8);
  _crypto_sign_ed25519_ref10_fe_add($t0,$r,$r);
  _crypto_sign_ed25519_ref10_fe_sub($r,$2,$1);
@@ -14798,15 +15560,15 @@ function _crypto_sign_ed25519_ref10_ge_tobytes($s,$h) {
  $recip = sp + 80|0;
  $x = sp + 40|0;
  $y = sp;
- $0 = (($h) + 80|0);
+ $0 = ((($h)) + 80|0);
  _crypto_sign_ed25519_ref10_fe_invert($recip,$0);
  _crypto_sign_ed25519_ref10_fe_mul($x,$h,$recip);
- $1 = (($h) + 40|0);
+ $1 = ((($h)) + 40|0);
  _crypto_sign_ed25519_ref10_fe_mul($y,$1,$recip);
  _crypto_sign_ed25519_ref10_fe_tobytes($s,$y);
  $2 = (_crypto_sign_ed25519_ref10_fe_isnegative($x)|0);
  $3 = $2 << 7;
- $4 = (($s) + 31|0);
+ $4 = ((($s)) + 31|0);
  $5 = HEAP8[$4>>0]|0;
  $6 = $5&255;
  $7 = $6 ^ $3;
@@ -14826,9 +15588,9 @@ function _crypto_sign_edwards25519sha512batch_ref10_open($m,$mlen,$sm,$0,$1,$pk)
  sp = STACKTOP;
  STACKTOP = STACKTOP + 480|0;
  $pkcopy1 = sp + 440|0;
- $rcopy = sp + 408|0;
- $scopy = sp + 376|0;
- $h = sp + 312|0;
+ $rcopy = sp + 344|0;
+ $scopy = sp + 312|0;
+ $h = sp + 376|0;
  $rcheck = sp + 280|0;
  $A = sp + 120|0;
  $R = sp;
@@ -14838,20 +15600,20 @@ function _crypto_sign_edwards25519sha512batch_ref10_open($m,$mlen,$sm,$0,$1,$pk)
  $5 = $4 & $3;
  $6 = $2 | $5;
  if (!($6)) {
-  $7 = (($sm) + 63|0);
+  $7 = ((($sm)) + 63|0);
   $8 = HEAP8[$7>>0]|0;
   $9 = ($8&255)>(31);
   if (!($9)) {
    $10 = (_crypto_sign_ed25519_ref10_ge_frombytes_negate_vartime($A,$pk)|0);
    $11 = ($10|0)==(0);
    if ($11) {
-    dest=$pkcopy1+0|0; src=$pk+0|0; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
-    dest=$rcopy+0|0; src=$sm+0|0; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
-    $12 = (($sm) + 32|0);
-    dest=$scopy+0|0; src=$12+0|0; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
+    dest=$pkcopy1; src=$pk; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
+    dest=$rcopy; src=$sm; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
+    $12 = ((($sm)) + 32|0);
+    dest=$scopy; src=$12; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
     _memmove(($m|0),($sm|0),($0|0))|0;
-    $13 = (($m) + 32|0);
-    dest=$13+0|0; src=$pkcopy1+0|0; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
+    $13 = ((($m)) + 32|0);
+    dest=$13; src=$pkcopy1; stop=dest+32|0; do { HEAP8[dest>>0]=HEAP8[src>>0]|0; dest=dest+1|0; src=src+1|0; } while ((dest|0) < (stop|0));
     (_crypto_hash_sha512_ref($h,$m,$0,$1)|0);
     _crypto_sign_ed25519_ref10_sc_reduce($h);
     _crypto_sign_ed25519_ref10_ge_double_scalarmult_vartime($R,$h,$A,$scopy);
@@ -14859,13 +15621,13 @@ function _crypto_sign_edwards25519sha512batch_ref10_open($m,$mlen,$sm,$0,$1,$pk)
     $14 = (_crypto_verify_32_ref($rcheck,$rcopy)|0);
     $15 = ($14|0)==(0);
     if ($15) {
-     $16 = (($m) + 64|0);
+     $16 = ((($m)) + 64|0);
      $17 = (_i64Add(($0|0),($1|0),-64,-1)|0);
      $18 = tempRet0;
      _memmove(($m|0),($16|0),($17|0))|0;
      $$sum = (($0) + -64)|0;
      $19 = (($m) + ($$sum)|0);
-     dest=$19+0|0; stop=dest+64|0; do { HEAP8[dest>>0]=0|0; dest=dest+1|0; } while ((dest|0) < (stop|0));
+     dest=$19; stop=dest+64|0; do { HEAP8[dest>>0]=0|0; dest=dest+1|0; } while ((dest|0) < (stop|0));
      $20 = $mlen;
      $21 = $20;
      HEAP32[$21>>2] = $17;
@@ -14992,65 +15754,65 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $0 = (_load_347($a)|0);
  $1 = tempRet0;
  $2 = $0 & 2097151;
- $3 = (($a) + 2|0);
+ $3 = ((($a)) + 2|0);
  $4 = (_load_448($3)|0);
  $5 = tempRet0;
  $6 = (_bitshift64Lshr(($4|0),($5|0),5)|0);
  $7 = tempRet0;
  $8 = $6 & 2097151;
- $9 = (($a) + 5|0);
+ $9 = ((($a)) + 5|0);
  $10 = (_load_347($9)|0);
  $11 = tempRet0;
  $12 = (_bitshift64Lshr(($10|0),($11|0),2)|0);
  $13 = tempRet0;
  $14 = $12 & 2097151;
- $15 = (($a) + 7|0);
+ $15 = ((($a)) + 7|0);
  $16 = (_load_448($15)|0);
  $17 = tempRet0;
  $18 = (_bitshift64Lshr(($16|0),($17|0),7)|0);
  $19 = tempRet0;
  $20 = $18 & 2097151;
- $21 = (($a) + 10|0);
+ $21 = ((($a)) + 10|0);
  $22 = (_load_448($21)|0);
  $23 = tempRet0;
  $24 = (_bitshift64Lshr(($22|0),($23|0),4)|0);
  $25 = tempRet0;
  $26 = $24 & 2097151;
- $27 = (($a) + 13|0);
+ $27 = ((($a)) + 13|0);
  $28 = (_load_347($27)|0);
  $29 = tempRet0;
  $30 = (_bitshift64Lshr(($28|0),($29|0),1)|0);
  $31 = tempRet0;
  $32 = $30 & 2097151;
- $33 = (($a) + 15|0);
+ $33 = ((($a)) + 15|0);
  $34 = (_load_448($33)|0);
  $35 = tempRet0;
  $36 = (_bitshift64Lshr(($34|0),($35|0),6)|0);
  $37 = tempRet0;
  $38 = $36 & 2097151;
- $39 = (($a) + 18|0);
+ $39 = ((($a)) + 18|0);
  $40 = (_load_347($39)|0);
  $41 = tempRet0;
  $42 = (_bitshift64Lshr(($40|0),($41|0),3)|0);
  $43 = tempRet0;
  $44 = $42 & 2097151;
- $45 = (($a) + 21|0);
+ $45 = ((($a)) + 21|0);
  $46 = (_load_347($45)|0);
  $47 = tempRet0;
  $48 = $46 & 2097151;
- $49 = (($a) + 23|0);
+ $49 = ((($a)) + 23|0);
  $50 = (_load_448($49)|0);
  $51 = tempRet0;
  $52 = (_bitshift64Lshr(($50|0),($51|0),5)|0);
  $53 = tempRet0;
  $54 = $52 & 2097151;
- $55 = (($a) + 26|0);
+ $55 = ((($a)) + 26|0);
  $56 = (_load_347($55)|0);
  $57 = tempRet0;
  $58 = (_bitshift64Lshr(($56|0),($57|0),2)|0);
  $59 = tempRet0;
  $60 = $58 & 2097151;
- $61 = (($a) + 28|0);
+ $61 = ((($a)) + 28|0);
  $62 = (_load_448($61)|0);
  $63 = tempRet0;
  $64 = (_bitshift64Lshr(($62|0),($63|0),7)|0);
@@ -15058,65 +15820,65 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $66 = (_load_347($b)|0);
  $67 = tempRet0;
  $68 = $66 & 2097151;
- $69 = (($b) + 2|0);
+ $69 = ((($b)) + 2|0);
  $70 = (_load_448($69)|0);
  $71 = tempRet0;
  $72 = (_bitshift64Lshr(($70|0),($71|0),5)|0);
  $73 = tempRet0;
  $74 = $72 & 2097151;
- $75 = (($b) + 5|0);
+ $75 = ((($b)) + 5|0);
  $76 = (_load_347($75)|0);
  $77 = tempRet0;
  $78 = (_bitshift64Lshr(($76|0),($77|0),2)|0);
  $79 = tempRet0;
  $80 = $78 & 2097151;
- $81 = (($b) + 7|0);
+ $81 = ((($b)) + 7|0);
  $82 = (_load_448($81)|0);
  $83 = tempRet0;
  $84 = (_bitshift64Lshr(($82|0),($83|0),7)|0);
  $85 = tempRet0;
  $86 = $84 & 2097151;
- $87 = (($b) + 10|0);
+ $87 = ((($b)) + 10|0);
  $88 = (_load_448($87)|0);
  $89 = tempRet0;
  $90 = (_bitshift64Lshr(($88|0),($89|0),4)|0);
  $91 = tempRet0;
  $92 = $90 & 2097151;
- $93 = (($b) + 13|0);
+ $93 = ((($b)) + 13|0);
  $94 = (_load_347($93)|0);
  $95 = tempRet0;
  $96 = (_bitshift64Lshr(($94|0),($95|0),1)|0);
  $97 = tempRet0;
  $98 = $96 & 2097151;
- $99 = (($b) + 15|0);
+ $99 = ((($b)) + 15|0);
  $100 = (_load_448($99)|0);
  $101 = tempRet0;
  $102 = (_bitshift64Lshr(($100|0),($101|0),6)|0);
  $103 = tempRet0;
  $104 = $102 & 2097151;
- $105 = (($b) + 18|0);
+ $105 = ((($b)) + 18|0);
  $106 = (_load_347($105)|0);
  $107 = tempRet0;
  $108 = (_bitshift64Lshr(($106|0),($107|0),3)|0);
  $109 = tempRet0;
  $110 = $108 & 2097151;
- $111 = (($b) + 21|0);
+ $111 = ((($b)) + 21|0);
  $112 = (_load_347($111)|0);
  $113 = tempRet0;
  $114 = $112 & 2097151;
- $115 = (($b) + 23|0);
+ $115 = ((($b)) + 23|0);
  $116 = (_load_448($115)|0);
  $117 = tempRet0;
  $118 = (_bitshift64Lshr(($116|0),($117|0),5)|0);
  $119 = tempRet0;
  $120 = $118 & 2097151;
- $121 = (($b) + 26|0);
+ $121 = ((($b)) + 26|0);
  $122 = (_load_347($121)|0);
  $123 = tempRet0;
  $124 = (_bitshift64Lshr(($122|0),($123|0),2)|0);
  $125 = tempRet0;
  $126 = $124 & 2097151;
- $127 = (($b) + 28|0);
+ $127 = ((($b)) + 28|0);
  $128 = (_load_448($127)|0);
  $129 = tempRet0;
  $130 = (_bitshift64Lshr(($128|0),($129|0),7)|0);
@@ -15124,65 +15886,65 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $132 = (_load_347($c)|0);
  $133 = tempRet0;
  $134 = $132 & 2097151;
- $135 = (($c) + 2|0);
+ $135 = ((($c)) + 2|0);
  $136 = (_load_448($135)|0);
  $137 = tempRet0;
  $138 = (_bitshift64Lshr(($136|0),($137|0),5)|0);
  $139 = tempRet0;
  $140 = $138 & 2097151;
- $141 = (($c) + 5|0);
+ $141 = ((($c)) + 5|0);
  $142 = (_load_347($141)|0);
  $143 = tempRet0;
  $144 = (_bitshift64Lshr(($142|0),($143|0),2)|0);
  $145 = tempRet0;
  $146 = $144 & 2097151;
- $147 = (($c) + 7|0);
+ $147 = ((($c)) + 7|0);
  $148 = (_load_448($147)|0);
  $149 = tempRet0;
  $150 = (_bitshift64Lshr(($148|0),($149|0),7)|0);
  $151 = tempRet0;
  $152 = $150 & 2097151;
- $153 = (($c) + 10|0);
+ $153 = ((($c)) + 10|0);
  $154 = (_load_448($153)|0);
  $155 = tempRet0;
  $156 = (_bitshift64Lshr(($154|0),($155|0),4)|0);
  $157 = tempRet0;
  $158 = $156 & 2097151;
- $159 = (($c) + 13|0);
+ $159 = ((($c)) + 13|0);
  $160 = (_load_347($159)|0);
  $161 = tempRet0;
  $162 = (_bitshift64Lshr(($160|0),($161|0),1)|0);
  $163 = tempRet0;
  $164 = $162 & 2097151;
- $165 = (($c) + 15|0);
+ $165 = ((($c)) + 15|0);
  $166 = (_load_448($165)|0);
  $167 = tempRet0;
  $168 = (_bitshift64Lshr(($166|0),($167|0),6)|0);
  $169 = tempRet0;
  $170 = $168 & 2097151;
- $171 = (($c) + 18|0);
+ $171 = ((($c)) + 18|0);
  $172 = (_load_347($171)|0);
  $173 = tempRet0;
  $174 = (_bitshift64Lshr(($172|0),($173|0),3)|0);
  $175 = tempRet0;
  $176 = $174 & 2097151;
- $177 = (($c) + 21|0);
+ $177 = ((($c)) + 21|0);
  $178 = (_load_347($177)|0);
  $179 = tempRet0;
  $180 = $178 & 2097151;
- $181 = (($c) + 23|0);
+ $181 = ((($c)) + 23|0);
  $182 = (_load_448($181)|0);
  $183 = tempRet0;
  $184 = (_bitshift64Lshr(($182|0),($183|0),5)|0);
  $185 = tempRet0;
  $186 = $184 & 2097151;
- $187 = (($c) + 26|0);
+ $187 = ((($c)) + 26|0);
  $188 = (_load_347($187)|0);
  $189 = tempRet0;
  $190 = (_bitshift64Lshr(($188|0),($189|0),2)|0);
  $191 = tempRet0;
  $192 = $190 & 2097151;
- $193 = (($c) + 28|0);
+ $193 = ((($c)) + 28|0);
  $194 = (_load_448($193)|0);
  $195 = tempRet0;
  $196 = (_bitshift64Lshr(($194|0),($195|0),7)|0);
@@ -15745,721 +16507,721 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $753 = tempRet0;
  $754 = (_bitshift64Shl(($726|0),($727|0),21)|0);
  $755 = tempRet0;
- $756 = (_i64Add(($466|0),($467|0),1048576,0)|0);
+ $756 = (_i64Subtract(($400|0),($401|0),($754|0),($755|0))|0);
  $757 = tempRet0;
- $758 = (_bitshift64Ashr(($756|0),($757|0),21)|0);
+ $758 = (_i64Add(($466|0),($467|0),1048576,0)|0);
  $759 = tempRet0;
- $760 = (_i64Add(($484|0),($485|0),($486|0),($487|0))|0);
+ $760 = (_bitshift64Ashr(($758|0),($759|0),21)|0);
  $761 = tempRet0;
- $762 = (_i64Add(($760|0),($761|0),($482|0),($483|0))|0);
+ $762 = (_i64Add(($484|0),($485|0),($486|0),($487|0))|0);
  $763 = tempRet0;
- $764 = (_i64Add(($762|0),($763|0),($480|0),($481|0))|0);
+ $764 = (_i64Add(($762|0),($763|0),($482|0),($483|0))|0);
  $765 = tempRet0;
- $766 = (_i64Add(($764|0),($765|0),($478|0),($479|0))|0);
+ $766 = (_i64Add(($764|0),($765|0),($480|0),($481|0))|0);
  $767 = tempRet0;
- $768 = (_i64Add(($766|0),($767|0),($474|0),($475|0))|0);
+ $768 = (_i64Add(($766|0),($767|0),($478|0),($479|0))|0);
  $769 = tempRet0;
- $770 = (_i64Add(($768|0),($769|0),($476|0),($477|0))|0);
+ $770 = (_i64Add(($768|0),($769|0),($474|0),($475|0))|0);
  $771 = tempRet0;
- $772 = (_i64Add(($770|0),($771|0),($472|0),($473|0))|0);
+ $772 = (_i64Add(($770|0),($771|0),($476|0),($477|0))|0);
  $773 = tempRet0;
- $774 = (_i64Add(($772|0),($773|0),($470|0),($471|0))|0);
+ $774 = (_i64Add(($772|0),($773|0),($472|0),($473|0))|0);
  $775 = tempRet0;
- $776 = (_i64Add(($774|0),($775|0),($468|0),($469|0))|0);
+ $776 = (_i64Add(($774|0),($775|0),($470|0),($471|0))|0);
  $777 = tempRet0;
- $778 = (_i64Add(($776|0),($777|0),($758|0),($759|0))|0);
+ $778 = (_i64Add(($776|0),($777|0),($468|0),($469|0))|0);
  $779 = tempRet0;
- $780 = (_bitshift64Shl(($758|0),($759|0),21)|0);
+ $780 = (_i64Add(($778|0),($779|0),($760|0),($761|0))|0);
  $781 = tempRet0;
- $782 = (_i64Add(($520|0),($521|0),1048576,0)|0);
+ $782 = (_bitshift64Shl(($760|0),($761|0),21)|0);
  $783 = tempRet0;
- $784 = (_bitshift64Ashr(($782|0),($783|0),21)|0);
+ $784 = (_i64Subtract(($466|0),($467|0),($782|0),($783|0))|0);
  $785 = tempRet0;
- $786 = (_i64Add(($534|0),($535|0),($536|0),($537|0))|0);
+ $786 = (_i64Add(($520|0),($521|0),1048576,0)|0);
  $787 = tempRet0;
- $788 = (_i64Add(($786|0),($787|0),($532|0),($533|0))|0);
+ $788 = (_bitshift64Ashr(($786|0),($787|0),21)|0);
  $789 = tempRet0;
- $790 = (_i64Add(($788|0),($789|0),($528|0),($529|0))|0);
+ $790 = (_i64Add(($534|0),($535|0),($536|0),($537|0))|0);
  $791 = tempRet0;
- $792 = (_i64Add(($790|0),($791|0),($530|0),($531|0))|0);
+ $792 = (_i64Add(($790|0),($791|0),($532|0),($533|0))|0);
  $793 = tempRet0;
- $794 = (_i64Add(($792|0),($793|0),($526|0),($527|0))|0);
+ $794 = (_i64Add(($792|0),($793|0),($528|0),($529|0))|0);
  $795 = tempRet0;
- $796 = (_i64Add(($794|0),($795|0),($524|0),($525|0))|0);
+ $796 = (_i64Add(($794|0),($795|0),($530|0),($531|0))|0);
  $797 = tempRet0;
- $798 = (_i64Add(($796|0),($797|0),($522|0),($523|0))|0);
+ $798 = (_i64Add(($796|0),($797|0),($526|0),($527|0))|0);
  $799 = tempRet0;
- $800 = (_i64Add(($798|0),($799|0),($784|0),($785|0))|0);
+ $800 = (_i64Add(($798|0),($799|0),($524|0),($525|0))|0);
  $801 = tempRet0;
- $802 = (_bitshift64Shl(($784|0),($785|0),21)|0);
+ $802 = (_i64Add(($800|0),($801|0),($522|0),($523|0))|0);
  $803 = tempRet0;
- $804 = (_i64Add(($562|0),($563|0),1048576,0)|0);
+ $804 = (_i64Add(($802|0),($803|0),($788|0),($789|0))|0);
  $805 = tempRet0;
- $806 = (_bitshift64Ashr(($804|0),($805|0),21)|0);
+ $806 = (_bitshift64Shl(($788|0),($789|0),21)|0);
  $807 = tempRet0;
- $808 = (_i64Add(($570|0),($571|0),($574|0),($575|0))|0);
+ $808 = (_i64Subtract(($520|0),($521|0),($806|0),($807|0))|0);
  $809 = tempRet0;
- $810 = (_i64Add(($808|0),($809|0),($572|0),($573|0))|0);
+ $810 = (_i64Add(($562|0),($563|0),1048576,0)|0);
  $811 = tempRet0;
- $812 = (_i64Add(($810|0),($811|0),($568|0),($569|0))|0);
+ $812 = (_bitshift64Ashr(($810|0),($811|0),21)|0);
  $813 = tempRet0;
- $814 = (_i64Add(($812|0),($813|0),($566|0),($567|0))|0);
+ $814 = (_i64Add(($570|0),($571|0),($574|0),($575|0))|0);
  $815 = tempRet0;
- $816 = (_i64Add(($814|0),($815|0),($564|0),($565|0))|0);
+ $816 = (_i64Add(($814|0),($815|0),($572|0),($573|0))|0);
  $817 = tempRet0;
- $818 = (_i64Add(($816|0),($817|0),($806|0),($807|0))|0);
+ $818 = (_i64Add(($816|0),($817|0),($568|0),($569|0))|0);
  $819 = tempRet0;
- $820 = (_bitshift64Shl(($806|0),($807|0),21)|0);
+ $820 = (_i64Add(($818|0),($819|0),($566|0),($567|0))|0);
  $821 = tempRet0;
- $822 = (_i64Add(($592|0),($593|0),1048576,0)|0);
+ $822 = (_i64Add(($820|0),($821|0),($564|0),($565|0))|0);
  $823 = tempRet0;
- $824 = (_bitshift64Ashr(($822|0),($823|0),21)|0);
+ $824 = (_i64Add(($822|0),($823|0),($812|0),($813|0))|0);
  $825 = tempRet0;
- $826 = (_i64Add(($598|0),($599|0),($600|0),($601|0))|0);
+ $826 = (_bitshift64Shl(($812|0),($813|0),21)|0);
  $827 = tempRet0;
- $828 = (_i64Add(($826|0),($827|0),($596|0),($597|0))|0);
+ $828 = (_i64Subtract(($562|0),($563|0),($826|0),($827|0))|0);
  $829 = tempRet0;
- $830 = (_i64Add(($828|0),($829|0),($594|0),($595|0))|0);
+ $830 = (_i64Add(($592|0),($593|0),1048576,0)|0);
  $831 = tempRet0;
- $832 = (_i64Add(($830|0),($831|0),($824|0),($825|0))|0);
+ $832 = (_bitshift64Ashr(($830|0),($831|0),21)|0);
  $833 = tempRet0;
- $834 = (_bitshift64Shl(($824|0),($825|0),21)|0);
+ $834 = (_i64Add(($598|0),($599|0),($600|0),($601|0))|0);
  $835 = tempRet0;
- $836 = (_i64Subtract(($592|0),($593|0),($834|0),($835|0))|0);
+ $836 = (_i64Add(($834|0),($835|0),($596|0),($597|0))|0);
  $837 = tempRet0;
- $838 = (_i64Add(($610|0),($611|0),1048576,0)|0);
+ $838 = (_i64Add(($836|0),($837|0),($594|0),($595|0))|0);
  $839 = tempRet0;
- $840 = (_bitshift64Lshr(($838|0),($839|0),21)|0);
+ $840 = (_i64Add(($838|0),($839|0),($832|0),($833|0))|0);
  $841 = tempRet0;
- $842 = (_i64Add(($616|0),($617|0),($840|0),($841|0))|0);
+ $842 = (_bitshift64Shl(($832|0),($833|0),21)|0);
  $843 = tempRet0;
- $844 = (_bitshift64Shl(($840|0),($841|0),21)|0);
+ $844 = (_i64Subtract(($592|0),($593|0),($842|0),($843|0))|0);
  $845 = tempRet0;
- $846 = (_i64Subtract(($610|0),($611|0),($844|0),($845|0))|0);
+ $846 = (_i64Add(($610|0),($611|0),1048576,0)|0);
  $847 = tempRet0;
- $848 = (_i64Add(($618|0),($619|0),1048576,0)|0);
+ $848 = (_bitshift64Lshr(($846|0),($847|0),21)|0);
  $849 = tempRet0;
- $850 = (_bitshift64Lshr(($848|0),($849|0),21)|0);
+ $850 = (_i64Add(($616|0),($617|0),($848|0),($849|0))|0);
  $851 = tempRet0;
- $852 = (_bitshift64Shl(($850|0),($851|0),21)|0);
+ $852 = (_bitshift64Shl(($848|0),($849|0),21)|0);
  $853 = tempRet0;
- $854 = (_i64Subtract(($618|0),($619|0),($852|0),($853|0))|0);
+ $854 = (_i64Subtract(($610|0),($611|0),($852|0),($853|0))|0);
  $855 = tempRet0;
- $856 = (_i64Add(($628|0),($629|0),1048576,0)|0);
+ $856 = (_i64Add(($618|0),($619|0),1048576,0)|0);
  $857 = tempRet0;
  $858 = (_bitshift64Lshr(($856|0),($857|0),21)|0);
  $859 = tempRet0;
  $860 = (_bitshift64Shl(($858|0),($859|0),21)|0);
  $861 = tempRet0;
- $862 = (_i64Subtract(($628|0),($629|0),($860|0),($861|0))|0);
+ $862 = (_i64Subtract(($618|0),($619|0),($860|0),($861|0))|0);
  $863 = tempRet0;
- $864 = (_i64Add(($646|0),($647|0),1048576,0)|0);
+ $864 = (_i64Add(($628|0),($629|0),1048576,0)|0);
  $865 = tempRet0;
- $866 = (_bitshift64Ashr(($864|0),($865|0),21)|0);
+ $866 = (_bitshift64Lshr(($864|0),($865|0),21)|0);
  $867 = tempRet0;
- $868 = (_i64Add(($670|0),($671|0),($866|0),($867|0))|0);
+ $868 = (_bitshift64Shl(($866|0),($867|0),21)|0);
  $869 = tempRet0;
- $870 = (_bitshift64Shl(($866|0),($867|0),21)|0);
+ $870 = (_i64Subtract(($628|0),($629|0),($868|0),($869|0))|0);
  $871 = tempRet0;
- $872 = (_i64Subtract(($646|0),($647|0),($870|0),($871|0))|0);
+ $872 = (_i64Add(($646|0),($647|0),1048576,0)|0);
  $873 = tempRet0;
- $874 = (_i64Add(($666|0),($667|0),1048576,0)|0);
+ $874 = (_bitshift64Ashr(($872|0),($873|0),21)|0);
  $875 = tempRet0;
- $876 = (_bitshift64Ashr(($874|0),($875|0),21)|0);
+ $876 = (_i64Add(($874|0),($875|0),($670|0),($671|0))|0);
  $877 = tempRet0;
- $878 = (_bitshift64Shl(($876|0),($877|0),21)|0);
+ $878 = (_bitshift64Shl(($874|0),($875|0),21)|0);
  $879 = tempRet0;
- $880 = (_i64Subtract(($666|0),($667|0),($878|0),($879|0))|0);
+ $880 = (_i64Subtract(($646|0),($647|0),($878|0),($879|0))|0);
  $881 = tempRet0;
- $882 = (_i64Add(($692|0),($693|0),1048576,0)|0);
+ $882 = (_i64Add(($666|0),($667|0),1048576,0)|0);
  $883 = tempRet0;
  $884 = (_bitshift64Ashr(($882|0),($883|0),21)|0);
  $885 = tempRet0;
  $886 = (_bitshift64Shl(($884|0),($885|0),21)|0);
  $887 = tempRet0;
- $888 = (_i64Add(($720|0),($721|0),1048576,0)|0);
+ $888 = (_i64Subtract(($666|0),($667|0),($886|0),($887|0))|0);
  $889 = tempRet0;
- $890 = (_bitshift64Ashr(($888|0),($889|0),21)|0);
+ $890 = (_i64Add(($692|0),($693|0),1048576,0)|0);
  $891 = tempRet0;
- $892 = (_bitshift64Shl(($890|0),($891|0),21)|0);
+ $892 = (_bitshift64Ashr(($890|0),($891|0),21)|0);
  $893 = tempRet0;
- $894 = (_i64Add(($752|0),($753|0),1048576,0)|0);
+ $894 = (_bitshift64Shl(($892|0),($893|0),21)|0);
  $895 = tempRet0;
- $896 = (_bitshift64Ashr(($894|0),($895|0),21)|0);
+ $896 = (_i64Add(($720|0),($721|0),1048576,0)|0);
  $897 = tempRet0;
- $898 = (_bitshift64Shl(($896|0),($897|0),21)|0);
+ $898 = (_bitshift64Ashr(($896|0),($897|0),21)|0);
  $899 = tempRet0;
- $900 = (_i64Add(($778|0),($779|0),1048576,0)|0);
+ $900 = (_i64Add(($898|0),($899|0),($756|0),($757|0))|0);
  $901 = tempRet0;
- $902 = (_bitshift64Ashr(($900|0),($901|0),21)|0);
+ $902 = (_bitshift64Shl(($898|0),($899|0),21)|0);
  $903 = tempRet0;
- $904 = (_bitshift64Shl(($902|0),($903|0),21)|0);
+ $904 = (_i64Subtract(($720|0),($721|0),($902|0),($903|0))|0);
  $905 = tempRet0;
- $906 = (_i64Add(($800|0),($801|0),1048576,0)|0);
+ $906 = (_i64Add(($752|0),($753|0),1048576,0)|0);
  $907 = tempRet0;
  $908 = (_bitshift64Ashr(($906|0),($907|0),21)|0);
  $909 = tempRet0;
- $910 = (_bitshift64Shl(($908|0),($909|0),21)|0);
+ $910 = (_i64Add(($784|0),($785|0),($908|0),($909|0))|0);
  $911 = tempRet0;
- $912 = (_i64Add(($818|0),($819|0),1048576,0)|0);
+ $912 = (_bitshift64Shl(($908|0),($909|0),21)|0);
  $913 = tempRet0;
- $914 = (_bitshift64Ashr(($912|0),($913|0),21)|0);
+ $914 = (_i64Subtract(($752|0),($753|0),($912|0),($913|0))|0);
  $915 = tempRet0;
- $916 = (_i64Add(($914|0),($915|0),($836|0),($837|0))|0);
+ $916 = (_i64Add(($780|0),($781|0),1048576,0)|0);
  $917 = tempRet0;
- $918 = (_bitshift64Shl(($914|0),($915|0),21)|0);
+ $918 = (_bitshift64Ashr(($916|0),($917|0),21)|0);
  $919 = tempRet0;
- $920 = (_i64Subtract(($818|0),($819|0),($918|0),($919|0))|0);
+ $920 = (_i64Add(($808|0),($809|0),($918|0),($919|0))|0);
  $921 = tempRet0;
- $922 = (_i64Add(($832|0),($833|0),1048576,0)|0);
+ $922 = (_bitshift64Shl(($918|0),($919|0),21)|0);
  $923 = tempRet0;
- $924 = (_bitshift64Ashr(($922|0),($923|0),21)|0);
+ $924 = (_i64Subtract(($780|0),($781|0),($922|0),($923|0))|0);
  $925 = tempRet0;
- $926 = (_i64Add(($924|0),($925|0),($846|0),($847|0))|0);
+ $926 = (_i64Add(($804|0),($805|0),1048576,0)|0);
  $927 = tempRet0;
- $928 = (_bitshift64Shl(($924|0),($925|0),21)|0);
+ $928 = (_bitshift64Ashr(($926|0),($927|0),21)|0);
  $929 = tempRet0;
- $930 = (_i64Subtract(($832|0),($833|0),($928|0),($929|0))|0);
+ $930 = (_i64Add(($828|0),($829|0),($928|0),($929|0))|0);
  $931 = tempRet0;
- $932 = (_i64Add(($842|0),($843|0),1048576,0)|0);
+ $932 = (_bitshift64Shl(($928|0),($929|0),21)|0);
  $933 = tempRet0;
- $934 = (_bitshift64Lshr(($932|0),($933|0),21)|0);
+ $934 = (_i64Subtract(($804|0),($805|0),($932|0),($933|0))|0);
  $935 = tempRet0;
- $936 = (_i64Add(($934|0),($935|0),($854|0),($855|0))|0);
+ $936 = (_i64Add(($824|0),($825|0),1048576,0)|0);
  $937 = tempRet0;
- $938 = (_bitshift64Shl(($934|0),($935|0),21)|0);
+ $938 = (_bitshift64Ashr(($936|0),($937|0),21)|0);
  $939 = tempRet0;
- $940 = (_i64Subtract(($842|0),($843|0),($938|0),($939|0))|0);
+ $940 = (_i64Add(($938|0),($939|0),($844|0),($845|0))|0);
  $941 = tempRet0;
- $942 = (___muldi3(($850|0),($851|0),666643,0)|0);
+ $942 = (_bitshift64Shl(($938|0),($939|0),21)|0);
  $943 = tempRet0;
- $944 = (___muldi3(($850|0),($851|0),470296,0)|0);
+ $944 = (_i64Subtract(($824|0),($825|0),($942|0),($943|0))|0);
  $945 = tempRet0;
- $946 = (___muldi3(($850|0),($851|0),654183,0)|0);
+ $946 = (_i64Add(($840|0),($841|0),1048576,0)|0);
  $947 = tempRet0;
- $948 = (___muldi3(($850|0),($851|0),-997805,-1)|0);
+ $948 = (_bitshift64Ashr(($946|0),($947|0),21)|0);
  $949 = tempRet0;
- $950 = (___muldi3(($850|0),($851|0),136657,0)|0);
+ $950 = (_i64Add(($948|0),($949|0),($854|0),($855|0))|0);
  $951 = tempRet0;
- $952 = (___muldi3(($850|0),($851|0),-683901,-1)|0);
+ $952 = (_bitshift64Shl(($948|0),($949|0),21)|0);
  $953 = tempRet0;
- $954 = (_i64Add(($952|0),($953|0),($562|0),($563|0))|0);
+ $954 = (_i64Subtract(($840|0),($841|0),($952|0),($953|0))|0);
  $955 = tempRet0;
- $956 = (_i64Subtract(($954|0),($955|0),($820|0),($821|0))|0);
+ $956 = (_i64Add(($850|0),($851|0),1048576,0)|0);
  $957 = tempRet0;
- $958 = (_i64Add(($956|0),($957|0),($908|0),($909|0))|0);
+ $958 = (_bitshift64Lshr(($956|0),($957|0),21)|0);
  $959 = tempRet0;
- $960 = (___muldi3(($936|0),($937|0),666643,0)|0);
+ $960 = (_i64Add(($958|0),($959|0),($862|0),($863|0))|0);
  $961 = tempRet0;
- $962 = (___muldi3(($936|0),($937|0),470296,0)|0);
+ $962 = (_bitshift64Shl(($958|0),($959|0),21)|0);
  $963 = tempRet0;
- $964 = (___muldi3(($936|0),($937|0),654183,0)|0);
+ $964 = (_i64Subtract(($850|0),($851|0),($962|0),($963|0))|0);
  $965 = tempRet0;
- $966 = (___muldi3(($936|0),($937|0),-997805,-1)|0);
+ $966 = (___muldi3(($858|0),($859|0),666643,0)|0);
  $967 = tempRet0;
- $968 = (___muldi3(($936|0),($937|0),136657,0)|0);
+ $968 = (_i64Add(($966|0),($967|0),($914|0),($915|0))|0);
  $969 = tempRet0;
- $970 = (___muldi3(($936|0),($937|0),-683901,-1)|0);
+ $970 = (___muldi3(($858|0),($859|0),470296,0)|0);
  $971 = tempRet0;
- $972 = (___muldi3(($940|0),($941|0),666643,0)|0);
+ $972 = (_i64Add(($970|0),($971|0),($910|0),($911|0))|0);
  $973 = tempRet0;
- $974 = (___muldi3(($940|0),($941|0),470296,0)|0);
+ $974 = (___muldi3(($858|0),($859|0),654183,0)|0);
  $975 = tempRet0;
- $976 = (___muldi3(($940|0),($941|0),654183,0)|0);
+ $976 = (_i64Add(($974|0),($975|0),($924|0),($925|0))|0);
  $977 = tempRet0;
- $978 = (___muldi3(($940|0),($941|0),-997805,-1)|0);
+ $978 = (___muldi3(($858|0),($859|0),-997805,-1)|0);
  $979 = tempRet0;
- $980 = (___muldi3(($940|0),($941|0),136657,0)|0);
+ $980 = (_i64Add(($978|0),($979|0),($920|0),($921|0))|0);
  $981 = tempRet0;
- $982 = (___muldi3(($940|0),($941|0),-683901,-1)|0);
+ $982 = (___muldi3(($858|0),($859|0),136657,0)|0);
  $983 = tempRet0;
- $984 = (_i64Add(($948|0),($949|0),($520|0),($521|0))|0);
+ $984 = (_i64Add(($982|0),($983|0),($934|0),($935|0))|0);
  $985 = tempRet0;
- $986 = (_i64Subtract(($984|0),($985|0),($802|0),($803|0))|0);
+ $986 = (___muldi3(($858|0),($859|0),-683901,-1)|0);
  $987 = tempRet0;
- $988 = (_i64Add(($986|0),($987|0),($902|0),($903|0))|0);
+ $988 = (_i64Add(($930|0),($931|0),($986|0),($987|0))|0);
  $989 = tempRet0;
- $990 = (_i64Add(($988|0),($989|0),($968|0),($969|0))|0);
+ $990 = (___muldi3(($960|0),($961|0),666643,0)|0);
  $991 = tempRet0;
- $992 = (_i64Add(($990|0),($991|0),($982|0),($983|0))|0);
+ $992 = (_i64Add(($990|0),($991|0),($900|0),($901|0))|0);
  $993 = tempRet0;
- $994 = (___muldi3(($926|0),($927|0),666643,0)|0);
+ $994 = (___muldi3(($960|0),($961|0),470296,0)|0);
  $995 = tempRet0;
- $996 = (___muldi3(($926|0),($927|0),470296,0)|0);
+ $996 = (_i64Add(($994|0),($995|0),($968|0),($969|0))|0);
  $997 = tempRet0;
- $998 = (___muldi3(($926|0),($927|0),654183,0)|0);
+ $998 = (___muldi3(($960|0),($961|0),654183,0)|0);
  $999 = tempRet0;
- $1000 = (___muldi3(($926|0),($927|0),-997805,-1)|0);
+ $1000 = (_i64Add(($998|0),($999|0),($972|0),($973|0))|0);
  $1001 = tempRet0;
- $1002 = (___muldi3(($926|0),($927|0),136657,0)|0);
+ $1002 = (___muldi3(($960|0),($961|0),-997805,-1)|0);
  $1003 = tempRet0;
- $1004 = (___muldi3(($926|0),($927|0),-683901,-1)|0);
+ $1004 = (_i64Add(($1002|0),($1003|0),($976|0),($977|0))|0);
  $1005 = tempRet0;
- $1006 = (___muldi3(($930|0),($931|0),666643,0)|0);
+ $1006 = (___muldi3(($960|0),($961|0),136657,0)|0);
  $1007 = tempRet0;
- $1008 = (___muldi3(($930|0),($931|0),470296,0)|0);
+ $1008 = (_i64Add(($1006|0),($1007|0),($980|0),($981|0))|0);
  $1009 = tempRet0;
- $1010 = (___muldi3(($930|0),($931|0),654183,0)|0);
+ $1010 = (___muldi3(($960|0),($961|0),-683901,-1)|0);
  $1011 = tempRet0;
- $1012 = (___muldi3(($930|0),($931|0),-997805,-1)|0);
+ $1012 = (_i64Add(($984|0),($985|0),($1010|0),($1011|0))|0);
  $1013 = tempRet0;
- $1014 = (___muldi3(($930|0),($931|0),136657,0)|0);
+ $1014 = (___muldi3(($964|0),($965|0),666643,0)|0);
  $1015 = tempRet0;
- $1016 = (___muldi3(($930|0),($931|0),-683901,-1)|0);
+ $1016 = (_i64Add(($1014|0),($1015|0),($904|0),($905|0))|0);
  $1017 = tempRet0;
- $1018 = (_i64Add(($944|0),($945|0),($466|0),($467|0))|0);
+ $1018 = (___muldi3(($964|0),($965|0),470296,0)|0);
  $1019 = tempRet0;
- $1020 = (_i64Subtract(($1018|0),($1019|0),($780|0),($781|0))|0);
+ $1020 = (_i64Add(($1018|0),($1019|0),($992|0),($993|0))|0);
  $1021 = tempRet0;
- $1022 = (_i64Add(($1020|0),($1021|0),($964|0),($965|0))|0);
+ $1022 = (___muldi3(($964|0),($965|0),654183,0)|0);
  $1023 = tempRet0;
- $1024 = (_i64Add(($1022|0),($1023|0),($1002|0),($1003|0))|0);
+ $1024 = (_i64Add(($1022|0),($1023|0),($996|0),($997|0))|0);
  $1025 = tempRet0;
- $1026 = (_i64Add(($1024|0),($1025|0),($978|0),($979|0))|0);
+ $1026 = (___muldi3(($964|0),($965|0),-997805,-1)|0);
  $1027 = tempRet0;
- $1028 = (_i64Add(($1026|0),($1027|0),($1016|0),($1017|0))|0);
+ $1028 = (_i64Add(($1026|0),($1027|0),($1000|0),($1001|0))|0);
  $1029 = tempRet0;
- $1030 = (_i64Add(($1028|0),($1029|0),($896|0),($897|0))|0);
+ $1030 = (___muldi3(($964|0),($965|0),136657,0)|0);
  $1031 = tempRet0;
- $1032 = (___muldi3(($916|0),($917|0),666643,0)|0);
+ $1032 = (_i64Add(($1030|0),($1031|0),($1004|0),($1005|0))|0);
  $1033 = tempRet0;
- $1034 = (_i64Add(($1032|0),($1033|0),($284|0),($285|0))|0);
+ $1034 = (___muldi3(($964|0),($965|0),-683901,-1)|0);
  $1035 = tempRet0;
- $1036 = (_i64Subtract(($1034|0),($1035|0),($694|0),($695|0))|0);
+ $1036 = (_i64Add(($1008|0),($1009|0),($1034|0),($1035|0))|0);
  $1037 = tempRet0;
- $1038 = (_i64Add(($1036|0),($1037|0),($876|0),($877|0))|0);
+ $1038 = (___muldi3(($950|0),($951|0),666643,0)|0);
  $1039 = tempRet0;
- $1040 = (___muldi3(($916|0),($917|0),470296,0)|0);
+ $1040 = (___muldi3(($950|0),($951|0),470296,0)|0);
  $1041 = tempRet0;
- $1042 = (___muldi3(($916|0),($917|0),654183,0)|0);
+ $1042 = (_i64Add(($1040|0),($1041|0),($1016|0),($1017|0))|0);
  $1043 = tempRet0;
- $1044 = (_i64Add(($994|0),($995|0),($336|0),($337|0))|0);
+ $1044 = (___muldi3(($950|0),($951|0),654183,0)|0);
  $1045 = tempRet0;
- $1046 = (_i64Add(($1044|0),($1045|0),($1042|0),($1043|0))|0);
+ $1046 = (_i64Add(($1044|0),($1045|0),($1020|0),($1021|0))|0);
  $1047 = tempRet0;
- $1048 = (_i64Add(($1046|0),($1047|0),($1008|0),($1009|0))|0);
+ $1048 = (___muldi3(($950|0),($951|0),-997805,-1)|0);
  $1049 = tempRet0;
- $1050 = (_i64Subtract(($1048|0),($1049|0),($722|0),($723|0))|0);
+ $1050 = (_i64Add(($1048|0),($1049|0),($1024|0),($1025|0))|0);
  $1051 = tempRet0;
- $1052 = (_i64Add(($1050|0),($1051|0),($884|0),($885|0))|0);
+ $1052 = (___muldi3(($950|0),($951|0),136657,0)|0);
  $1053 = tempRet0;
- $1054 = (___muldi3(($916|0),($917|0),-997805,-1)|0);
+ $1054 = (_i64Add(($1052|0),($1053|0),($1028|0),($1029|0))|0);
  $1055 = tempRet0;
- $1056 = (___muldi3(($916|0),($917|0),136657,0)|0);
+ $1056 = (___muldi3(($950|0),($951|0),-683901,-1)|0);
  $1057 = tempRet0;
- $1058 = (_i64Add(($998|0),($999|0),($960|0),($961|0))|0);
+ $1058 = (_i64Add(($1032|0),($1033|0),($1056|0),($1057|0))|0);
  $1059 = tempRet0;
- $1060 = (_i64Add(($1058|0),($1059|0),($1056|0),($1057|0))|0);
+ $1060 = (___muldi3(($954|0),($955|0),666643,0)|0);
  $1061 = tempRet0;
- $1062 = (_i64Add(($1060|0),($1061|0),($974|0),($975|0))|0);
+ $1062 = (___muldi3(($954|0),($955|0),470296,0)|0);
  $1063 = tempRet0;
- $1064 = (_i64Add(($1062|0),($1063|0),($1012|0),($1013|0))|0);
+ $1064 = (___muldi3(($954|0),($955|0),654183,0)|0);
  $1065 = tempRet0;
- $1066 = (_i64Add(($1064|0),($1065|0),($400|0),($401|0))|0);
+ $1066 = (_i64Add(($1064|0),($1065|0),($1042|0),($1043|0))|0);
  $1067 = tempRet0;
- $1068 = (_i64Add(($1066|0),($1067|0),($890|0),($891|0))|0);
+ $1068 = (___muldi3(($954|0),($955|0),-997805,-1)|0);
  $1069 = tempRet0;
- $1070 = (_i64Subtract(($1068|0),($1069|0),($754|0),($755|0))|0);
+ $1070 = (_i64Add(($1046|0),($1047|0),($1068|0),($1069|0))|0);
  $1071 = tempRet0;
- $1072 = (___muldi3(($916|0),($917|0),-683901,-1)|0);
+ $1072 = (___muldi3(($954|0),($955|0),136657,0)|0);
  $1073 = tempRet0;
- $1074 = (_i64Add(($1038|0),($1039|0),1048576,0)|0);
+ $1074 = (_i64Add(($1072|0),($1073|0),($1050|0),($1051|0))|0);
  $1075 = tempRet0;
- $1076 = (_bitshift64Ashr(($1074|0),($1075|0),21)|0);
+ $1076 = (___muldi3(($954|0),($955|0),-683901,-1)|0);
  $1077 = tempRet0;
- $1078 = (_i64Add(($1006|0),($1007|0),($1040|0),($1041|0))|0);
+ $1078 = (_i64Add(($1054|0),($1055|0),($1076|0),($1077|0))|0);
  $1079 = tempRet0;
- $1080 = (_i64Add(($1078|0),($1079|0),($692|0),($693|0))|0);
+ $1080 = (___muldi3(($940|0),($941|0),666643,0)|0);
  $1081 = tempRet0;
- $1082 = (_i64Subtract(($1080|0),($1081|0),($886|0),($887|0))|0);
+ $1082 = (_i64Add(($284|0),($285|0),($1080|0),($1081|0))|0);
  $1083 = tempRet0;
- $1084 = (_i64Add(($1082|0),($1083|0),($1076|0),($1077|0))|0);
+ $1084 = (_i64Add(($1082|0),($1083|0),($884|0),($885|0))|0);
  $1085 = tempRet0;
- $1086 = (_bitshift64Shl(($1076|0),($1077|0),21)|0);
+ $1086 = (_i64Subtract(($1084|0),($1085|0),($694|0),($695|0))|0);
  $1087 = tempRet0;
- $1088 = (_i64Add(($1052|0),($1053|0),1048576,0)|0);
+ $1088 = (___muldi3(($940|0),($941|0),470296,0)|0);
  $1089 = tempRet0;
- $1090 = (_bitshift64Ashr(($1088|0),($1089|0),21)|0);
+ $1090 = (___muldi3(($940|0),($941|0),654183,0)|0);
  $1091 = tempRet0;
- $1092 = (_i64Add(($1054|0),($1055|0),($996|0),($997|0))|0);
+ $1092 = (_i64Add(($1062|0),($1063|0),($1038|0),($1039|0))|0);
  $1093 = tempRet0;
- $1094 = (_i64Add(($1092|0),($1093|0),($972|0),($973|0))|0);
+ $1094 = (_i64Add(($1092|0),($1093|0),($1090|0),($1091|0))|0);
  $1095 = tempRet0;
- $1096 = (_i64Add(($1094|0),($1095|0),($1010|0),($1011|0))|0);
+ $1096 = (_i64Add(($1094|0),($1095|0),($336|0),($337|0))|0);
  $1097 = tempRet0;
- $1098 = (_i64Add(($1096|0),($1097|0),($720|0),($721|0))|0);
+ $1098 = (_i64Add(($1096|0),($1097|0),($892|0),($893|0))|0);
  $1099 = tempRet0;
- $1100 = (_i64Subtract(($1098|0),($1099|0),($892|0),($893|0))|0);
+ $1100 = (_i64Subtract(($1098|0),($1099|0),($722|0),($723|0))|0);
  $1101 = tempRet0;
- $1102 = (_i64Add(($1100|0),($1101|0),($1090|0),($1091|0))|0);
+ $1102 = (___muldi3(($940|0),($941|0),-997805,-1)|0);
  $1103 = tempRet0;
- $1104 = (_bitshift64Shl(($1090|0),($1091|0),21)|0);
+ $1104 = (_i64Add(($1066|0),($1067|0),($1102|0),($1103|0))|0);
  $1105 = tempRet0;
- $1106 = (_i64Add(($1070|0),($1071|0),1048576,0)|0);
+ $1106 = (___muldi3(($940|0),($941|0),136657,0)|0);
  $1107 = tempRet0;
- $1108 = (_bitshift64Ashr(($1106|0),($1107|0),21)|0);
+ $1108 = (_i64Add(($1070|0),($1071|0),($1106|0),($1107|0))|0);
  $1109 = tempRet0;
- $1110 = (_i64Add(($962|0),($963|0),($942|0),($943|0))|0);
+ $1110 = (___muldi3(($940|0),($941|0),-683901,-1)|0);
  $1111 = tempRet0;
- $1112 = (_i64Add(($1110|0),($1111|0),($1000|0),($1001|0))|0);
+ $1112 = (_i64Add(($1074|0),($1075|0),($1110|0),($1111|0))|0);
  $1113 = tempRet0;
- $1114 = (_i64Add(($1112|0),($1113|0),($1072|0),($1073|0))|0);
+ $1114 = (_i64Add(($1086|0),($1087|0),1048576,0)|0);
  $1115 = tempRet0;
- $1116 = (_i64Add(($1114|0),($1115|0),($976|0),($977|0))|0);
+ $1116 = (_bitshift64Ashr(($1114|0),($1115|0),21)|0);
  $1117 = tempRet0;
- $1118 = (_i64Add(($1116|0),($1117|0),($1014|0),($1015|0))|0);
+ $1118 = (_i64Add(($1088|0),($1089|0),($1060|0),($1061|0))|0);
  $1119 = tempRet0;
- $1120 = (_i64Add(($1118|0),($1119|0),($752|0),($753|0))|0);
+ $1120 = (_i64Add(($1118|0),($1119|0),($692|0),($693|0))|0);
  $1121 = tempRet0;
- $1122 = (_i64Subtract(($1120|0),($1121|0),($898|0),($899|0))|0);
+ $1122 = (_i64Subtract(($1120|0),($1121|0),($894|0),($895|0))|0);
  $1123 = tempRet0;
- $1124 = (_i64Add(($1122|0),($1123|0),($1108|0),($1109|0))|0);
+ $1124 = (_i64Add(($1122|0),($1123|0),($1116|0),($1117|0))|0);
  $1125 = tempRet0;
- $1126 = (_bitshift64Shl(($1108|0),($1109|0),21)|0);
+ $1126 = (_bitshift64Shl(($1116|0),($1117|0),21)|0);
  $1127 = tempRet0;
- $1128 = (_i64Add(($1030|0),($1031|0),1048576,0)|0);
+ $1128 = (_i64Subtract(($1086|0),($1087|0),($1126|0),($1127|0))|0);
  $1129 = tempRet0;
- $1130 = (_bitshift64Ashr(($1128|0),($1129|0),21)|0);
+ $1130 = (_i64Add(($1100|0),($1101|0),1048576,0)|0);
  $1131 = tempRet0;
- $1132 = (_i64Add(($778|0),($779|0),($946|0),($947|0))|0);
+ $1132 = (_bitshift64Ashr(($1130|0),($1131|0),21)|0);
  $1133 = tempRet0;
- $1134 = (_i64Subtract(($1132|0),($1133|0),($904|0),($905|0))|0);
+ $1134 = (_i64Add(($1104|0),($1105|0),($1132|0),($1133|0))|0);
  $1135 = tempRet0;
- $1136 = (_i64Add(($1134|0),($1135|0),($966|0),($967|0))|0);
+ $1136 = (_bitshift64Shl(($1132|0),($1133|0),21)|0);
  $1137 = tempRet0;
- $1138 = (_i64Add(($1136|0),($1137|0),($1004|0),($1005|0))|0);
+ $1138 = (_i64Subtract(($1100|0),($1101|0),($1136|0),($1137|0))|0);
  $1139 = tempRet0;
- $1140 = (_i64Add(($1138|0),($1139|0),($980|0),($981|0))|0);
+ $1140 = (_i64Add(($1108|0),($1109|0),1048576,0)|0);
  $1141 = tempRet0;
- $1142 = (_i64Add(($1140|0),($1141|0),($1130|0),($1131|0))|0);
+ $1142 = (_bitshift64Ashr(($1140|0),($1141|0),21)|0);
  $1143 = tempRet0;
- $1144 = (_bitshift64Shl(($1130|0),($1131|0),21)|0);
+ $1144 = (_i64Add(($1112|0),($1113|0),($1142|0),($1143|0))|0);
  $1145 = tempRet0;
- $1146 = (_i64Subtract(($1030|0),($1031|0),($1144|0),($1145|0))|0);
+ $1146 = (_bitshift64Shl(($1142|0),($1143|0),21)|0);
  $1147 = tempRet0;
- $1148 = (_i64Add(($992|0),($993|0),1048576,0)|0);
+ $1148 = (_i64Subtract(($1108|0),($1109|0),($1146|0),($1147|0))|0);
  $1149 = tempRet0;
- $1150 = (_bitshift64Ashr(($1148|0),($1149|0),21)|0);
+ $1150 = (_i64Add(($1078|0),($1079|0),1048576,0)|0);
  $1151 = tempRet0;
- $1152 = (_i64Add(($800|0),($801|0),($950|0),($951|0))|0);
+ $1152 = (_bitshift64Ashr(($1150|0),($1151|0),21)|0);
  $1153 = tempRet0;
- $1154 = (_i64Subtract(($1152|0),($1153|0),($910|0),($911|0))|0);
+ $1154 = (_i64Add(($1152|0),($1153|0),($1058|0),($1059|0))|0);
  $1155 = tempRet0;
- $1156 = (_i64Add(($1154|0),($1155|0),($970|0),($971|0))|0);
+ $1156 = (_bitshift64Shl(($1152|0),($1153|0),21)|0);
  $1157 = tempRet0;
- $1158 = (_i64Add(($1156|0),($1157|0),($1150|0),($1151|0))|0);
+ $1158 = (_i64Subtract(($1078|0),($1079|0),($1156|0),($1157|0))|0);
  $1159 = tempRet0;
- $1160 = (_bitshift64Shl(($1150|0),($1151|0),21)|0);
+ $1160 = (_i64Add(($1036|0),($1037|0),1048576,0)|0);
  $1161 = tempRet0;
- $1162 = (_i64Subtract(($992|0),($993|0),($1160|0),($1161|0))|0);
+ $1162 = (_bitshift64Ashr(($1160|0),($1161|0),21)|0);
  $1163 = tempRet0;
- $1164 = (_i64Add(($958|0),($959|0),1048576,0)|0);
+ $1164 = (_i64Add(($1162|0),($1163|0),($1012|0),($1013|0))|0);
  $1165 = tempRet0;
- $1166 = (_bitshift64Ashr(($1164|0),($1165|0),21)|0);
+ $1166 = (_bitshift64Shl(($1162|0),($1163|0),21)|0);
  $1167 = tempRet0;
- $1168 = (_i64Add(($1166|0),($1167|0),($920|0),($921|0))|0);
+ $1168 = (_i64Subtract(($1036|0),($1037|0),($1166|0),($1167|0))|0);
  $1169 = tempRet0;
- $1170 = (_bitshift64Shl(($1166|0),($1167|0),21)|0);
+ $1170 = (_i64Add(($988|0),($989|0),1048576,0)|0);
  $1171 = tempRet0;
- $1172 = (_i64Subtract(($958|0),($959|0),($1170|0),($1171|0))|0);
+ $1172 = (_bitshift64Ashr(($1170|0),($1171|0),21)|0);
  $1173 = tempRet0;
- $1174 = (_i64Add(($1084|0),($1085|0),1048576,0)|0);
+ $1174 = (_i64Add(($1172|0),($1173|0),($944|0),($945|0))|0);
  $1175 = tempRet0;
- $1176 = (_bitshift64Ashr(($1174|0),($1175|0),21)|0);
+ $1176 = (_bitshift64Shl(($1172|0),($1173|0),21)|0);
  $1177 = tempRet0;
- $1178 = (_bitshift64Shl(($1176|0),($1177|0),21)|0);
+ $1178 = (_i64Subtract(($988|0),($989|0),($1176|0),($1177|0))|0);
  $1179 = tempRet0;
- $1180 = (_i64Add(($1102|0),($1103|0),1048576,0)|0);
+ $1180 = (_i64Add(($1124|0),($1125|0),1048576,0)|0);
  $1181 = tempRet0;
  $1182 = (_bitshift64Ashr(($1180|0),($1181|0),21)|0);
  $1183 = tempRet0;
- $1184 = (_bitshift64Shl(($1182|0),($1183|0),21)|0);
+ $1184 = (_i64Add(($1182|0),($1183|0),($1138|0),($1139|0))|0);
  $1185 = tempRet0;
- $1186 = (_i64Add(($1124|0),($1125|0),1048576,0)|0);
+ $1186 = (_bitshift64Shl(($1182|0),($1183|0),21)|0);
  $1187 = tempRet0;
- $1188 = (_bitshift64Ashr(($1186|0),($1187|0),21)|0);
+ $1188 = (_i64Subtract(($1124|0),($1125|0),($1186|0),($1187|0))|0);
  $1189 = tempRet0;
- $1190 = (_i64Add(($1146|0),($1147|0),($1188|0),($1189|0))|0);
+ $1190 = (_i64Add(($1134|0),($1135|0),1048576,0)|0);
  $1191 = tempRet0;
- $1192 = (_bitshift64Shl(($1188|0),($1189|0),21)|0);
+ $1192 = (_bitshift64Ashr(($1190|0),($1191|0),21)|0);
  $1193 = tempRet0;
- $1194 = (_i64Subtract(($1124|0),($1125|0),($1192|0),($1193|0))|0);
+ $1194 = (_i64Add(($1192|0),($1193|0),($1148|0),($1149|0))|0);
  $1195 = tempRet0;
- $1196 = (_i64Add(($1142|0),($1143|0),1048576,0)|0);
+ $1196 = (_bitshift64Shl(($1192|0),($1193|0),21)|0);
  $1197 = tempRet0;
- $1198 = (_bitshift64Ashr(($1196|0),($1197|0),21)|0);
+ $1198 = (_i64Subtract(($1134|0),($1135|0),($1196|0),($1197|0))|0);
  $1199 = tempRet0;
- $1200 = (_i64Add(($1198|0),($1199|0),($1162|0),($1163|0))|0);
+ $1200 = (_i64Add(($1144|0),($1145|0),1048576,0)|0);
  $1201 = tempRet0;
- $1202 = (_bitshift64Shl(($1198|0),($1199|0),21)|0);
+ $1202 = (_bitshift64Ashr(($1200|0),($1201|0),21)|0);
  $1203 = tempRet0;
- $1204 = (_i64Subtract(($1142|0),($1143|0),($1202|0),($1203|0))|0);
+ $1204 = (_i64Add(($1202|0),($1203|0),($1158|0),($1159|0))|0);
  $1205 = tempRet0;
- $1206 = (_i64Add(($1158|0),($1159|0),1048576,0)|0);
+ $1206 = (_bitshift64Shl(($1202|0),($1203|0),21)|0);
  $1207 = tempRet0;
- $1208 = (_bitshift64Ashr(($1206|0),($1207|0),21)|0);
+ $1208 = (_i64Subtract(($1144|0),($1145|0),($1206|0),($1207|0))|0);
  $1209 = tempRet0;
- $1210 = (_i64Add(($1208|0),($1209|0),($1172|0),($1173|0))|0);
+ $1210 = (_i64Add(($1154|0),($1155|0),1048576,0)|0);
  $1211 = tempRet0;
- $1212 = (_bitshift64Shl(($1208|0),($1209|0),21)|0);
+ $1212 = (_bitshift64Ashr(($1210|0),($1211|0),21)|0);
  $1213 = tempRet0;
- $1214 = (_i64Subtract(($1158|0),($1159|0),($1212|0),($1213|0))|0);
+ $1214 = (_i64Add(($1212|0),($1213|0),($1168|0),($1169|0))|0);
  $1215 = tempRet0;
- $1216 = (___muldi3(($1168|0),($1169|0),666643,0)|0);
+ $1216 = (_bitshift64Shl(($1212|0),($1213|0),21)|0);
  $1217 = tempRet0;
- $1218 = (_i64Add(($880|0),($881|0),($1216|0),($1217|0))|0);
+ $1218 = (_i64Subtract(($1154|0),($1155|0),($1216|0),($1217|0))|0);
  $1219 = tempRet0;
- $1220 = (___muldi3(($1168|0),($1169|0),470296,0)|0);
+ $1220 = (_i64Add(($1164|0),($1165|0),1048576,0)|0);
  $1221 = tempRet0;
- $1222 = (___muldi3(($1168|0),($1169|0),654183,0)|0);
+ $1222 = (_bitshift64Ashr(($1220|0),($1221|0),21)|0);
  $1223 = tempRet0;
- $1224 = (___muldi3(($1168|0),($1169|0),-997805,-1)|0);
+ $1224 = (_i64Add(($1222|0),($1223|0),($1178|0),($1179|0))|0);
  $1225 = tempRet0;
- $1226 = (___muldi3(($1168|0),($1169|0),136657,0)|0);
+ $1226 = (_bitshift64Shl(($1222|0),($1223|0),21)|0);
  $1227 = tempRet0;
- $1228 = (___muldi3(($1168|0),($1169|0),-683901,-1)|0);
+ $1228 = (_i64Subtract(($1164|0),($1165|0),($1226|0),($1227|0))|0);
  $1229 = tempRet0;
- $1230 = (_i64Add(($1070|0),($1071|0),($1228|0),($1229|0))|0);
+ $1230 = (___muldi3(($1174|0),($1175|0),666643,0)|0);
  $1231 = tempRet0;
- $1232 = (_i64Subtract(($1230|0),($1231|0),($1126|0),($1127|0))|0);
+ $1232 = (_i64Add(($888|0),($889|0),($1230|0),($1231|0))|0);
  $1233 = tempRet0;
- $1234 = (_i64Add(($1232|0),($1233|0),($1182|0),($1183|0))|0);
+ $1234 = (___muldi3(($1174|0),($1175|0),470296,0)|0);
  $1235 = tempRet0;
- $1236 = (___muldi3(($1210|0),($1211|0),666643,0)|0);
+ $1236 = (_i64Add(($1234|0),($1235|0),($1128|0),($1129|0))|0);
  $1237 = tempRet0;
- $1238 = (_i64Add(($868|0),($869|0),($1236|0),($1237|0))|0);
+ $1238 = (___muldi3(($1174|0),($1175|0),654183,0)|0);
  $1239 = tempRet0;
- $1240 = (___muldi3(($1210|0),($1211|0),470296,0)|0);
+ $1240 = (_i64Add(($1238|0),($1239|0),($1188|0),($1189|0))|0);
  $1241 = tempRet0;
- $1242 = (_i64Add(($1218|0),($1219|0),($1240|0),($1241|0))|0);
+ $1242 = (___muldi3(($1174|0),($1175|0),-997805,-1)|0);
  $1243 = tempRet0;
- $1244 = (___muldi3(($1210|0),($1211|0),654183,0)|0);
+ $1244 = (_i64Add(($1242|0),($1243|0),($1184|0),($1185|0))|0);
  $1245 = tempRet0;
- $1246 = (___muldi3(($1210|0),($1211|0),-997805,-1)|0);
+ $1246 = (___muldi3(($1174|0),($1175|0),136657,0)|0);
  $1247 = tempRet0;
- $1248 = (___muldi3(($1210|0),($1211|0),136657,0)|0);
+ $1248 = (_i64Add(($1246|0),($1247|0),($1198|0),($1199|0))|0);
  $1249 = tempRet0;
- $1250 = (___muldi3(($1210|0),($1211|0),-683901,-1)|0);
+ $1250 = (___muldi3(($1174|0),($1175|0),-683901,-1)|0);
  $1251 = tempRet0;
- $1252 = (___muldi3(($1214|0),($1215|0),666643,0)|0);
+ $1252 = (_i64Add(($1194|0),($1195|0),($1250|0),($1251|0))|0);
  $1253 = tempRet0;
- $1254 = (_i64Add(($872|0),($873|0),($1252|0),($1253|0))|0);
+ $1254 = (___muldi3(($1224|0),($1225|0),666643,0)|0);
  $1255 = tempRet0;
- $1256 = (___muldi3(($1214|0),($1215|0),470296,0)|0);
+ $1256 = (_i64Add(($876|0),($877|0),($1254|0),($1255|0))|0);
  $1257 = tempRet0;
- $1258 = (_i64Add(($1238|0),($1239|0),($1256|0),($1257|0))|0);
+ $1258 = (___muldi3(($1224|0),($1225|0),470296,0)|0);
  $1259 = tempRet0;
- $1260 = (___muldi3(($1214|0),($1215|0),654183,0)|0);
+ $1260 = (_i64Add(($1232|0),($1233|0),($1258|0),($1259|0))|0);
  $1261 = tempRet0;
- $1262 = (_i64Add(($1242|0),($1243|0),($1260|0),($1261|0))|0);
+ $1262 = (___muldi3(($1224|0),($1225|0),654183,0)|0);
  $1263 = tempRet0;
- $1264 = (___muldi3(($1214|0),($1215|0),-997805,-1)|0);
+ $1264 = (_i64Add(($1236|0),($1237|0),($1262|0),($1263|0))|0);
  $1265 = tempRet0;
- $1266 = (___muldi3(($1214|0),($1215|0),136657,0)|0);
+ $1266 = (___muldi3(($1224|0),($1225|0),-997805,-1)|0);
  $1267 = tempRet0;
- $1268 = (___muldi3(($1214|0),($1215|0),-683901,-1)|0);
+ $1268 = (_i64Add(($1266|0),($1267|0),($1240|0),($1241|0))|0);
  $1269 = tempRet0;
- $1270 = (_i64Add(($1052|0),($1053|0),($1224|0),($1225|0))|0);
+ $1270 = (___muldi3(($1224|0),($1225|0),136657,0)|0);
  $1271 = tempRet0;
- $1272 = (_i64Subtract(($1270|0),($1271|0),($1104|0),($1105|0))|0);
+ $1272 = (_i64Add(($1270|0),($1271|0),($1244|0),($1245|0))|0);
  $1273 = tempRet0;
- $1274 = (_i64Add(($1272|0),($1273|0),($1176|0),($1177|0))|0);
+ $1274 = (___muldi3(($1224|0),($1225|0),-683901,-1)|0);
  $1275 = tempRet0;
- $1276 = (_i64Add(($1274|0),($1275|0),($1248|0),($1249|0))|0);
+ $1276 = (_i64Add(($1248|0),($1249|0),($1274|0),($1275|0))|0);
  $1277 = tempRet0;
- $1278 = (_i64Add(($1276|0),($1277|0),($1268|0),($1269|0))|0);
+ $1278 = (___muldi3(($1228|0),($1229|0),666643,0)|0);
  $1279 = tempRet0;
- $1280 = (___muldi3(($1200|0),($1201|0),666643,0)|0);
+ $1280 = (_i64Add(($880|0),($881|0),($1278|0),($1279|0))|0);
  $1281 = tempRet0;
- $1282 = (___muldi3(($1200|0),($1201|0),470296,0)|0);
+ $1282 = (___muldi3(($1228|0),($1229|0),470296,0)|0);
  $1283 = tempRet0;
- $1284 = (___muldi3(($1200|0),($1201|0),654183,0)|0);
+ $1284 = (_i64Add(($1256|0),($1257|0),($1282|0),($1283|0))|0);
  $1285 = tempRet0;
- $1286 = (___muldi3(($1200|0),($1201|0),-997805,-1)|0);
+ $1286 = (___muldi3(($1228|0),($1229|0),654183,0)|0);
  $1287 = tempRet0;
- $1288 = (___muldi3(($1200|0),($1201|0),136657,0)|0);
+ $1288 = (_i64Add(($1260|0),($1261|0),($1286|0),($1287|0))|0);
  $1289 = tempRet0;
- $1290 = (___muldi3(($1200|0),($1201|0),-683901,-1)|0);
+ $1290 = (___muldi3(($1228|0),($1229|0),-997805,-1)|0);
  $1291 = tempRet0;
- $1292 = (___muldi3(($1204|0),($1205|0),666643,0)|0);
+ $1292 = (_i64Add(($1264|0),($1265|0),($1290|0),($1291|0))|0);
  $1293 = tempRet0;
- $1294 = (___muldi3(($1204|0),($1205|0),470296,0)|0);
+ $1294 = (___muldi3(($1228|0),($1229|0),136657,0)|0);
  $1295 = tempRet0;
- $1296 = (___muldi3(($1204|0),($1205|0),654183,0)|0);
+ $1296 = (_i64Add(($1294|0),($1295|0),($1268|0),($1269|0))|0);
  $1297 = tempRet0;
- $1298 = (___muldi3(($1204|0),($1205|0),-997805,-1)|0);
+ $1298 = (___muldi3(($1228|0),($1229|0),-683901,-1)|0);
  $1299 = tempRet0;
- $1300 = (___muldi3(($1204|0),($1205|0),136657,0)|0);
+ $1300 = (_i64Add(($1272|0),($1273|0),($1298|0),($1299|0))|0);
  $1301 = tempRet0;
- $1302 = (___muldi3(($1204|0),($1205|0),-683901,-1)|0);
+ $1302 = (___muldi3(($1214|0),($1215|0),666643,0)|0);
  $1303 = tempRet0;
- $1304 = (_i64Add(($1038|0),($1039|0),($1220|0),($1221|0))|0);
+ $1304 = (___muldi3(($1214|0),($1215|0),470296,0)|0);
  $1305 = tempRet0;
- $1306 = (_i64Subtract(($1304|0),($1305|0),($1086|0),($1087|0))|0);
+ $1306 = (_i64Add(($1280|0),($1281|0),($1304|0),($1305|0))|0);
  $1307 = tempRet0;
- $1308 = (_i64Add(($1306|0),($1307|0),($1244|0),($1245|0))|0);
+ $1308 = (___muldi3(($1214|0),($1215|0),654183,0)|0);
  $1309 = tempRet0;
- $1310 = (_i64Add(($1308|0),($1309|0),($1264|0),($1265|0))|0);
+ $1310 = (_i64Add(($1284|0),($1285|0),($1308|0),($1309|0))|0);
  $1311 = tempRet0;
- $1312 = (_i64Add(($1310|0),($1311|0),($1288|0),($1289|0))|0);
+ $1312 = (___muldi3(($1214|0),($1215|0),-997805,-1)|0);
  $1313 = tempRet0;
- $1314 = (_i64Add(($1312|0),($1313|0),($1302|0),($1303|0))|0);
+ $1314 = (_i64Add(($1288|0),($1289|0),($1312|0),($1313|0))|0);
  $1315 = tempRet0;
- $1316 = (___muldi3(($1190|0),($1191|0),666643,0)|0);
+ $1316 = (___muldi3(($1214|0),($1215|0),136657,0)|0);
  $1317 = tempRet0;
- $1318 = (_i64Add(($1316|0),($1317|0),($632|0),($633|0))|0);
+ $1318 = (_i64Add(($1292|0),($1293|0),($1316|0),($1317|0))|0);
  $1319 = tempRet0;
- $1320 = (___muldi3(($1190|0),($1191|0),470296,0)|0);
+ $1320 = (___muldi3(($1214|0),($1215|0),-683901,-1)|0);
  $1321 = tempRet0;
- $1322 = (___muldi3(($1190|0),($1191|0),654183,0)|0);
+ $1322 = (_i64Add(($1296|0),($1297|0),($1320|0),($1321|0))|0);
  $1323 = tempRet0;
- $1324 = (_i64Add(($858|0),($859|0),($216|0),($217|0))|0);
+ $1324 = (___muldi3(($1218|0),($1219|0),666643,0)|0);
  $1325 = tempRet0;
- $1326 = (_i64Subtract(($1324|0),($1325|0),($648|0),($649|0))|0);
+ $1326 = (___muldi3(($1218|0),($1219|0),470296,0)|0);
  $1327 = tempRet0;
- $1328 = (_i64Add(($1326|0),($1327|0),($1322|0),($1323|0))|0);
+ $1328 = (___muldi3(($1218|0),($1219|0),654183,0)|0);
  $1329 = tempRet0;
- $1330 = (_i64Add(($1328|0),($1329|0),($1280|0),($1281|0))|0);
+ $1330 = (_i64Add(($1306|0),($1307|0),($1328|0),($1329|0))|0);
  $1331 = tempRet0;
- $1332 = (_i64Add(($1330|0),($1331|0),($1294|0),($1295|0))|0);
+ $1332 = (___muldi3(($1218|0),($1219|0),-997805,-1)|0);
  $1333 = tempRet0;
- $1334 = (___muldi3(($1190|0),($1191|0),-997805,-1)|0);
+ $1334 = (_i64Add(($1310|0),($1311|0),($1332|0),($1333|0))|0);
  $1335 = tempRet0;
- $1336 = (___muldi3(($1190|0),($1191|0),136657,0)|0);
+ $1336 = (___muldi3(($1218|0),($1219|0),136657,0)|0);
  $1337 = tempRet0;
- $1338 = (_i64Add(($1258|0),($1259|0),($1336|0),($1337|0))|0);
+ $1338 = (_i64Add(($1314|0),($1315|0),($1336|0),($1337|0))|0);
  $1339 = tempRet0;
- $1340 = (_i64Add(($1338|0),($1339|0),($1284|0),($1285|0))|0);
+ $1340 = (___muldi3(($1218|0),($1219|0),-683901,-1)|0);
  $1341 = tempRet0;
- $1342 = (_i64Add(($1340|0),($1341|0),($1298|0),($1299|0))|0);
+ $1342 = (_i64Add(($1318|0),($1319|0),($1340|0),($1341|0))|0);
  $1343 = tempRet0;
- $1344 = (___muldi3(($1190|0),($1191|0),-683901,-1)|0);
+ $1344 = (___muldi3(($1204|0),($1205|0),666643,0)|0);
  $1345 = tempRet0;
- $1346 = (_i64Add(($1318|0),($1319|0),1048576,0)|0);
+ $1346 = (_i64Add(($1344|0),($1345|0),($632|0),($633|0))|0);
  $1347 = tempRet0;
- $1348 = (_bitshift64Ashr(($1346|0),($1347|0),21)|0);
+ $1348 = (___muldi3(($1204|0),($1205|0),470296,0)|0);
  $1349 = tempRet0;
- $1350 = (_i64Add(($862|0),($863|0),($1320|0),($1321|0))|0);
+ $1350 = (___muldi3(($1204|0),($1205|0),654183,0)|0);
  $1351 = tempRet0;
- $1352 = (_i64Add(($1350|0),($1351|0),($1292|0),($1293|0))|0);
+ $1352 = (_i64Add(($866|0),($867|0),($216|0),($217|0))|0);
  $1353 = tempRet0;
- $1354 = (_i64Add(($1352|0),($1353|0),($1348|0),($1349|0))|0);
+ $1354 = (_i64Subtract(($1352|0),($1353|0),($648|0),($649|0))|0);
  $1355 = tempRet0;
- $1356 = (_bitshift64Shl(($1348|0),($1349|0),21)|0);
+ $1356 = (_i64Add(($1354|0),($1355|0),($1302|0),($1303|0))|0);
  $1357 = tempRet0;
- $1358 = (_i64Subtract(($1318|0),($1319|0),($1356|0),($1357|0))|0);
+ $1358 = (_i64Add(($1356|0),($1357|0),($1350|0),($1351|0))|0);
  $1359 = tempRet0;
- $1360 = (_i64Add(($1332|0),($1333|0),1048576,0)|0);
+ $1360 = (_i64Add(($1358|0),($1359|0),($1326|0),($1327|0))|0);
  $1361 = tempRet0;
- $1362 = (_bitshift64Ashr(($1360|0),($1361|0),21)|0);
+ $1362 = (___muldi3(($1204|0),($1205|0),-997805,-1)|0);
  $1363 = tempRet0;
- $1364 = (_i64Add(($1254|0),($1255|0),($1334|0),($1335|0))|0);
+ $1364 = (_i64Add(($1330|0),($1331|0),($1362|0),($1363|0))|0);
  $1365 = tempRet0;
- $1366 = (_i64Add(($1364|0),($1365|0),($1282|0),($1283|0))|0);
+ $1366 = (___muldi3(($1204|0),($1205|0),136657,0)|0);
  $1367 = tempRet0;
- $1368 = (_i64Add(($1366|0),($1367|0),($1296|0),($1297|0))|0);
+ $1368 = (_i64Add(($1334|0),($1335|0),($1366|0),($1367|0))|0);
  $1369 = tempRet0;
- $1370 = (_i64Add(($1368|0),($1369|0),($1362|0),($1363|0))|0);
+ $1370 = (___muldi3(($1204|0),($1205|0),-683901,-1)|0);
  $1371 = tempRet0;
- $1372 = (_bitshift64Shl(($1362|0),($1363|0),21)|0);
+ $1372 = (_i64Add(($1338|0),($1339|0),($1370|0),($1371|0))|0);
  $1373 = tempRet0;
- $1374 = (_i64Add(($1342|0),($1343|0),1048576,0)|0);
+ $1374 = (_i64Add(($1346|0),($1347|0),1048576,0)|0);
  $1375 = tempRet0;
  $1376 = (_bitshift64Ashr(($1374|0),($1375|0),21)|0);
  $1377 = tempRet0;
- $1378 = (_i64Add(($1262|0),($1263|0),($1344|0),($1345|0))|0);
+ $1378 = (_i64Add(($870|0),($871|0),($1348|0),($1349|0))|0);
  $1379 = tempRet0;
- $1380 = (_i64Add(($1378|0),($1379|0),($1286|0),($1287|0))|0);
+ $1380 = (_i64Add(($1378|0),($1379|0),($1324|0),($1325|0))|0);
  $1381 = tempRet0;
- $1382 = (_i64Add(($1380|0),($1381|0),($1300|0),($1301|0))|0);
+ $1382 = (_i64Add(($1380|0),($1381|0),($1376|0),($1377|0))|0);
  $1383 = tempRet0;
- $1384 = (_i64Add(($1382|0),($1383|0),($1376|0),($1377|0))|0);
+ $1384 = (_bitshift64Shl(($1376|0),($1377|0),21)|0);
  $1385 = tempRet0;
- $1386 = (_bitshift64Shl(($1376|0),($1377|0),21)|0);
+ $1386 = (_i64Subtract(($1346|0),($1347|0),($1384|0),($1385|0))|0);
  $1387 = tempRet0;
- $1388 = (_i64Add(($1314|0),($1315|0),1048576,0)|0);
+ $1388 = (_i64Add(($1360|0),($1361|0),1048576,0)|0);
  $1389 = tempRet0;
  $1390 = (_bitshift64Ashr(($1388|0),($1389|0),21)|0);
  $1391 = tempRet0;
- $1392 = (_i64Add(($1084|0),($1085|0),($1222|0),($1223|0))|0);
+ $1392 = (_i64Add(($1390|0),($1391|0),($1364|0),($1365|0))|0);
  $1393 = tempRet0;
- $1394 = (_i64Add(($1392|0),($1393|0),($1246|0),($1247|0))|0);
+ $1394 = (_bitshift64Shl(($1390|0),($1391|0),21)|0);
  $1395 = tempRet0;
- $1396 = (_i64Subtract(($1394|0),($1395|0),($1178|0),($1179|0))|0);
+ $1396 = (_i64Add(($1368|0),($1369|0),1048576,0)|0);
  $1397 = tempRet0;
- $1398 = (_i64Add(($1396|0),($1397|0),($1266|0),($1267|0))|0);
+ $1398 = (_bitshift64Ashr(($1396|0),($1397|0),21)|0);
  $1399 = tempRet0;
- $1400 = (_i64Add(($1398|0),($1399|0),($1290|0),($1291|0))|0);
+ $1400 = (_i64Add(($1398|0),($1399|0),($1372|0),($1373|0))|0);
  $1401 = tempRet0;
- $1402 = (_i64Add(($1400|0),($1401|0),($1390|0),($1391|0))|0);
+ $1402 = (_bitshift64Shl(($1398|0),($1399|0),21)|0);
  $1403 = tempRet0;
- $1404 = (_bitshift64Shl(($1390|0),($1391|0),21)|0);
+ $1404 = (_i64Add(($1342|0),($1343|0),1048576,0)|0);
  $1405 = tempRet0;
- $1406 = (_i64Subtract(($1314|0),($1315|0),($1404|0),($1405|0))|0);
+ $1406 = (_bitshift64Ashr(($1404|0),($1405|0),21)|0);
  $1407 = tempRet0;
- $1408 = (_i64Add(($1278|0),($1279|0),1048576,0)|0);
+ $1408 = (_i64Add(($1406|0),($1407|0),($1322|0),($1323|0))|0);
  $1409 = tempRet0;
- $1410 = (_bitshift64Ashr(($1408|0),($1409|0),21)|0);
+ $1410 = (_bitshift64Shl(($1406|0),($1407|0),21)|0);
  $1411 = tempRet0;
- $1412 = (_i64Add(($1102|0),($1103|0),($1226|0),($1227|0))|0);
+ $1412 = (_i64Subtract(($1342|0),($1343|0),($1410|0),($1411|0))|0);
  $1413 = tempRet0;
- $1414 = (_i64Add(($1412|0),($1413|0),($1250|0),($1251|0))|0);
+ $1414 = (_i64Add(($1300|0),($1301|0),1048576,0)|0);
  $1415 = tempRet0;
- $1416 = (_i64Subtract(($1414|0),($1415|0),($1184|0),($1185|0))|0);
+ $1416 = (_bitshift64Ashr(($1414|0),($1415|0),21)|0);
  $1417 = tempRet0;
- $1418 = (_i64Add(($1416|0),($1417|0),($1410|0),($1411|0))|0);
+ $1418 = (_i64Add(($1276|0),($1277|0),($1416|0),($1417|0))|0);
  $1419 = tempRet0;
- $1420 = (_bitshift64Shl(($1410|0),($1411|0),21)|0);
+ $1420 = (_bitshift64Shl(($1416|0),($1417|0),21)|0);
  $1421 = tempRet0;
- $1422 = (_i64Subtract(($1278|0),($1279|0),($1420|0),($1421|0))|0);
+ $1422 = (_i64Subtract(($1300|0),($1301|0),($1420|0),($1421|0))|0);
  $1423 = tempRet0;
- $1424 = (_i64Add(($1234|0),($1235|0),1048576,0)|0);
+ $1424 = (_i64Add(($1252|0),($1253|0),1048576,0)|0);
  $1425 = tempRet0;
  $1426 = (_bitshift64Ashr(($1424|0),($1425|0),21)|0);
  $1427 = tempRet0;
- $1428 = (_i64Add(($1194|0),($1195|0),($1426|0),($1427|0))|0);
+ $1428 = (_i64Add(($1208|0),($1209|0),($1426|0),($1427|0))|0);
  $1429 = tempRet0;
  $1430 = (_bitshift64Shl(($1426|0),($1427|0),21)|0);
  $1431 = tempRet0;
- $1432 = (_i64Subtract(($1234|0),($1235|0),($1430|0),($1431|0))|0);
+ $1432 = (_i64Add(($1382|0),($1383|0),1048576,0)|0);
  $1433 = tempRet0;
- $1434 = (_i64Add(($1354|0),($1355|0),1048576,0)|0);
+ $1434 = (_bitshift64Ashr(($1432|0),($1433|0),21)|0);
  $1435 = tempRet0;
- $1436 = (_bitshift64Ashr(($1434|0),($1435|0),21)|0);
+ $1436 = (_bitshift64Shl(($1434|0),($1435|0),21)|0);
  $1437 = tempRet0;
- $1438 = (_bitshift64Shl(($1436|0),($1437|0),21)|0);
+ $1438 = (_i64Add(($1392|0),($1393|0),1048576,0)|0);
  $1439 = tempRet0;
- $1440 = (_i64Add(($1370|0),($1371|0),1048576,0)|0);
+ $1440 = (_bitshift64Ashr(($1438|0),($1439|0),21)|0);
  $1441 = tempRet0;
- $1442 = (_bitshift64Ashr(($1440|0),($1441|0),21)|0);
+ $1442 = (_bitshift64Shl(($1440|0),($1441|0),21)|0);
  $1443 = tempRet0;
- $1444 = (_bitshift64Shl(($1442|0),($1443|0),21)|0);
+ $1444 = (_i64Subtract(($1392|0),($1393|0),($1442|0),($1443|0))|0);
  $1445 = tempRet0;
- $1446 = (_i64Add(($1384|0),($1385|0),1048576,0)|0);
+ $1446 = (_i64Add(($1400|0),($1401|0),1048576,0)|0);
  $1447 = tempRet0;
  $1448 = (_bitshift64Ashr(($1446|0),($1447|0),21)|0);
  $1449 = tempRet0;
- $1450 = (_i64Add(($1406|0),($1407|0),($1448|0),($1449|0))|0);
+ $1450 = (_i64Add(($1412|0),($1413|0),($1448|0),($1449|0))|0);
  $1451 = tempRet0;
  $1452 = (_bitshift64Shl(($1448|0),($1449|0),21)|0);
  $1453 = tempRet0;
- $1454 = (_i64Add(($1402|0),($1403|0),1048576,0)|0);
+ $1454 = (_i64Subtract(($1400|0),($1401|0),($1452|0),($1453|0))|0);
  $1455 = tempRet0;
- $1456 = (_bitshift64Ashr(($1454|0),($1455|0),21)|0);
+ $1456 = (_i64Add(($1408|0),($1409|0),1048576,0)|0);
  $1457 = tempRet0;
- $1458 = (_i64Add(($1422|0),($1423|0),($1456|0),($1457|0))|0);
+ $1458 = (_bitshift64Ashr(($1456|0),($1457|0),21)|0);
  $1459 = tempRet0;
- $1460 = (_bitshift64Shl(($1456|0),($1457|0),21)|0);
+ $1460 = (_i64Add(($1422|0),($1423|0),($1458|0),($1459|0))|0);
  $1461 = tempRet0;
- $1462 = (_i64Subtract(($1402|0),($1403|0),($1460|0),($1461|0))|0);
+ $1462 = (_bitshift64Shl(($1458|0),($1459|0),21)|0);
  $1463 = tempRet0;
- $1464 = (_i64Add(($1418|0),($1419|0),1048576,0)|0);
+ $1464 = (_i64Subtract(($1408|0),($1409|0),($1462|0),($1463|0))|0);
  $1465 = tempRet0;
- $1466 = (_bitshift64Ashr(($1464|0),($1465|0),21)|0);
+ $1466 = (_i64Add(($1418|0),($1419|0),1048576,0)|0);
  $1467 = tempRet0;
- $1468 = (_i64Add(($1432|0),($1433|0),($1466|0),($1467|0))|0);
+ $1468 = (_bitshift64Ashr(($1466|0),($1467|0),21)|0);
  $1469 = tempRet0;
- $1470 = (_bitshift64Shl(($1466|0),($1467|0),21)|0);
+ $1470 = (_bitshift64Shl(($1468|0),($1469|0),21)|0);
  $1471 = tempRet0;
  $1472 = (_i64Subtract(($1418|0),($1419|0),($1470|0),($1471|0))|0);
  $1473 = tempRet0;
@@ -16473,7 +17235,7 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1481 = tempRet0;
  $1482 = (___muldi3(($1476|0),($1477|0),666643,0)|0);
  $1483 = tempRet0;
- $1484 = (_i64Add(($1358|0),($1359|0),($1482|0),($1483|0))|0);
+ $1484 = (_i64Add(($1386|0),($1387|0),($1482|0),($1483|0))|0);
  $1485 = tempRet0;
  $1486 = (___muldi3(($1476|0),($1477|0),470296,0)|0);
  $1487 = tempRet0;
@@ -16481,55 +17243,55 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1489 = tempRet0;
  $1490 = (___muldi3(($1476|0),($1477|0),-997805,-1)|0);
  $1491 = tempRet0;
- $1492 = (___muldi3(($1476|0),($1477|0),136657,0)|0);
+ $1492 = (_i64Add(($1444|0),($1445|0),($1490|0),($1491|0))|0);
  $1493 = tempRet0;
- $1494 = (___muldi3(($1476|0),($1477|0),-683901,-1)|0);
+ $1494 = (___muldi3(($1476|0),($1477|0),136657,0)|0);
  $1495 = tempRet0;
- $1496 = (_bitshift64Ashr(($1484|0),($1485|0),21)|0);
+ $1496 = (___muldi3(($1476|0),($1477|0),-683901,-1)|0);
  $1497 = tempRet0;
- $1498 = (_i64Add(($1486|0),($1487|0),($1354|0),($1355|0))|0);
+ $1498 = (_i64Add(($1454|0),($1455|0),($1496|0),($1497|0))|0);
  $1499 = tempRet0;
- $1500 = (_i64Subtract(($1498|0),($1499|0),($1438|0),($1439|0))|0);
+ $1500 = (_bitshift64Ashr(($1484|0),($1485|0),21)|0);
  $1501 = tempRet0;
- $1502 = (_i64Add(($1500|0),($1501|0),($1496|0),($1497|0))|0);
+ $1502 = (_i64Add(($1486|0),($1487|0),($1382|0),($1383|0))|0);
  $1503 = tempRet0;
- $1504 = (_bitshift64Shl(($1496|0),($1497|0),21)|0);
+ $1504 = (_i64Subtract(($1502|0),($1503|0),($1436|0),($1437|0))|0);
  $1505 = tempRet0;
- $1506 = (_i64Subtract(($1484|0),($1485|0),($1504|0),($1505|0))|0);
+ $1506 = (_i64Add(($1504|0),($1505|0),($1500|0),($1501|0))|0);
  $1507 = tempRet0;
- $1508 = (_bitshift64Ashr(($1502|0),($1503|0),21)|0);
+ $1508 = (_bitshift64Shl(($1500|0),($1501|0),21)|0);
  $1509 = tempRet0;
- $1510 = (_i64Add(($1488|0),($1489|0),($1332|0),($1333|0))|0);
+ $1510 = (_i64Subtract(($1484|0),($1485|0),($1508|0),($1509|0))|0);
  $1511 = tempRet0;
- $1512 = (_i64Subtract(($1510|0),($1511|0),($1372|0),($1373|0))|0);
+ $1512 = (_bitshift64Ashr(($1506|0),($1507|0),21)|0);
  $1513 = tempRet0;
- $1514 = (_i64Add(($1512|0),($1513|0),($1436|0),($1437|0))|0);
+ $1514 = (_i64Add(($1488|0),($1489|0),($1360|0),($1361|0))|0);
  $1515 = tempRet0;
- $1516 = (_i64Add(($1514|0),($1515|0),($1508|0),($1509|0))|0);
+ $1516 = (_i64Subtract(($1514|0),($1515|0),($1394|0),($1395|0))|0);
  $1517 = tempRet0;
- $1518 = (_bitshift64Shl(($1508|0),($1509|0),21)|0);
+ $1518 = (_i64Add(($1516|0),($1517|0),($1434|0),($1435|0))|0);
  $1519 = tempRet0;
- $1520 = (_i64Subtract(($1502|0),($1503|0),($1518|0),($1519|0))|0);
+ $1520 = (_i64Add(($1518|0),($1519|0),($1512|0),($1513|0))|0);
  $1521 = tempRet0;
- $1522 = (_bitshift64Ashr(($1516|0),($1517|0),21)|0);
+ $1522 = (_bitshift64Shl(($1512|0),($1513|0),21)|0);
  $1523 = tempRet0;
- $1524 = (_i64Add(($1370|0),($1371|0),($1490|0),($1491|0))|0);
+ $1524 = (_i64Subtract(($1506|0),($1507|0),($1522|0),($1523|0))|0);
  $1525 = tempRet0;
- $1526 = (_i64Subtract(($1524|0),($1525|0),($1444|0),($1445|0))|0);
+ $1526 = (_bitshift64Ashr(($1520|0),($1521|0),21)|0);
  $1527 = tempRet0;
- $1528 = (_i64Add(($1526|0),($1527|0),($1522|0),($1523|0))|0);
+ $1528 = (_i64Add(($1526|0),($1527|0),($1492|0),($1493|0))|0);
  $1529 = tempRet0;
- $1530 = (_bitshift64Shl(($1522|0),($1523|0),21)|0);
+ $1530 = (_bitshift64Shl(($1526|0),($1527|0),21)|0);
  $1531 = tempRet0;
- $1532 = (_i64Subtract(($1516|0),($1517|0),($1530|0),($1531|0))|0);
+ $1532 = (_i64Subtract(($1520|0),($1521|0),($1530|0),($1531|0))|0);
  $1533 = tempRet0;
  $1534 = (_bitshift64Ashr(($1528|0),($1529|0),21)|0);
  $1535 = tempRet0;
- $1536 = (_i64Add(($1492|0),($1493|0),($1342|0),($1343|0))|0);
+ $1536 = (_i64Add(($1494|0),($1495|0),($1368|0),($1369|0))|0);
  $1537 = tempRet0;
- $1538 = (_i64Subtract(($1536|0),($1537|0),($1386|0),($1387|0))|0);
+ $1538 = (_i64Subtract(($1536|0),($1537|0),($1402|0),($1403|0))|0);
  $1539 = tempRet0;
- $1540 = (_i64Add(($1538|0),($1539|0),($1442|0),($1443|0))|0);
+ $1540 = (_i64Add(($1538|0),($1539|0),($1440|0),($1441|0))|0);
  $1541 = tempRet0;
  $1542 = (_i64Add(($1540|0),($1541|0),($1534|0),($1535|0))|0);
  $1543 = tempRet0;
@@ -16539,55 +17301,55 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1547 = tempRet0;
  $1548 = (_bitshift64Ashr(($1542|0),($1543|0),21)|0);
  $1549 = tempRet0;
- $1550 = (_i64Add(($1384|0),($1385|0),($1494|0),($1495|0))|0);
+ $1550 = (_i64Add(($1548|0),($1549|0),($1498|0),($1499|0))|0);
  $1551 = tempRet0;
- $1552 = (_i64Subtract(($1550|0),($1551|0),($1452|0),($1453|0))|0);
+ $1552 = (_bitshift64Shl(($1548|0),($1549|0),21)|0);
  $1553 = tempRet0;
- $1554 = (_i64Add(($1552|0),($1553|0),($1548|0),($1549|0))|0);
+ $1554 = (_i64Subtract(($1542|0),($1543|0),($1552|0),($1553|0))|0);
  $1555 = tempRet0;
- $1556 = (_bitshift64Shl(($1548|0),($1549|0),21)|0);
+ $1556 = (_bitshift64Ashr(($1550|0),($1551|0),21)|0);
  $1557 = tempRet0;
- $1558 = (_i64Subtract(($1542|0),($1543|0),($1556|0),($1557|0))|0);
+ $1558 = (_i64Add(($1450|0),($1451|0),($1556|0),($1557|0))|0);
  $1559 = tempRet0;
- $1560 = (_bitshift64Ashr(($1554|0),($1555|0),21)|0);
+ $1560 = (_bitshift64Shl(($1556|0),($1557|0),21)|0);
  $1561 = tempRet0;
- $1562 = (_i64Add(($1450|0),($1451|0),($1560|0),($1561|0))|0);
+ $1562 = (_i64Subtract(($1550|0),($1551|0),($1560|0),($1561|0))|0);
  $1563 = tempRet0;
- $1564 = (_bitshift64Shl(($1560|0),($1561|0),21)|0);
+ $1564 = (_bitshift64Ashr(($1558|0),($1559|0),21)|0);
  $1565 = tempRet0;
- $1566 = (_i64Subtract(($1554|0),($1555|0),($1564|0),($1565|0))|0);
+ $1566 = (_i64Add(($1564|0),($1565|0),($1464|0),($1465|0))|0);
  $1567 = tempRet0;
- $1568 = (_bitshift64Ashr(($1562|0),($1563|0),21)|0);
+ $1568 = (_bitshift64Shl(($1564|0),($1565|0),21)|0);
  $1569 = tempRet0;
- $1570 = (_i64Add(($1568|0),($1569|0),($1462|0),($1463|0))|0);
+ $1570 = (_i64Subtract(($1558|0),($1559|0),($1568|0),($1569|0))|0);
  $1571 = tempRet0;
- $1572 = (_bitshift64Shl(($1568|0),($1569|0),21)|0);
+ $1572 = (_bitshift64Ashr(($1566|0),($1567|0),21)|0);
  $1573 = tempRet0;
- $1574 = (_i64Subtract(($1562|0),($1563|0),($1572|0),($1573|0))|0);
+ $1574 = (_i64Add(($1460|0),($1461|0),($1572|0),($1573|0))|0);
  $1575 = tempRet0;
- $1576 = (_bitshift64Ashr(($1570|0),($1571|0),21)|0);
+ $1576 = (_bitshift64Shl(($1572|0),($1573|0),21)|0);
  $1577 = tempRet0;
- $1578 = (_i64Add(($1458|0),($1459|0),($1576|0),($1577|0))|0);
+ $1578 = (_i64Subtract(($1566|0),($1567|0),($1576|0),($1577|0))|0);
  $1579 = tempRet0;
- $1580 = (_bitshift64Shl(($1576|0),($1577|0),21)|0);
+ $1580 = (_bitshift64Ashr(($1574|0),($1575|0),21)|0);
  $1581 = tempRet0;
- $1582 = (_i64Subtract(($1570|0),($1571|0),($1580|0),($1581|0))|0);
+ $1582 = (_i64Add(($1580|0),($1581|0),($1472|0),($1473|0))|0);
  $1583 = tempRet0;
- $1584 = (_bitshift64Ashr(($1578|0),($1579|0),21)|0);
+ $1584 = (_bitshift64Shl(($1580|0),($1581|0),21)|0);
  $1585 = tempRet0;
- $1586 = (_i64Add(($1584|0),($1585|0),($1472|0),($1473|0))|0);
+ $1586 = (_i64Subtract(($1574|0),($1575|0),($1584|0),($1585|0))|0);
  $1587 = tempRet0;
- $1588 = (_bitshift64Shl(($1584|0),($1585|0),21)|0);
+ $1588 = (_bitshift64Ashr(($1582|0),($1583|0),21)|0);
  $1589 = tempRet0;
- $1590 = (_i64Subtract(($1578|0),($1579|0),($1588|0),($1589|0))|0);
+ $1590 = (_i64Add(($1468|0),($1469|0),($1252|0),($1253|0))|0);
  $1591 = tempRet0;
- $1592 = (_bitshift64Ashr(($1586|0),($1587|0),21)|0);
+ $1592 = (_i64Subtract(($1590|0),($1591|0),($1430|0),($1431|0))|0);
  $1593 = tempRet0;
- $1594 = (_i64Add(($1468|0),($1469|0),($1592|0),($1593|0))|0);
+ $1594 = (_i64Add(($1592|0),($1593|0),($1588|0),($1589|0))|0);
  $1595 = tempRet0;
- $1596 = (_bitshift64Shl(($1592|0),($1593|0),21)|0);
+ $1596 = (_bitshift64Shl(($1588|0),($1589|0),21)|0);
  $1597 = tempRet0;
- $1598 = (_i64Subtract(($1586|0),($1587|0),($1596|0),($1597|0))|0);
+ $1598 = (_i64Subtract(($1582|0),($1583|0),($1596|0),($1597|0))|0);
  $1599 = tempRet0;
  $1600 = (_bitshift64Ashr(($1594|0),($1595|0),21)|0);
  $1601 = tempRet0;
@@ -16605,11 +17367,11 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1613 = tempRet0;
  $1614 = (___muldi3(($1608|0),($1609|0),666643,0)|0);
  $1615 = tempRet0;
- $1616 = (_i64Add(($1614|0),($1615|0),($1506|0),($1507|0))|0);
+ $1616 = (_i64Add(($1614|0),($1615|0),($1510|0),($1511|0))|0);
  $1617 = tempRet0;
  $1618 = (___muldi3(($1608|0),($1609|0),470296,0)|0);
  $1619 = tempRet0;
- $1620 = (_i64Add(($1520|0),($1521|0),($1618|0),($1619|0))|0);
+ $1620 = (_i64Add(($1524|0),($1525|0),($1618|0),($1619|0))|0);
  $1621 = tempRet0;
  $1622 = (___muldi3(($1608|0),($1609|0),654183,0)|0);
  $1623 = tempRet0;
@@ -16621,11 +17383,11 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1629 = tempRet0;
  $1630 = (___muldi3(($1608|0),($1609|0),136657,0)|0);
  $1631 = tempRet0;
- $1632 = (_i64Add(($1558|0),($1559|0),($1630|0),($1631|0))|0);
+ $1632 = (_i64Add(($1554|0),($1555|0),($1630|0),($1631|0))|0);
  $1633 = tempRet0;
  $1634 = (___muldi3(($1608|0),($1609|0),-683901,-1)|0);
  $1635 = tempRet0;
- $1636 = (_i64Add(($1566|0),($1567|0),($1634|0),($1635|0))|0);
+ $1636 = (_i64Add(($1562|0),($1563|0),($1634|0),($1635|0))|0);
  $1637 = tempRet0;
  $1638 = (_bitshift64Ashr(($1616|0),($1617|0),21)|0);
  $1639 = tempRet0;
@@ -16645,7 +17407,7 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1653 = tempRet0;
  $1654 = (_bitshift64Ashr(($1648|0),($1649|0),21)|0);
  $1655 = tempRet0;
- $1656 = (_i64Add(($1628|0),($1629|0),($1654|0),($1655|0))|0);
+ $1656 = (_i64Add(($1654|0),($1655|0),($1628|0),($1629|0))|0);
  $1657 = tempRet0;
  $1658 = (_bitshift64Shl(($1654|0),($1655|0),21)|0);
  $1659 = tempRet0;
@@ -16661,7 +17423,7 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1669 = tempRet0;
  $1670 = (_bitshift64Ashr(($1664|0),($1665|0),21)|0);
  $1671 = tempRet0;
- $1672 = (_i64Add(($1636|0),($1637|0),($1670|0),($1671|0))|0);
+ $1672 = (_i64Add(($1670|0),($1671|0),($1636|0),($1637|0))|0);
  $1673 = tempRet0;
  $1674 = (_bitshift64Shl(($1670|0),($1671|0),21)|0);
  $1675 = tempRet0;
@@ -16669,7 +17431,7 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1677 = tempRet0;
  $1678 = (_bitshift64Ashr(($1672|0),($1673|0),21)|0);
  $1679 = tempRet0;
- $1680 = (_i64Add(($1678|0),($1679|0),($1574|0),($1575|0))|0);
+ $1680 = (_i64Add(($1678|0),($1679|0),($1570|0),($1571|0))|0);
  $1681 = tempRet0;
  $1682 = (_bitshift64Shl(($1678|0),($1679|0),21)|0);
  $1683 = tempRet0;
@@ -16677,7 +17439,7 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1685 = tempRet0;
  $1686 = (_bitshift64Ashr(($1680|0),($1681|0),21)|0);
  $1687 = tempRet0;
- $1688 = (_i64Add(($1686|0),($1687|0),($1582|0),($1583|0))|0);
+ $1688 = (_i64Add(($1686|0),($1687|0),($1578|0),($1579|0))|0);
  $1689 = tempRet0;
  $1690 = (_bitshift64Shl(($1686|0),($1687|0),21)|0);
  $1691 = tempRet0;
@@ -16685,7 +17447,7 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1693 = tempRet0;
  $1694 = (_bitshift64Ashr(($1688|0),($1689|0),21)|0);
  $1695 = tempRet0;
- $1696 = (_i64Add(($1694|0),($1695|0),($1590|0),($1591|0))|0);
+ $1696 = (_i64Add(($1694|0),($1695|0),($1586|0),($1587|0))|0);
  $1697 = tempRet0;
  $1698 = (_bitshift64Shl(($1694|0),($1695|0),21)|0);
  $1699 = tempRet0;
@@ -16720,7 +17482,7 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1727 = (_bitshift64Lshr(($1644|0),($1645|0),8)|0);
  $1728 = tempRet0;
  $1729 = $1727&255;
- $1730 = (($s) + 1|0);
+ $1730 = ((($s)) + 1|0);
  HEAP8[$1730>>0] = $1729;
  $1731 = (_bitshift64Lshr(($1644|0),($1645|0),16)|0);
  $1732 = tempRet0;
@@ -16729,17 +17491,17 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1735 = $1733 | $1731;
  $1734 | $1732;
  $1736 = $1735&255;
- $1737 = (($s) + 2|0);
+ $1737 = ((($s)) + 2|0);
  HEAP8[$1737>>0] = $1736;
  $1738 = (_bitshift64Lshr(($1652|0),($1653|0),3)|0);
  $1739 = tempRet0;
  $1740 = $1738&255;
- $1741 = (($s) + 3|0);
+ $1741 = ((($s)) + 3|0);
  HEAP8[$1741>>0] = $1740;
  $1742 = (_bitshift64Lshr(($1652|0),($1653|0),11)|0);
  $1743 = tempRet0;
  $1744 = $1742&255;
- $1745 = (($s) + 4|0);
+ $1745 = ((($s)) + 4|0);
  HEAP8[$1745>>0] = $1744;
  $1746 = (_bitshift64Lshr(($1652|0),($1653|0),19)|0);
  $1747 = tempRet0;
@@ -16748,12 +17510,12 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1750 = $1748 | $1746;
  $1749 | $1747;
  $1751 = $1750&255;
- $1752 = (($s) + 5|0);
+ $1752 = ((($s)) + 5|0);
  HEAP8[$1752>>0] = $1751;
  $1753 = (_bitshift64Lshr(($1660|0),($1661|0),6)|0);
  $1754 = tempRet0;
  $1755 = $1753&255;
- $1756 = (($s) + 6|0);
+ $1756 = ((($s)) + 6|0);
  HEAP8[$1756>>0] = $1755;
  $1757 = (_bitshift64Lshr(($1660|0),($1661|0),14)|0);
  $1758 = tempRet0;
@@ -16762,17 +17524,17 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1761 = $1759 | $1757;
  $1760 | $1758;
  $1762 = $1761&255;
- $1763 = (($s) + 7|0);
+ $1763 = ((($s)) + 7|0);
  HEAP8[$1763>>0] = $1762;
  $1764 = (_bitshift64Lshr(($1668|0),($1669|0),1)|0);
  $1765 = tempRet0;
  $1766 = $1764&255;
- $1767 = (($s) + 8|0);
+ $1767 = ((($s)) + 8|0);
  HEAP8[$1767>>0] = $1766;
  $1768 = (_bitshift64Lshr(($1668|0),($1669|0),9)|0);
  $1769 = tempRet0;
  $1770 = $1768&255;
- $1771 = (($s) + 9|0);
+ $1771 = ((($s)) + 9|0);
  HEAP8[$1771>>0] = $1770;
  $1772 = (_bitshift64Lshr(($1668|0),($1669|0),17)|0);
  $1773 = tempRet0;
@@ -16781,17 +17543,17 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1776 = $1774 | $1772;
  $1775 | $1773;
  $1777 = $1776&255;
- $1778 = (($s) + 10|0);
+ $1778 = ((($s)) + 10|0);
  HEAP8[$1778>>0] = $1777;
  $1779 = (_bitshift64Lshr(($1676|0),($1677|0),4)|0);
  $1780 = tempRet0;
  $1781 = $1779&255;
- $1782 = (($s) + 11|0);
+ $1782 = ((($s)) + 11|0);
  HEAP8[$1782>>0] = $1781;
  $1783 = (_bitshift64Lshr(($1676|0),($1677|0),12)|0);
  $1784 = tempRet0;
  $1785 = $1783&255;
- $1786 = (($s) + 12|0);
+ $1786 = ((($s)) + 12|0);
  HEAP8[$1786>>0] = $1785;
  $1787 = (_bitshift64Lshr(($1676|0),($1677|0),20)|0);
  $1788 = tempRet0;
@@ -16800,12 +17562,12 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1791 = $1789 | $1787;
  $1790 | $1788;
  $1792 = $1791&255;
- $1793 = (($s) + 13|0);
+ $1793 = ((($s)) + 13|0);
  HEAP8[$1793>>0] = $1792;
  $1794 = (_bitshift64Lshr(($1684|0),($1685|0),7)|0);
  $1795 = tempRet0;
  $1796 = $1794&255;
- $1797 = (($s) + 14|0);
+ $1797 = ((($s)) + 14|0);
  HEAP8[$1797>>0] = $1796;
  $1798 = (_bitshift64Lshr(($1684|0),($1685|0),15)|0);
  $1799 = tempRet0;
@@ -16814,17 +17576,17 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1802 = $1800 | $1798;
  $1801 | $1799;
  $1803 = $1802&255;
- $1804 = (($s) + 15|0);
+ $1804 = ((($s)) + 15|0);
  HEAP8[$1804>>0] = $1803;
  $1805 = (_bitshift64Lshr(($1692|0),($1693|0),2)|0);
  $1806 = tempRet0;
  $1807 = $1805&255;
- $1808 = (($s) + 16|0);
+ $1808 = ((($s)) + 16|0);
  HEAP8[$1808>>0] = $1807;
  $1809 = (_bitshift64Lshr(($1692|0),($1693|0),10)|0);
  $1810 = tempRet0;
  $1811 = $1809&255;
- $1812 = (($s) + 17|0);
+ $1812 = ((($s)) + 17|0);
  HEAP8[$1812>>0] = $1811;
  $1813 = (_bitshift64Lshr(($1692|0),($1693|0),18)|0);
  $1814 = tempRet0;
@@ -16833,25 +17595,25 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1817 = $1815 | $1813;
  $1816 | $1814;
  $1818 = $1817&255;
- $1819 = (($s) + 18|0);
+ $1819 = ((($s)) + 18|0);
  HEAP8[$1819>>0] = $1818;
  $1820 = (_bitshift64Lshr(($1700|0),($1701|0),5)|0);
  $1821 = tempRet0;
  $1822 = $1820&255;
- $1823 = (($s) + 19|0);
+ $1823 = ((($s)) + 19|0);
  HEAP8[$1823>>0] = $1822;
  $1824 = (_bitshift64Lshr(($1700|0),($1701|0),13)|0);
  $1825 = tempRet0;
  $1826 = $1824&255;
- $1827 = (($s) + 20|0);
+ $1827 = ((($s)) + 20|0);
  HEAP8[$1827>>0] = $1826;
  $1828 = $1708&255;
- $1829 = (($s) + 21|0);
+ $1829 = ((($s)) + 21|0);
  HEAP8[$1829>>0] = $1828;
  $1830 = (_bitshift64Lshr(($1708|0),($1709|0),8)|0);
  $1831 = tempRet0;
  $1832 = $1830&255;
- $1833 = (($s) + 22|0);
+ $1833 = ((($s)) + 22|0);
  HEAP8[$1833>>0] = $1832;
  $1834 = (_bitshift64Lshr(($1708|0),($1709|0),16)|0);
  $1835 = tempRet0;
@@ -16860,17 +17622,17 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1838 = $1836 | $1834;
  $1837 | $1835;
  $1839 = $1838&255;
- $1840 = (($s) + 23|0);
+ $1840 = ((($s)) + 23|0);
  HEAP8[$1840>>0] = $1839;
  $1841 = (_bitshift64Lshr(($1716|0),($1717|0),3)|0);
  $1842 = tempRet0;
  $1843 = $1841&255;
- $1844 = (($s) + 24|0);
+ $1844 = ((($s)) + 24|0);
  HEAP8[$1844>>0] = $1843;
  $1845 = (_bitshift64Lshr(($1716|0),($1717|0),11)|0);
  $1846 = tempRet0;
  $1847 = $1845&255;
- $1848 = (($s) + 25|0);
+ $1848 = ((($s)) + 25|0);
  HEAP8[$1848>>0] = $1847;
  $1849 = (_bitshift64Lshr(($1716|0),($1717|0),19)|0);
  $1850 = tempRet0;
@@ -16879,12 +17641,12 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1853 = $1851 | $1849;
  $1852 | $1850;
  $1854 = $1853&255;
- $1855 = (($s) + 26|0);
+ $1855 = ((($s)) + 26|0);
  HEAP8[$1855>>0] = $1854;
  $1856 = (_bitshift64Lshr(($1724|0),($1725|0),6)|0);
  $1857 = tempRet0;
  $1858 = $1856&255;
- $1859 = (($s) + 27|0);
+ $1859 = ((($s)) + 27|0);
  HEAP8[$1859>>0] = $1858;
  $1860 = (_bitshift64Lshr(($1724|0),($1725|0),14)|0);
  $1861 = tempRet0;
@@ -16893,24 +17655,24 @@ function _crypto_sign_ed25519_ref10_sc_muladd($s,$a,$b,$c) {
  $1864 = $1860 | $1862;
  $1861 | $1863;
  $1865 = $1864&255;
- $1866 = (($s) + 28|0);
+ $1866 = ((($s)) + 28|0);
  HEAP8[$1866>>0] = $1865;
  $1867 = (_bitshift64Lshr(($1720|0),($1721|0),1)|0);
  $1868 = tempRet0;
  $1869 = $1867&255;
- $1870 = (($s) + 29|0);
+ $1870 = ((($s)) + 29|0);
  HEAP8[$1870>>0] = $1869;
  $1871 = (_bitshift64Lshr(($1720|0),($1721|0),9)|0);
  $1872 = tempRet0;
  $1873 = $1871&255;
- $1874 = (($s) + 30|0);
+ $1874 = ((($s)) + 30|0);
  HEAP8[$1874>>0] = $1873;
  $1875 = (_bitshift64Lshr(($1720|0),($1721|0),17)|0);
  $1876 = tempRet0;
  $1877 = $1875&255;
- $1878 = (($s) + 31|0);
+ $1878 = ((($s)) + 31|0);
  HEAP8[$1878>>0] = $1877;
- STACKTOP = sp;return;
+ return;
 }
 function _load_347($in) {
  $in = $in|0;
@@ -16918,21 +17680,21 @@ function _load_347($in) {
  sp = STACKTOP;
  $0 = HEAP8[$in>>0]|0;
  $1 = $0&255;
- $2 = (($in) + 1|0);
+ $2 = ((($in)) + 1|0);
  $3 = HEAP8[$2>>0]|0;
  $4 = $3&255;
  $5 = (_bitshift64Shl(($4|0),0,8)|0);
  $6 = tempRet0;
  $7 = $5 | $1;
- $8 = (($in) + 2|0);
+ $8 = ((($in)) + 2|0);
  $9 = HEAP8[$8>>0]|0;
  $10 = $9&255;
  $11 = (_bitshift64Shl(($10|0),0,16)|0);
  $12 = tempRet0;
  $13 = $7 | $11;
  $14 = $6 | $12;
- tempRet0 = $14;
- STACKTOP = sp;return ($13|0);
+ tempRet0 = ($14);
+ return ($13|0);
 }
 function _load_448($in) {
  $in = $in|0;
@@ -16941,28 +17703,28 @@ function _load_448($in) {
  sp = STACKTOP;
  $0 = HEAP8[$in>>0]|0;
  $1 = $0&255;
- $2 = (($in) + 1|0);
+ $2 = ((($in)) + 1|0);
  $3 = HEAP8[$2>>0]|0;
  $4 = $3&255;
  $5 = (_bitshift64Shl(($4|0),0,8)|0);
  $6 = tempRet0;
  $7 = $5 | $1;
- $8 = (($in) + 2|0);
+ $8 = ((($in)) + 2|0);
  $9 = HEAP8[$8>>0]|0;
  $10 = $9&255;
  $11 = (_bitshift64Shl(($10|0),0,16)|0);
  $12 = tempRet0;
  $13 = $7 | $11;
  $14 = $6 | $12;
- $15 = (($in) + 3|0);
+ $15 = ((($in)) + 3|0);
  $16 = HEAP8[$15>>0]|0;
  $17 = $16&255;
  $18 = (_bitshift64Shl(($17|0),0,24)|0);
  $19 = tempRet0;
  $20 = $13 | $18;
  $21 = $14 | $19;
- tempRet0 = $21;
- STACKTOP = sp;return ($20|0);
+ tempRet0 = ($21);
+ return ($20|0);
 }
 function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $s = $s|0;
@@ -17022,334 +17784,334 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $0 = (_load_351($s)|0);
  $1 = tempRet0;
  $2 = $0 & 2097151;
- $3 = (($s) + 2|0);
+ $3 = ((($s)) + 2|0);
  $4 = (_load_452($3)|0);
  $5 = tempRet0;
  $6 = (_bitshift64Lshr(($4|0),($5|0),5)|0);
  $7 = tempRet0;
  $8 = $6 & 2097151;
- $9 = (($s) + 5|0);
+ $9 = ((($s)) + 5|0);
  $10 = (_load_351($9)|0);
  $11 = tempRet0;
  $12 = (_bitshift64Lshr(($10|0),($11|0),2)|0);
  $13 = tempRet0;
  $14 = $12 & 2097151;
- $15 = (($s) + 7|0);
+ $15 = ((($s)) + 7|0);
  $16 = (_load_452($15)|0);
  $17 = tempRet0;
  $18 = (_bitshift64Lshr(($16|0),($17|0),7)|0);
  $19 = tempRet0;
  $20 = $18 & 2097151;
- $21 = (($s) + 10|0);
+ $21 = ((($s)) + 10|0);
  $22 = (_load_452($21)|0);
  $23 = tempRet0;
  $24 = (_bitshift64Lshr(($22|0),($23|0),4)|0);
  $25 = tempRet0;
  $26 = $24 & 2097151;
- $27 = (($s) + 13|0);
+ $27 = ((($s)) + 13|0);
  $28 = (_load_351($27)|0);
  $29 = tempRet0;
  $30 = (_bitshift64Lshr(($28|0),($29|0),1)|0);
  $31 = tempRet0;
  $32 = $30 & 2097151;
- $33 = (($s) + 15|0);
+ $33 = ((($s)) + 15|0);
  $34 = (_load_452($33)|0);
  $35 = tempRet0;
  $36 = (_bitshift64Lshr(($34|0),($35|0),6)|0);
  $37 = tempRet0;
  $38 = $36 & 2097151;
- $39 = (($s) + 18|0);
+ $39 = ((($s)) + 18|0);
  $40 = (_load_351($39)|0);
  $41 = tempRet0;
  $42 = (_bitshift64Lshr(($40|0),($41|0),3)|0);
  $43 = tempRet0;
  $44 = $42 & 2097151;
- $45 = (($s) + 21|0);
+ $45 = ((($s)) + 21|0);
  $46 = (_load_351($45)|0);
  $47 = tempRet0;
  $48 = $46 & 2097151;
- $49 = (($s) + 23|0);
+ $49 = ((($s)) + 23|0);
  $50 = (_load_452($49)|0);
  $51 = tempRet0;
  $52 = (_bitshift64Lshr(($50|0),($51|0),5)|0);
  $53 = tempRet0;
  $54 = $52 & 2097151;
- $55 = (($s) + 26|0);
+ $55 = ((($s)) + 26|0);
  $56 = (_load_351($55)|0);
  $57 = tempRet0;
  $58 = (_bitshift64Lshr(($56|0),($57|0),2)|0);
  $59 = tempRet0;
  $60 = $58 & 2097151;
- $61 = (($s) + 28|0);
+ $61 = ((($s)) + 28|0);
  $62 = (_load_452($61)|0);
  $63 = tempRet0;
  $64 = (_bitshift64Lshr(($62|0),($63|0),7)|0);
  $65 = tempRet0;
  $66 = $64 & 2097151;
- $67 = (($s) + 31|0);
+ $67 = ((($s)) + 31|0);
  $68 = (_load_452($67)|0);
  $69 = tempRet0;
  $70 = (_bitshift64Lshr(($68|0),($69|0),4)|0);
  $71 = tempRet0;
  $72 = $70 & 2097151;
- $73 = (($s) + 34|0);
+ $73 = ((($s)) + 34|0);
  $74 = (_load_351($73)|0);
  $75 = tempRet0;
  $76 = (_bitshift64Lshr(($74|0),($75|0),1)|0);
  $77 = tempRet0;
  $78 = $76 & 2097151;
- $79 = (($s) + 36|0);
+ $79 = ((($s)) + 36|0);
  $80 = (_load_452($79)|0);
  $81 = tempRet0;
  $82 = (_bitshift64Lshr(($80|0),($81|0),6)|0);
  $83 = tempRet0;
  $84 = $82 & 2097151;
- $85 = (($s) + 39|0);
+ $85 = ((($s)) + 39|0);
  $86 = (_load_351($85)|0);
  $87 = tempRet0;
  $88 = (_bitshift64Lshr(($86|0),($87|0),3)|0);
  $89 = tempRet0;
  $90 = $88 & 2097151;
- $91 = (($s) + 42|0);
+ $91 = ((($s)) + 42|0);
  $92 = (_load_351($91)|0);
  $93 = tempRet0;
  $94 = $92 & 2097151;
- $95 = (($s) + 44|0);
+ $95 = ((($s)) + 44|0);
  $96 = (_load_452($95)|0);
  $97 = tempRet0;
  $98 = (_bitshift64Lshr(($96|0),($97|0),5)|0);
  $99 = tempRet0;
  $100 = $98 & 2097151;
- $101 = (($s) + 47|0);
+ $101 = ((($s)) + 47|0);
  $102 = (_load_351($101)|0);
  $103 = tempRet0;
  $104 = (_bitshift64Lshr(($102|0),($103|0),2)|0);
  $105 = tempRet0;
  $106 = $104 & 2097151;
- $107 = (($s) + 49|0);
+ $107 = ((($s)) + 49|0);
  $108 = (_load_452($107)|0);
  $109 = tempRet0;
  $110 = (_bitshift64Lshr(($108|0),($109|0),7)|0);
  $111 = tempRet0;
  $112 = $110 & 2097151;
- $113 = (($s) + 52|0);
+ $113 = ((($s)) + 52|0);
  $114 = (_load_452($113)|0);
  $115 = tempRet0;
  $116 = (_bitshift64Lshr(($114|0),($115|0),4)|0);
  $117 = tempRet0;
  $118 = $116 & 2097151;
- $119 = (($s) + 55|0);
+ $119 = ((($s)) + 55|0);
  $120 = (_load_351($119)|0);
  $121 = tempRet0;
  $122 = (_bitshift64Lshr(($120|0),($121|0),1)|0);
  $123 = tempRet0;
  $124 = $122 & 2097151;
- $125 = (($s) + 57|0);
+ $125 = ((($s)) + 57|0);
  $126 = (_load_452($125)|0);
  $127 = tempRet0;
  $128 = (_bitshift64Lshr(($126|0),($127|0),6)|0);
  $129 = tempRet0;
  $130 = $128 & 2097151;
- $131 = (($s) + 60|0);
+ $131 = ((($s)) + 60|0);
  $132 = (_load_452($131)|0);
  $133 = tempRet0;
  $134 = (_bitshift64Lshr(($132|0),($133|0),3)|0);
  $135 = tempRet0;
  $136 = (___muldi3(($134|0),($135|0),666643,0)|0);
  $137 = tempRet0;
- $138 = (___muldi3(($134|0),($135|0),470296,0)|0);
+ $138 = (_i64Add(($66|0),0,($136|0),($137|0))|0);
  $139 = tempRet0;
- $140 = (___muldi3(($134|0),($135|0),654183,0)|0);
+ $140 = (___muldi3(($134|0),($135|0),470296,0)|0);
  $141 = tempRet0;
- $142 = (___muldi3(($134|0),($135|0),-997805,-1)|0);
+ $142 = (_i64Add(($72|0),0,($140|0),($141|0))|0);
  $143 = tempRet0;
- $144 = (___muldi3(($134|0),($135|0),136657,0)|0);
+ $144 = (___muldi3(($134|0),($135|0),654183,0)|0);
  $145 = tempRet0;
- $146 = (_i64Add(($144|0),($145|0),($90|0),0)|0);
+ $146 = (_i64Add(($78|0),0,($144|0),($145|0))|0);
  $147 = tempRet0;
- $148 = (___muldi3(($134|0),($135|0),-683901,-1)|0);
+ $148 = (___muldi3(($134|0),($135|0),-997805,-1)|0);
  $149 = tempRet0;
- $150 = (_i64Add(($148|0),($149|0),($94|0),0)|0);
+ $150 = (_i64Add(($84|0),0,($148|0),($149|0))|0);
  $151 = tempRet0;
- $152 = (___muldi3(($130|0),0,666643,0)|0);
+ $152 = (___muldi3(($134|0),($135|0),136657,0)|0);
  $153 = tempRet0;
- $154 = (___muldi3(($130|0),0,470296,0)|0);
+ $154 = (_i64Add(($90|0),0,($152|0),($153|0))|0);
  $155 = tempRet0;
- $156 = (___muldi3(($130|0),0,654183,0)|0);
+ $156 = (___muldi3(($134|0),($135|0),-683901,-1)|0);
  $157 = tempRet0;
- $158 = (___muldi3(($130|0),0,-997805,-1)|0);
+ $158 = (_i64Add(($94|0),0,($156|0),($157|0))|0);
  $159 = tempRet0;
- $160 = (___muldi3(($130|0),0,136657,0)|0);
+ $160 = (___muldi3(($130|0),0,666643,0)|0);
  $161 = tempRet0;
- $162 = (___muldi3(($130|0),0,-683901,-1)|0);
+ $162 = (_i64Add(($60|0),0,($160|0),($161|0))|0);
  $163 = tempRet0;
- $164 = (_i64Add(($146|0),($147|0),($162|0),($163|0))|0);
+ $164 = (___muldi3(($130|0),0,470296,0)|0);
  $165 = tempRet0;
- $166 = (___muldi3(($124|0),0,666643,0)|0);
+ $166 = (_i64Add(($164|0),($165|0),($138|0),($139|0))|0);
  $167 = tempRet0;
- $168 = (___muldi3(($124|0),0,470296,0)|0);
+ $168 = (___muldi3(($130|0),0,654183,0)|0);
  $169 = tempRet0;
- $170 = (___muldi3(($124|0),0,654183,0)|0);
+ $170 = (_i64Add(($168|0),($169|0),($142|0),($143|0))|0);
  $171 = tempRet0;
- $172 = (___muldi3(($124|0),0,-997805,-1)|0);
+ $172 = (___muldi3(($130|0),0,-997805,-1)|0);
  $173 = tempRet0;
- $174 = (___muldi3(($124|0),0,136657,0)|0);
+ $174 = (_i64Add(($172|0),($173|0),($146|0),($147|0))|0);
  $175 = tempRet0;
- $176 = (___muldi3(($124|0),0,-683901,-1)|0);
+ $176 = (___muldi3(($130|0),0,136657,0)|0);
  $177 = tempRet0;
- $178 = (_i64Add(($176|0),($177|0),($84|0),0)|0);
+ $178 = (_i64Add(($176|0),($177|0),($150|0),($151|0))|0);
  $179 = tempRet0;
- $180 = (_i64Add(($178|0),($179|0),($142|0),($143|0))|0);
+ $180 = (___muldi3(($130|0),0,-683901,-1)|0);
  $181 = tempRet0;
- $182 = (_i64Add(($180|0),($181|0),($160|0),($161|0))|0);
+ $182 = (_i64Add(($154|0),($155|0),($180|0),($181|0))|0);
  $183 = tempRet0;
- $184 = (___muldi3(($118|0),0,666643,0)|0);
+ $184 = (___muldi3(($124|0),0,666643,0)|0);
  $185 = tempRet0;
- $186 = (___muldi3(($118|0),0,470296,0)|0);
+ $186 = (_i64Add(($54|0),0,($184|0),($185|0))|0);
  $187 = tempRet0;
- $188 = (___muldi3(($118|0),0,654183,0)|0);
+ $188 = (___muldi3(($124|0),0,470296,0)|0);
  $189 = tempRet0;
- $190 = (___muldi3(($118|0),0,-997805,-1)|0);
+ $190 = (_i64Add(($188|0),($189|0),($162|0),($163|0))|0);
  $191 = tempRet0;
- $192 = (___muldi3(($118|0),0,136657,0)|0);
+ $192 = (___muldi3(($124|0),0,654183,0)|0);
  $193 = tempRet0;
- $194 = (___muldi3(($118|0),0,-683901,-1)|0);
+ $194 = (_i64Add(($192|0),($193|0),($166|0),($167|0))|0);
  $195 = tempRet0;
- $196 = (___muldi3(($112|0),0,666643,0)|0);
+ $196 = (___muldi3(($124|0),0,-997805,-1)|0);
  $197 = tempRet0;
- $198 = (___muldi3(($112|0),0,470296,0)|0);
+ $198 = (_i64Add(($196|0),($197|0),($170|0),($171|0))|0);
  $199 = tempRet0;
- $200 = (___muldi3(($112|0),0,654183,0)|0);
+ $200 = (___muldi3(($124|0),0,136657,0)|0);
  $201 = tempRet0;
- $202 = (___muldi3(($112|0),0,-997805,-1)|0);
+ $202 = (_i64Add(($200|0),($201|0),($174|0),($175|0))|0);
  $203 = tempRet0;
- $204 = (___muldi3(($112|0),0,136657,0)|0);
+ $204 = (___muldi3(($124|0),0,-683901,-1)|0);
  $205 = tempRet0;
- $206 = (___muldi3(($112|0),0,-683901,-1)|0);
+ $206 = (_i64Add(($178|0),($179|0),($204|0),($205|0))|0);
  $207 = tempRet0;
- $208 = (_i64Add(($206|0),($207|0),($72|0),0)|0);
+ $208 = (___muldi3(($118|0),0,666643,0)|0);
  $209 = tempRet0;
- $210 = (_i64Add(($208|0),($209|0),($192|0),($193|0))|0);
+ $210 = (___muldi3(($118|0),0,470296,0)|0);
  $211 = tempRet0;
- $212 = (_i64Add(($210|0),($211|0),($172|0),($173|0))|0);
+ $212 = (_i64Add(($210|0),($211|0),($186|0),($187|0))|0);
  $213 = tempRet0;
- $214 = (_i64Add(($212|0),($213|0),($138|0),($139|0))|0);
+ $214 = (___muldi3(($118|0),0,654183,0)|0);
  $215 = tempRet0;
- $216 = (_i64Add(($214|0),($215|0),($156|0),($157|0))|0);
+ $216 = (_i64Add(($214|0),($215|0),($190|0),($191|0))|0);
  $217 = tempRet0;
- $218 = (___muldi3(($106|0),0,666643,0)|0);
+ $218 = (___muldi3(($118|0),0,-997805,-1)|0);
  $219 = tempRet0;
- $220 = (_i64Add(($218|0),($219|0),($38|0),0)|0);
+ $220 = (_i64Add(($218|0),($219|0),($194|0),($195|0))|0);
  $221 = tempRet0;
- $222 = (___muldi3(($106|0),0,470296,0)|0);
+ $222 = (___muldi3(($118|0),0,136657,0)|0);
  $223 = tempRet0;
- $224 = (___muldi3(($106|0),0,654183,0)|0);
+ $224 = (_i64Add(($222|0),($223|0),($198|0),($199|0))|0);
  $225 = tempRet0;
- $226 = (_i64Add(($224|0),($225|0),($48|0),0)|0);
+ $226 = (___muldi3(($118|0),0,-683901,-1)|0);
  $227 = tempRet0;
- $228 = (_i64Add(($226|0),($227|0),($198|0),($199|0))|0);
+ $228 = (_i64Add(($202|0),($203|0),($226|0),($227|0))|0);
  $229 = tempRet0;
- $230 = (_i64Add(($228|0),($229|0),($184|0),($185|0))|0);
+ $230 = (___muldi3(($112|0),0,666643,0)|0);
  $231 = tempRet0;
- $232 = (___muldi3(($106|0),0,-997805,-1)|0);
+ $232 = (___muldi3(($112|0),0,470296,0)|0);
  $233 = tempRet0;
- $234 = (___muldi3(($106|0),0,136657,0)|0);
+ $234 = (___muldi3(($112|0),0,654183,0)|0);
  $235 = tempRet0;
- $236 = (_i64Add(($234|0),($235|0),($60|0),0)|0);
+ $236 = (_i64Add(($234|0),($235|0),($212|0),($213|0))|0);
  $237 = tempRet0;
- $238 = (_i64Add(($236|0),($237|0),($202|0),($203|0))|0);
+ $238 = (___muldi3(($112|0),0,-997805,-1)|0);
  $239 = tempRet0;
- $240 = (_i64Add(($238|0),($239|0),($188|0),($189|0))|0);
+ $240 = (_i64Add(($216|0),($217|0),($238|0),($239|0))|0);
  $241 = tempRet0;
- $242 = (_i64Add(($240|0),($241|0),($168|0),($169|0))|0);
+ $242 = (___muldi3(($112|0),0,136657,0)|0);
  $243 = tempRet0;
- $244 = (_i64Add(($242|0),($243|0),($152|0),($153|0))|0);
+ $244 = (_i64Add(($242|0),($243|0),($220|0),($221|0))|0);
  $245 = tempRet0;
- $246 = (___muldi3(($106|0),0,-683901,-1)|0);
+ $246 = (___muldi3(($112|0),0,-683901,-1)|0);
  $247 = tempRet0;
- $248 = (_i64Add(($220|0),($221|0),1048576,0)|0);
+ $248 = (_i64Add(($224|0),($225|0),($246|0),($247|0))|0);
  $249 = tempRet0;
- $250 = (_bitshift64Lshr(($248|0),($249|0),21)|0);
+ $250 = (___muldi3(($106|0),0,666643,0)|0);
  $251 = tempRet0;
- $252 = (_i64Add(($222|0),($223|0),($44|0),0)|0);
+ $252 = (_i64Add(($250|0),($251|0),($38|0),0)|0);
  $253 = tempRet0;
- $254 = (_i64Add(($252|0),($253|0),($196|0),($197|0))|0);
+ $254 = (___muldi3(($106|0),0,470296,0)|0);
  $255 = tempRet0;
- $256 = (_i64Add(($254|0),($255|0),($250|0),($251|0))|0);
+ $256 = (___muldi3(($106|0),0,654183,0)|0);
  $257 = tempRet0;
- $258 = (_bitshift64Shl(($250|0),($251|0),21)|0);
+ $258 = (_i64Add(($256|0),($257|0),($48|0),0)|0);
  $259 = tempRet0;
- $260 = (_i64Subtract(($220|0),($221|0),($258|0),($259|0))|0);
+ $260 = (_i64Add(($258|0),($259|0),($232|0),($233|0))|0);
  $261 = tempRet0;
- $262 = (_i64Add(($230|0),($231|0),1048576,0)|0);
+ $262 = (_i64Add(($260|0),($261|0),($208|0),($209|0))|0);
  $263 = tempRet0;
- $264 = (_bitshift64Lshr(($262|0),($263|0),21)|0);
+ $264 = (___muldi3(($106|0),0,-997805,-1)|0);
  $265 = tempRet0;
- $266 = (_i64Add(($232|0),($233|0),($54|0),0)|0);
+ $266 = (_i64Add(($236|0),($237|0),($264|0),($265|0))|0);
  $267 = tempRet0;
- $268 = (_i64Add(($266|0),($267|0),($200|0),($201|0))|0);
+ $268 = (___muldi3(($106|0),0,136657,0)|0);
  $269 = tempRet0;
- $270 = (_i64Add(($268|0),($269|0),($186|0),($187|0))|0);
+ $270 = (_i64Add(($240|0),($241|0),($268|0),($269|0))|0);
  $271 = tempRet0;
- $272 = (_i64Add(($270|0),($271|0),($166|0),($167|0))|0);
+ $272 = (___muldi3(($106|0),0,-683901,-1)|0);
  $273 = tempRet0;
- $274 = (_i64Add(($272|0),($273|0),($264|0),($265|0))|0);
+ $274 = (_i64Add(($244|0),($245|0),($272|0),($273|0))|0);
  $275 = tempRet0;
- $276 = (_bitshift64Shl(($264|0),($265|0),21)|0);
+ $276 = (_i64Add(($252|0),($253|0),1048576,0)|0);
  $277 = tempRet0;
- $278 = (_i64Subtract(($230|0),($231|0),($276|0),($277|0))|0);
+ $278 = (_bitshift64Lshr(($276|0),($277|0),21)|0);
  $279 = tempRet0;
- $280 = (_i64Add(($244|0),($245|0),1048576,0)|0);
+ $280 = (_i64Add(($254|0),($255|0),($44|0),0)|0);
  $281 = tempRet0;
- $282 = (_bitshift64Ashr(($280|0),($281|0),21)|0);
+ $282 = (_i64Add(($280|0),($281|0),($230|0),($231|0))|0);
  $283 = tempRet0;
- $284 = (_i64Add(($246|0),($247|0),($66|0),0)|0);
+ $284 = (_i64Add(($282|0),($283|0),($278|0),($279|0))|0);
  $285 = tempRet0;
- $286 = (_i64Add(($284|0),($285|0),($204|0),($205|0))|0);
+ $286 = (_bitshift64Shl(($278|0),($279|0),21)|0);
  $287 = tempRet0;
- $288 = (_i64Add(($286|0),($287|0),($190|0),($191|0))|0);
+ $288 = (_i64Subtract(($252|0),($253|0),($286|0),($287|0))|0);
  $289 = tempRet0;
- $290 = (_i64Add(($288|0),($289|0),($170|0),($171|0))|0);
+ $290 = (_i64Add(($262|0),($263|0),1048576,0)|0);
  $291 = tempRet0;
- $292 = (_i64Add(($290|0),($291|0),($136|0),($137|0))|0);
+ $292 = (_bitshift64Lshr(($290|0),($291|0),21)|0);
  $293 = tempRet0;
- $294 = (_i64Add(($292|0),($293|0),($154|0),($155|0))|0);
+ $294 = (_i64Add(($266|0),($267|0),($292|0),($293|0))|0);
  $295 = tempRet0;
- $296 = (_i64Add(($294|0),($295|0),($282|0),($283|0))|0);
+ $296 = (_bitshift64Shl(($292|0),($293|0),21)|0);
  $297 = tempRet0;
- $298 = (_bitshift64Shl(($282|0),($283|0),21)|0);
+ $298 = (_i64Subtract(($262|0),($263|0),($296|0),($297|0))|0);
  $299 = tempRet0;
- $300 = (_i64Subtract(($244|0),($245|0),($298|0),($299|0))|0);
+ $300 = (_i64Add(($270|0),($271|0),1048576,0)|0);
  $301 = tempRet0;
- $302 = (_i64Add(($216|0),($217|0),1048576,0)|0);
+ $302 = (_bitshift64Ashr(($300|0),($301|0),21)|0);
  $303 = tempRet0;
- $304 = (_bitshift64Ashr(($302|0),($303|0),21)|0);
+ $304 = (_i64Add(($302|0),($303|0),($274|0),($275|0))|0);
  $305 = tempRet0;
- $306 = (_i64Add(($194|0),($195|0),($78|0),0)|0);
+ $306 = (_bitshift64Shl(($302|0),($303|0),21)|0);
  $307 = tempRet0;
- $308 = (_i64Add(($306|0),($307|0),($174|0),($175|0))|0);
+ $308 = (_i64Subtract(($270|0),($271|0),($306|0),($307|0))|0);
  $309 = tempRet0;
- $310 = (_i64Add(($308|0),($309|0),($140|0),($141|0))|0);
+ $310 = (_i64Add(($248|0),($249|0),1048576,0)|0);
  $311 = tempRet0;
- $312 = (_i64Add(($310|0),($311|0),($158|0),($159|0))|0);
+ $312 = (_bitshift64Ashr(($310|0),($311|0),21)|0);
  $313 = tempRet0;
- $314 = (_i64Add(($312|0),($313|0),($304|0),($305|0))|0);
+ $314 = (_i64Add(($312|0),($313|0),($228|0),($229|0))|0);
  $315 = tempRet0;
- $316 = (_bitshift64Shl(($304|0),($305|0),21)|0);
+ $316 = (_bitshift64Shl(($312|0),($313|0),21)|0);
  $317 = tempRet0;
- $318 = (_i64Subtract(($216|0),($217|0),($316|0),($317|0))|0);
+ $318 = (_i64Subtract(($248|0),($249|0),($316|0),($317|0))|0);
  $319 = tempRet0;
- $320 = (_i64Add(($182|0),($183|0),1048576,0)|0);
+ $320 = (_i64Add(($206|0),($207|0),1048576,0)|0);
  $321 = tempRet0;
  $322 = (_bitshift64Ashr(($320|0),($321|0),21)|0);
  $323 = tempRet0;
- $324 = (_i64Add(($164|0),($165|0),($322|0),($323|0))|0);
+ $324 = (_i64Add(($322|0),($323|0),($182|0),($183|0))|0);
  $325 = tempRet0;
  $326 = (_bitshift64Shl(($322|0),($323|0),21)|0);
  $327 = tempRet0;
- $328 = (_i64Subtract(($182|0),($183|0),($326|0),($327|0))|0);
+ $328 = (_i64Subtract(($206|0),($207|0),($326|0),($327|0))|0);
  $329 = tempRet0;
- $330 = (_i64Add(($150|0),($151|0),1048576,0)|0);
+ $330 = (_i64Add(($158|0),($159|0),1048576,0)|0);
  $331 = tempRet0;
  $332 = (_bitshift64Ashr(($330|0),($331|0),21)|0);
  $333 = tempRet0;
@@ -17357,37 +18119,37 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $335 = tempRet0;
  $336 = (_bitshift64Shl(($332|0),($333|0),21)|0);
  $337 = tempRet0;
- $338 = (_i64Subtract(($150|0),($151|0),($336|0),($337|0))|0);
+ $338 = (_i64Subtract(($158|0),($159|0),($336|0),($337|0))|0);
  $339 = tempRet0;
- $340 = (_i64Add(($256|0),($257|0),1048576,0)|0);
+ $340 = (_i64Add(($284|0),($285|0),1048576,0)|0);
  $341 = tempRet0;
  $342 = (_bitshift64Lshr(($340|0),($341|0),21)|0);
  $343 = tempRet0;
- $344 = (_i64Add(($278|0),($279|0),($342|0),($343|0))|0);
+ $344 = (_i64Add(($342|0),($343|0),($298|0),($299|0))|0);
  $345 = tempRet0;
  $346 = (_bitshift64Shl(($342|0),($343|0),21)|0);
  $347 = tempRet0;
- $348 = (_i64Subtract(($256|0),($257|0),($346|0),($347|0))|0);
+ $348 = (_i64Subtract(($284|0),($285|0),($346|0),($347|0))|0);
  $349 = tempRet0;
- $350 = (_i64Add(($274|0),($275|0),1048576,0)|0);
+ $350 = (_i64Add(($294|0),($295|0),1048576,0)|0);
  $351 = tempRet0;
  $352 = (_bitshift64Ashr(($350|0),($351|0),21)|0);
  $353 = tempRet0;
- $354 = (_i64Add(($300|0),($301|0),($352|0),($353|0))|0);
+ $354 = (_i64Add(($352|0),($353|0),($308|0),($309|0))|0);
  $355 = tempRet0;
  $356 = (_bitshift64Shl(($352|0),($353|0),21)|0);
  $357 = tempRet0;
- $358 = (_i64Subtract(($274|0),($275|0),($356|0),($357|0))|0);
+ $358 = (_i64Subtract(($294|0),($295|0),($356|0),($357|0))|0);
  $359 = tempRet0;
- $360 = (_i64Add(($296|0),($297|0),1048576,0)|0);
+ $360 = (_i64Add(($304|0),($305|0),1048576,0)|0);
  $361 = tempRet0;
  $362 = (_bitshift64Ashr(($360|0),($361|0),21)|0);
  $363 = tempRet0;
- $364 = (_i64Add(($318|0),($319|0),($362|0),($363|0))|0);
+ $364 = (_i64Add(($362|0),($363|0),($318|0),($319|0))|0);
  $365 = tempRet0;
  $366 = (_bitshift64Shl(($362|0),($363|0),21)|0);
  $367 = tempRet0;
- $368 = (_i64Subtract(($296|0),($297|0),($366|0),($367|0))|0);
+ $368 = (_i64Subtract(($304|0),($305|0),($366|0),($367|0))|0);
  $369 = tempRet0;
  $370 = (_i64Add(($314|0),($315|0),1048576,0)|0);
  $371 = tempRet0;
@@ -17411,11 +18173,11 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $389 = tempRet0;
  $390 = (___muldi3(($334|0),($335|0),666643,0)|0);
  $391 = tempRet0;
- $392 = (_i64Add(($390|0),($391|0),($32|0),0)|0);
+ $392 = (_i64Add(($32|0),0,($390|0),($391|0))|0);
  $393 = tempRet0;
  $394 = (___muldi3(($334|0),($335|0),470296,0)|0);
  $395 = tempRet0;
- $396 = (_i64Add(($260|0),($261|0),($394|0),($395|0))|0);
+ $396 = (_i64Add(($288|0),($289|0),($394|0),($395|0))|0);
  $397 = tempRet0;
  $398 = (___muldi3(($334|0),($335|0),654183,0)|0);
  $399 = tempRet0;
@@ -17423,11 +18185,11 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $401 = tempRet0;
  $402 = (___muldi3(($334|0),($335|0),-997805,-1)|0);
  $403 = tempRet0;
- $404 = (_i64Add(($344|0),($345|0),($402|0),($403|0))|0);
+ $404 = (_i64Add(($402|0),($403|0),($344|0),($345|0))|0);
  $405 = tempRet0;
  $406 = (___muldi3(($334|0),($335|0),136657,0)|0);
  $407 = tempRet0;
- $408 = (_i64Add(($358|0),($359|0),($406|0),($407|0))|0);
+ $408 = (_i64Add(($406|0),($407|0),($358|0),($359|0))|0);
  $409 = tempRet0;
  $410 = (___muldi3(($334|0),($335|0),-683901,-1)|0);
  $411 = tempRet0;
@@ -17435,169 +18197,169 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $413 = tempRet0;
  $414 = (___muldi3(($384|0),($385|0),666643,0)|0);
  $415 = tempRet0;
- $416 = (___muldi3(($384|0),($385|0),470296,0)|0);
+ $416 = (_i64Add(($26|0),0,($414|0),($415|0))|0);
  $417 = tempRet0;
- $418 = (___muldi3(($384|0),($385|0),654183,0)|0);
+ $418 = (___muldi3(($384|0),($385|0),470296,0)|0);
  $419 = tempRet0;
- $420 = (_i64Add(($396|0),($397|0),($418|0),($419|0))|0);
+ $420 = (_i64Add(($392|0),($393|0),($418|0),($419|0))|0);
  $421 = tempRet0;
- $422 = (___muldi3(($384|0),($385|0),-997805,-1)|0);
+ $422 = (___muldi3(($384|0),($385|0),654183,0)|0);
  $423 = tempRet0;
- $424 = (_i64Add(($400|0),($401|0),($422|0),($423|0))|0);
+ $424 = (_i64Add(($396|0),($397|0),($422|0),($423|0))|0);
  $425 = tempRet0;
- $426 = (___muldi3(($384|0),($385|0),136657,0)|0);
+ $426 = (___muldi3(($384|0),($385|0),-997805,-1)|0);
  $427 = tempRet0;
- $428 = (_i64Add(($404|0),($405|0),($426|0),($427|0))|0);
+ $428 = (_i64Add(($400|0),($401|0),($426|0),($427|0))|0);
  $429 = tempRet0;
- $430 = (___muldi3(($384|0),($385|0),-683901,-1)|0);
+ $430 = (___muldi3(($384|0),($385|0),136657,0)|0);
  $431 = tempRet0;
- $432 = (_i64Add(($408|0),($409|0),($430|0),($431|0))|0);
+ $432 = (_i64Add(($404|0),($405|0),($430|0),($431|0))|0);
  $433 = tempRet0;
- $434 = (___muldi3(($388|0),($389|0),666643,0)|0);
+ $434 = (___muldi3(($384|0),($385|0),-683901,-1)|0);
  $435 = tempRet0;
- $436 = (___muldi3(($388|0),($389|0),470296,0)|0);
+ $436 = (_i64Add(($408|0),($409|0),($434|0),($435|0))|0);
  $437 = tempRet0;
- $438 = (___muldi3(($388|0),($389|0),654183,0)|0);
+ $438 = (___muldi3(($388|0),($389|0),666643,0)|0);
  $439 = tempRet0;
- $440 = (___muldi3(($388|0),($389|0),-997805,-1)|0);
+ $440 = (_i64Add(($20|0),0,($438|0),($439|0))|0);
  $441 = tempRet0;
- $442 = (___muldi3(($388|0),($389|0),136657,0)|0);
+ $442 = (___muldi3(($388|0),($389|0),470296,0)|0);
  $443 = tempRet0;
- $444 = (___muldi3(($388|0),($389|0),-683901,-1)|0);
+ $444 = (_i64Add(($416|0),($417|0),($442|0),($443|0))|0);
  $445 = tempRet0;
- $446 = (_i64Add(($428|0),($429|0),($444|0),($445|0))|0);
+ $446 = (___muldi3(($388|0),($389|0),654183,0)|0);
  $447 = tempRet0;
- $448 = (___muldi3(($374|0),($375|0),666643,0)|0);
+ $448 = (_i64Add(($420|0),($421|0),($446|0),($447|0))|0);
  $449 = tempRet0;
- $450 = (___muldi3(($374|0),($375|0),470296,0)|0);
+ $450 = (___muldi3(($388|0),($389|0),-997805,-1)|0);
  $451 = tempRet0;
- $452 = (___muldi3(($374|0),($375|0),654183,0)|0);
+ $452 = (_i64Add(($424|0),($425|0),($450|0),($451|0))|0);
  $453 = tempRet0;
- $454 = (___muldi3(($374|0),($375|0),-997805,-1)|0);
+ $454 = (___muldi3(($388|0),($389|0),136657,0)|0);
  $455 = tempRet0;
- $456 = (___muldi3(($374|0),($375|0),136657,0)|0);
+ $456 = (_i64Add(($428|0),($429|0),($454|0),($455|0))|0);
  $457 = tempRet0;
- $458 = (___muldi3(($374|0),($375|0),-683901,-1)|0);
+ $458 = (___muldi3(($388|0),($389|0),-683901,-1)|0);
  $459 = tempRet0;
- $460 = (___muldi3(($378|0),($379|0),666643,0)|0);
+ $460 = (_i64Add(($432|0),($433|0),($458|0),($459|0))|0);
  $461 = tempRet0;
- $462 = (___muldi3(($378|0),($379|0),470296,0)|0);
+ $462 = (___muldi3(($374|0),($375|0),666643,0)|0);
  $463 = tempRet0;
- $464 = (___muldi3(($378|0),($379|0),654183,0)|0);
+ $464 = (_i64Add(($462|0),($463|0),($14|0),0)|0);
  $465 = tempRet0;
- $466 = (___muldi3(($378|0),($379|0),-997805,-1)|0);
+ $466 = (___muldi3(($374|0),($375|0),470296,0)|0);
  $467 = tempRet0;
- $468 = (___muldi3(($378|0),($379|0),136657,0)|0);
+ $468 = (_i64Add(($440|0),($441|0),($466|0),($467|0))|0);
  $469 = tempRet0;
- $470 = (___muldi3(($378|0),($379|0),-683901,-1)|0);
+ $470 = (___muldi3(($374|0),($375|0),654183,0)|0);
  $471 = tempRet0;
- $472 = (_i64Add(($420|0),($421|0),($456|0),($457|0))|0);
+ $472 = (_i64Add(($444|0),($445|0),($470|0),($471|0))|0);
  $473 = tempRet0;
- $474 = (_i64Add(($472|0),($473|0),($440|0),($441|0))|0);
+ $474 = (___muldi3(($374|0),($375|0),-997805,-1)|0);
  $475 = tempRet0;
- $476 = (_i64Add(($474|0),($475|0),($470|0),($471|0))|0);
+ $476 = (_i64Add(($448|0),($449|0),($474|0),($475|0))|0);
  $477 = tempRet0;
- $478 = (___muldi3(($364|0),($365|0),666643,0)|0);
+ $478 = (___muldi3(($374|0),($375|0),136657,0)|0);
  $479 = tempRet0;
- $480 = (_i64Add(($478|0),($479|0),($2|0),0)|0);
+ $480 = (_i64Add(($452|0),($453|0),($478|0),($479|0))|0);
  $481 = tempRet0;
- $482 = (___muldi3(($364|0),($365|0),470296,0)|0);
+ $482 = (___muldi3(($374|0),($375|0),-683901,-1)|0);
  $483 = tempRet0;
- $484 = (___muldi3(($364|0),($365|0),654183,0)|0);
+ $484 = (_i64Add(($456|0),($457|0),($482|0),($483|0))|0);
  $485 = tempRet0;
- $486 = (_i64Add(($484|0),($485|0),($14|0),0)|0);
+ $486 = (___muldi3(($378|0),($379|0),666643,0)|0);
  $487 = tempRet0;
- $488 = (_i64Add(($486|0),($487|0),($448|0),($449|0))|0);
+ $488 = (___muldi3(($378|0),($379|0),470296,0)|0);
  $489 = tempRet0;
- $490 = (_i64Add(($488|0),($489|0),($462|0),($463|0))|0);
+ $490 = (___muldi3(($378|0),($379|0),654183,0)|0);
  $491 = tempRet0;
- $492 = (___muldi3(($364|0),($365|0),-997805,-1)|0);
+ $492 = (_i64Add(($468|0),($469|0),($490|0),($491|0))|0);
  $493 = tempRet0;
- $494 = (___muldi3(($364|0),($365|0),136657,0)|0);
+ $494 = (___muldi3(($378|0),($379|0),-997805,-1)|0);
  $495 = tempRet0;
- $496 = (_i64Add(($494|0),($495|0),($26|0),0)|0);
+ $496 = (_i64Add(($472|0),($473|0),($494|0),($495|0))|0);
  $497 = tempRet0;
- $498 = (_i64Add(($496|0),($497|0),($414|0),($415|0))|0);
+ $498 = (___muldi3(($378|0),($379|0),136657,0)|0);
  $499 = tempRet0;
- $500 = (_i64Add(($498|0),($499|0),($452|0),($453|0))|0);
+ $500 = (_i64Add(($476|0),($477|0),($498|0),($499|0))|0);
  $501 = tempRet0;
- $502 = (_i64Add(($500|0),($501|0),($436|0),($437|0))|0);
+ $502 = (___muldi3(($378|0),($379|0),-683901,-1)|0);
  $503 = tempRet0;
- $504 = (_i64Add(($502|0),($503|0),($466|0),($467|0))|0);
+ $504 = (_i64Add(($480|0),($481|0),($502|0),($503|0))|0);
  $505 = tempRet0;
- $506 = (___muldi3(($364|0),($365|0),-683901,-1)|0);
+ $506 = (___muldi3(($364|0),($365|0),666643,0)|0);
  $507 = tempRet0;
- $508 = (_i64Add(($480|0),($481|0),1048576,0)|0);
+ $508 = (_i64Add(($506|0),($507|0),($2|0),0)|0);
  $509 = tempRet0;
- $510 = (_bitshift64Ashr(($508|0),($509|0),21)|0);
+ $510 = (___muldi3(($364|0),($365|0),470296,0)|0);
  $511 = tempRet0;
- $512 = (_i64Add(($482|0),($483|0),($8|0),0)|0);
+ $512 = (___muldi3(($364|0),($365|0),654183,0)|0);
  $513 = tempRet0;
- $514 = (_i64Add(($512|0),($513|0),($460|0),($461|0))|0);
+ $514 = (_i64Add(($464|0),($465|0),($512|0),($513|0))|0);
  $515 = tempRet0;
- $516 = (_i64Add(($514|0),($515|0),($510|0),($511|0))|0);
+ $516 = (_i64Add(($514|0),($515|0),($488|0),($489|0))|0);
  $517 = tempRet0;
- $518 = (_bitshift64Shl(($510|0),($511|0),21)|0);
+ $518 = (___muldi3(($364|0),($365|0),-997805,-1)|0);
  $519 = tempRet0;
- $520 = (_i64Subtract(($480|0),($481|0),($518|0),($519|0))|0);
+ $520 = (_i64Add(($492|0),($493|0),($518|0),($519|0))|0);
  $521 = tempRet0;
- $522 = (_i64Add(($490|0),($491|0),1048576,0)|0);
+ $522 = (___muldi3(($364|0),($365|0),136657,0)|0);
  $523 = tempRet0;
- $524 = (_bitshift64Ashr(($522|0),($523|0),21)|0);
+ $524 = (_i64Add(($496|0),($497|0),($522|0),($523|0))|0);
  $525 = tempRet0;
- $526 = (_i64Add(($492|0),($493|0),($20|0),0)|0);
+ $526 = (___muldi3(($364|0),($365|0),-683901,-1)|0);
  $527 = tempRet0;
- $528 = (_i64Add(($526|0),($527|0),($450|0),($451|0))|0);
+ $528 = (_i64Add(($500|0),($501|0),($526|0),($527|0))|0);
  $529 = tempRet0;
- $530 = (_i64Add(($528|0),($529|0),($434|0),($435|0))|0);
+ $530 = (_i64Add(($508|0),($509|0),1048576,0)|0);
  $531 = tempRet0;
- $532 = (_i64Add(($530|0),($531|0),($464|0),($465|0))|0);
+ $532 = (_bitshift64Ashr(($530|0),($531|0),21)|0);
  $533 = tempRet0;
- $534 = (_i64Add(($532|0),($533|0),($524|0),($525|0))|0);
+ $534 = (_i64Add(($510|0),($511|0),($8|0),0)|0);
  $535 = tempRet0;
- $536 = (_bitshift64Shl(($524|0),($525|0),21)|0);
+ $536 = (_i64Add(($534|0),($535|0),($486|0),($487|0))|0);
  $537 = tempRet0;
- $538 = (_i64Add(($504|0),($505|0),1048576,0)|0);
+ $538 = (_i64Add(($536|0),($537|0),($532|0),($533|0))|0);
  $539 = tempRet0;
- $540 = (_bitshift64Ashr(($538|0),($539|0),21)|0);
+ $540 = (_bitshift64Shl(($532|0),($533|0),21)|0);
  $541 = tempRet0;
- $542 = (_i64Add(($392|0),($393|0),($506|0),($507|0))|0);
+ $542 = (_i64Subtract(($508|0),($509|0),($540|0),($541|0))|0);
  $543 = tempRet0;
- $544 = (_i64Add(($542|0),($543|0),($416|0),($417|0))|0);
+ $544 = (_i64Add(($516|0),($517|0),1048576,0)|0);
  $545 = tempRet0;
- $546 = (_i64Add(($544|0),($545|0),($454|0),($455|0))|0);
+ $546 = (_bitshift64Ashr(($544|0),($545|0),21)|0);
  $547 = tempRet0;
- $548 = (_i64Add(($546|0),($547|0),($438|0),($439|0))|0);
+ $548 = (_i64Add(($546|0),($547|0),($520|0),($521|0))|0);
  $549 = tempRet0;
- $550 = (_i64Add(($548|0),($549|0),($468|0),($469|0))|0);
+ $550 = (_bitshift64Shl(($546|0),($547|0),21)|0);
  $551 = tempRet0;
- $552 = (_i64Add(($550|0),($551|0),($540|0),($541|0))|0);
+ $552 = (_i64Add(($524|0),($525|0),1048576,0)|0);
  $553 = tempRet0;
- $554 = (_bitshift64Shl(($540|0),($541|0),21)|0);
+ $554 = (_bitshift64Ashr(($552|0),($553|0),21)|0);
  $555 = tempRet0;
- $556 = (_i64Add(($476|0),($477|0),1048576,0)|0);
+ $556 = (_i64Add(($554|0),($555|0),($528|0),($529|0))|0);
  $557 = tempRet0;
- $558 = (_bitshift64Ashr(($556|0),($557|0),21)|0);
+ $558 = (_bitshift64Shl(($554|0),($555|0),21)|0);
  $559 = tempRet0;
- $560 = (_i64Add(($424|0),($425|0),($458|0),($459|0))|0);
+ $560 = (_i64Add(($504|0),($505|0),1048576,0)|0);
  $561 = tempRet0;
- $562 = (_i64Add(($560|0),($561|0),($442|0),($443|0))|0);
+ $562 = (_bitshift64Ashr(($560|0),($561|0),21)|0);
  $563 = tempRet0;
- $564 = (_i64Add(($562|0),($563|0),($558|0),($559|0))|0);
+ $564 = (_i64Add(($562|0),($563|0),($484|0),($485|0))|0);
  $565 = tempRet0;
- $566 = (_bitshift64Shl(($558|0),($559|0),21)|0);
+ $566 = (_bitshift64Shl(($562|0),($563|0),21)|0);
  $567 = tempRet0;
- $568 = (_i64Subtract(($476|0),($477|0),($566|0),($567|0))|0);
+ $568 = (_i64Subtract(($504|0),($505|0),($566|0),($567|0))|0);
  $569 = tempRet0;
- $570 = (_i64Add(($446|0),($447|0),1048576,0)|0);
+ $570 = (_i64Add(($460|0),($461|0),1048576,0)|0);
  $571 = tempRet0;
  $572 = (_bitshift64Ashr(($570|0),($571|0),21)|0);
  $573 = tempRet0;
- $574 = (_i64Add(($432|0),($433|0),($572|0),($573|0))|0);
+ $574 = (_i64Add(($572|0),($573|0),($436|0),($437|0))|0);
  $575 = tempRet0;
  $576 = (_bitshift64Shl(($572|0),($573|0),21)|0);
  $577 = tempRet0;
- $578 = (_i64Subtract(($446|0),($447|0),($576|0),($577|0))|0);
+ $578 = (_i64Subtract(($460|0),($461|0),($576|0),($577|0))|0);
  $579 = tempRet0;
  $580 = (_i64Add(($412|0),($413|0),1048576,0)|0);
  $581 = tempRet0;
@@ -17609,135 +18371,135 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $587 = tempRet0;
  $588 = (_i64Subtract(($412|0),($413|0),($586|0),($587|0))|0);
  $589 = tempRet0;
- $590 = (_i64Add(($516|0),($517|0),1048576,0)|0);
+ $590 = (_i64Add(($538|0),($539|0),1048576,0)|0);
  $591 = tempRet0;
  $592 = (_bitshift64Ashr(($590|0),($591|0),21)|0);
  $593 = tempRet0;
  $594 = (_bitshift64Shl(($592|0),($593|0),21)|0);
  $595 = tempRet0;
- $596 = (_i64Add(($534|0),($535|0),1048576,0)|0);
+ $596 = (_i64Add(($548|0),($549|0),1048576,0)|0);
  $597 = tempRet0;
  $598 = (_bitshift64Ashr(($596|0),($597|0),21)|0);
  $599 = tempRet0;
  $600 = (_bitshift64Shl(($598|0),($599|0),21)|0);
  $601 = tempRet0;
- $602 = (_i64Add(($552|0),($553|0),1048576,0)|0);
+ $602 = (_i64Subtract(($548|0),($549|0),($600|0),($601|0))|0);
  $603 = tempRet0;
- $604 = (_bitshift64Ashr(($602|0),($603|0),21)|0);
+ $604 = (_i64Add(($556|0),($557|0),1048576,0)|0);
  $605 = tempRet0;
- $606 = (_i64Add(($568|0),($569|0),($604|0),($605|0))|0);
+ $606 = (_bitshift64Ashr(($604|0),($605|0),21)|0);
  $607 = tempRet0;
- $608 = (_bitshift64Shl(($604|0),($605|0),21)|0);
+ $608 = (_i64Add(($568|0),($569|0),($606|0),($607|0))|0);
  $609 = tempRet0;
- $610 = (_i64Add(($564|0),($565|0),1048576,0)|0);
+ $610 = (_bitshift64Shl(($606|0),($607|0),21)|0);
  $611 = tempRet0;
- $612 = (_bitshift64Ashr(($610|0),($611|0),21)|0);
+ $612 = (_i64Subtract(($556|0),($557|0),($610|0),($611|0))|0);
  $613 = tempRet0;
- $614 = (_i64Add(($578|0),($579|0),($612|0),($613|0))|0);
+ $614 = (_i64Add(($564|0),($565|0),1048576,0)|0);
  $615 = tempRet0;
- $616 = (_bitshift64Shl(($612|0),($613|0),21)|0);
+ $616 = (_bitshift64Ashr(($614|0),($615|0),21)|0);
  $617 = tempRet0;
- $618 = (_i64Subtract(($564|0),($565|0),($616|0),($617|0))|0);
+ $618 = (_i64Add(($578|0),($579|0),($616|0),($617|0))|0);
  $619 = tempRet0;
- $620 = (_i64Add(($574|0),($575|0),1048576,0)|0);
+ $620 = (_bitshift64Shl(($616|0),($617|0),21)|0);
  $621 = tempRet0;
- $622 = (_bitshift64Ashr(($620|0),($621|0),21)|0);
+ $622 = (_i64Subtract(($564|0),($565|0),($620|0),($621|0))|0);
  $623 = tempRet0;
- $624 = (_i64Add(($588|0),($589|0),($622|0),($623|0))|0);
+ $624 = (_i64Add(($574|0),($575|0),1048576,0)|0);
  $625 = tempRet0;
- $626 = (_bitshift64Shl(($622|0),($623|0),21)|0);
+ $626 = (_bitshift64Ashr(($624|0),($625|0),21)|0);
  $627 = tempRet0;
- $628 = (_i64Subtract(($574|0),($575|0),($626|0),($627|0))|0);
+ $628 = (_i64Add(($588|0),($589|0),($626|0),($627|0))|0);
  $629 = tempRet0;
- $630 = (_i64Add(($584|0),($585|0),1048576,0)|0);
+ $630 = (_bitshift64Shl(($626|0),($627|0),21)|0);
  $631 = tempRet0;
- $632 = (_bitshift64Ashr(($630|0),($631|0),21)|0);
+ $632 = (_i64Subtract(($574|0),($575|0),($630|0),($631|0))|0);
  $633 = tempRet0;
- $634 = (_bitshift64Shl(($632|0),($633|0),21)|0);
+ $634 = (_i64Add(($584|0),($585|0),1048576,0)|0);
  $635 = tempRet0;
- $636 = (_i64Subtract(($584|0),($585|0),($634|0),($635|0))|0);
+ $636 = (_bitshift64Ashr(($634|0),($635|0),21)|0);
  $637 = tempRet0;
- $638 = (___muldi3(($632|0),($633|0),666643,0)|0);
+ $638 = (_bitshift64Shl(($636|0),($637|0),21)|0);
  $639 = tempRet0;
- $640 = (_i64Add(($520|0),($521|0),($638|0),($639|0))|0);
+ $640 = (_i64Subtract(($584|0),($585|0),($638|0),($639|0))|0);
  $641 = tempRet0;
- $642 = (___muldi3(($632|0),($633|0),470296,0)|0);
+ $642 = (___muldi3(($636|0),($637|0),666643,0)|0);
  $643 = tempRet0;
- $644 = (___muldi3(($632|0),($633|0),654183,0)|0);
+ $644 = (_i64Add(($542|0),($543|0),($642|0),($643|0))|0);
  $645 = tempRet0;
- $646 = (___muldi3(($632|0),($633|0),-997805,-1)|0);
+ $646 = (___muldi3(($636|0),($637|0),470296,0)|0);
  $647 = tempRet0;
- $648 = (___muldi3(($632|0),($633|0),136657,0)|0);
+ $648 = (___muldi3(($636|0),($637|0),654183,0)|0);
  $649 = tempRet0;
- $650 = (___muldi3(($632|0),($633|0),-683901,-1)|0);
+ $650 = (___muldi3(($636|0),($637|0),-997805,-1)|0);
  $651 = tempRet0;
- $652 = (_bitshift64Ashr(($640|0),($641|0),21)|0);
+ $652 = (_i64Add(($602|0),($603|0),($650|0),($651|0))|0);
  $653 = tempRet0;
- $654 = (_i64Add(($642|0),($643|0),($516|0),($517|0))|0);
+ $654 = (___muldi3(($636|0),($637|0),136657,0)|0);
  $655 = tempRet0;
- $656 = (_i64Subtract(($654|0),($655|0),($594|0),($595|0))|0);
+ $656 = (___muldi3(($636|0),($637|0),-683901,-1)|0);
  $657 = tempRet0;
- $658 = (_i64Add(($656|0),($657|0),($652|0),($653|0))|0);
+ $658 = (_i64Add(($612|0),($613|0),($656|0),($657|0))|0);
  $659 = tempRet0;
- $660 = (_bitshift64Shl(($652|0),($653|0),21)|0);
+ $660 = (_bitshift64Ashr(($644|0),($645|0),21)|0);
  $661 = tempRet0;
- $662 = (_i64Subtract(($640|0),($641|0),($660|0),($661|0))|0);
+ $662 = (_i64Add(($646|0),($647|0),($538|0),($539|0))|0);
  $663 = tempRet0;
- $664 = (_bitshift64Ashr(($658|0),($659|0),21)|0);
+ $664 = (_i64Subtract(($662|0),($663|0),($594|0),($595|0))|0);
  $665 = tempRet0;
- $666 = (_i64Add(($644|0),($645|0),($490|0),($491|0))|0);
+ $666 = (_i64Add(($664|0),($665|0),($660|0),($661|0))|0);
  $667 = tempRet0;
- $668 = (_i64Subtract(($666|0),($667|0),($536|0),($537|0))|0);
+ $668 = (_bitshift64Shl(($660|0),($661|0),21)|0);
  $669 = tempRet0;
- $670 = (_i64Add(($668|0),($669|0),($592|0),($593|0))|0);
+ $670 = (_i64Subtract(($644|0),($645|0),($668|0),($669|0))|0);
  $671 = tempRet0;
- $672 = (_i64Add(($670|0),($671|0),($664|0),($665|0))|0);
+ $672 = (_bitshift64Ashr(($666|0),($667|0),21)|0);
  $673 = tempRet0;
- $674 = (_bitshift64Shl(($664|0),($665|0),21)|0);
+ $674 = (_i64Add(($648|0),($649|0),($516|0),($517|0))|0);
  $675 = tempRet0;
- $676 = (_i64Subtract(($658|0),($659|0),($674|0),($675|0))|0);
+ $676 = (_i64Subtract(($674|0),($675|0),($550|0),($551|0))|0);
  $677 = tempRet0;
- $678 = (_bitshift64Ashr(($672|0),($673|0),21)|0);
+ $678 = (_i64Add(($676|0),($677|0),($592|0),($593|0))|0);
  $679 = tempRet0;
- $680 = (_i64Add(($534|0),($535|0),($646|0),($647|0))|0);
+ $680 = (_i64Add(($678|0),($679|0),($672|0),($673|0))|0);
  $681 = tempRet0;
- $682 = (_i64Subtract(($680|0),($681|0),($600|0),($601|0))|0);
+ $682 = (_bitshift64Shl(($672|0),($673|0),21)|0);
  $683 = tempRet0;
- $684 = (_i64Add(($682|0),($683|0),($678|0),($679|0))|0);
+ $684 = (_i64Subtract(($666|0),($667|0),($682|0),($683|0))|0);
  $685 = tempRet0;
- $686 = (_bitshift64Shl(($678|0),($679|0),21)|0);
+ $686 = (_bitshift64Ashr(($680|0),($681|0),21)|0);
  $687 = tempRet0;
- $688 = (_i64Subtract(($672|0),($673|0),($686|0),($687|0))|0);
+ $688 = (_i64Add(($686|0),($687|0),($652|0),($653|0))|0);
  $689 = tempRet0;
- $690 = (_bitshift64Ashr(($684|0),($685|0),21)|0);
+ $690 = (_bitshift64Shl(($686|0),($687|0),21)|0);
  $691 = tempRet0;
- $692 = (_i64Add(($648|0),($649|0),($504|0),($505|0))|0);
+ $692 = (_i64Subtract(($680|0),($681|0),($690|0),($691|0))|0);
  $693 = tempRet0;
- $694 = (_i64Subtract(($692|0),($693|0),($554|0),($555|0))|0);
+ $694 = (_bitshift64Ashr(($688|0),($689|0),21)|0);
  $695 = tempRet0;
- $696 = (_i64Add(($694|0),($695|0),($598|0),($599|0))|0);
+ $696 = (_i64Add(($654|0),($655|0),($524|0),($525|0))|0);
  $697 = tempRet0;
- $698 = (_i64Add(($696|0),($697|0),($690|0),($691|0))|0);
+ $698 = (_i64Subtract(($696|0),($697|0),($558|0),($559|0))|0);
  $699 = tempRet0;
- $700 = (_bitshift64Shl(($690|0),($691|0),21)|0);
+ $700 = (_i64Add(($698|0),($699|0),($598|0),($599|0))|0);
  $701 = tempRet0;
- $702 = (_i64Subtract(($684|0),($685|0),($700|0),($701|0))|0);
+ $702 = (_i64Add(($700|0),($701|0),($694|0),($695|0))|0);
  $703 = tempRet0;
- $704 = (_bitshift64Ashr(($698|0),($699|0),21)|0);
+ $704 = (_bitshift64Shl(($694|0),($695|0),21)|0);
  $705 = tempRet0;
- $706 = (_i64Add(($552|0),($553|0),($650|0),($651|0))|0);
+ $706 = (_i64Subtract(($688|0),($689|0),($704|0),($705|0))|0);
  $707 = tempRet0;
- $708 = (_i64Subtract(($706|0),($707|0),($608|0),($609|0))|0);
+ $708 = (_bitshift64Ashr(($702|0),($703|0),21)|0);
  $709 = tempRet0;
- $710 = (_i64Add(($708|0),($709|0),($704|0),($705|0))|0);
+ $710 = (_i64Add(($708|0),($709|0),($658|0),($659|0))|0);
  $711 = tempRet0;
- $712 = (_bitshift64Shl(($704|0),($705|0),21)|0);
+ $712 = (_bitshift64Shl(($708|0),($709|0),21)|0);
  $713 = tempRet0;
- $714 = (_i64Subtract(($698|0),($699|0),($712|0),($713|0))|0);
+ $714 = (_i64Subtract(($702|0),($703|0),($712|0),($713|0))|0);
  $715 = tempRet0;
  $716 = (_bitshift64Ashr(($710|0),($711|0),21)|0);
  $717 = tempRet0;
- $718 = (_i64Add(($606|0),($607|0),($716|0),($717|0))|0);
+ $718 = (_i64Add(($608|0),($609|0),($716|0),($717|0))|0);
  $719 = tempRet0;
  $720 = (_bitshift64Shl(($716|0),($717|0),21)|0);
  $721 = tempRet0;
@@ -17745,7 +18507,7 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $723 = tempRet0;
  $724 = (_bitshift64Ashr(($718|0),($719|0),21)|0);
  $725 = tempRet0;
- $726 = (_i64Add(($724|0),($725|0),($618|0),($619|0))|0);
+ $726 = (_i64Add(($724|0),($725|0),($622|0),($623|0))|0);
  $727 = tempRet0;
  $728 = (_bitshift64Shl(($724|0),($725|0),21)|0);
  $729 = tempRet0;
@@ -17753,7 +18515,7 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $731 = tempRet0;
  $732 = (_bitshift64Ashr(($726|0),($727|0),21)|0);
  $733 = tempRet0;
- $734 = (_i64Add(($614|0),($615|0),($732|0),($733|0))|0);
+ $734 = (_i64Add(($618|0),($619|0),($732|0),($733|0))|0);
  $735 = tempRet0;
  $736 = (_bitshift64Shl(($732|0),($733|0),21)|0);
  $737 = tempRet0;
@@ -17761,7 +18523,7 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $739 = tempRet0;
  $740 = (_bitshift64Ashr(($734|0),($735|0),21)|0);
  $741 = tempRet0;
- $742 = (_i64Add(($740|0),($741|0),($628|0),($629|0))|0);
+ $742 = (_i64Add(($740|0),($741|0),($632|0),($633|0))|0);
  $743 = tempRet0;
  $744 = (_bitshift64Shl(($740|0),($741|0),21)|0);
  $745 = tempRet0;
@@ -17769,7 +18531,7 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $747 = tempRet0;
  $748 = (_bitshift64Ashr(($742|0),($743|0),21)|0);
  $749 = tempRet0;
- $750 = (_i64Add(($624|0),($625|0),($748|0),($749|0))|0);
+ $750 = (_i64Add(($628|0),($629|0),($748|0),($749|0))|0);
  $751 = tempRet0;
  $752 = (_bitshift64Shl(($748|0),($749|0),21)|0);
  $753 = tempRet0;
@@ -17777,7 +18539,7 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $755 = tempRet0;
  $756 = (_bitshift64Ashr(($750|0),($751|0),21)|0);
  $757 = tempRet0;
- $758 = (_i64Add(($756|0),($757|0),($636|0),($637|0))|0);
+ $758 = (_i64Add(($756|0),($757|0),($640|0),($641|0))|0);
  $759 = tempRet0;
  $760 = (_bitshift64Shl(($756|0),($757|0),21)|0);
  $761 = tempRet0;
@@ -17791,19 +18553,19 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $769 = tempRet0;
  $770 = (___muldi3(($764|0),($765|0),666643,0)|0);
  $771 = tempRet0;
- $772 = (_i64Add(($770|0),($771|0),($662|0),($663|0))|0);
+ $772 = (_i64Add(($770|0),($771|0),($670|0),($671|0))|0);
  $773 = tempRet0;
  $774 = (___muldi3(($764|0),($765|0),470296,0)|0);
  $775 = tempRet0;
- $776 = (_i64Add(($676|0),($677|0),($774|0),($775|0))|0);
+ $776 = (_i64Add(($684|0),($685|0),($774|0),($775|0))|0);
  $777 = tempRet0;
  $778 = (___muldi3(($764|0),($765|0),654183,0)|0);
  $779 = tempRet0;
- $780 = (_i64Add(($688|0),($689|0),($778|0),($779|0))|0);
+ $780 = (_i64Add(($692|0),($693|0),($778|0),($779|0))|0);
  $781 = tempRet0;
  $782 = (___muldi3(($764|0),($765|0),-997805,-1)|0);
  $783 = tempRet0;
- $784 = (_i64Add(($702|0),($703|0),($782|0),($783|0))|0);
+ $784 = (_i64Add(($706|0),($707|0),($782|0),($783|0))|0);
  $785 = tempRet0;
  $786 = (___muldi3(($764|0),($765|0),136657,0)|0);
  $787 = tempRet0;
@@ -17831,7 +18593,7 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $809 = tempRet0;
  $810 = (_bitshift64Ashr(($804|0),($805|0),21)|0);
  $811 = tempRet0;
- $812 = (_i64Add(($784|0),($785|0),($810|0),($811|0))|0);
+ $812 = (_i64Add(($810|0),($811|0),($784|0),($785|0))|0);
  $813 = tempRet0;
  $814 = (_bitshift64Shl(($810|0),($811|0),21)|0);
  $815 = tempRet0;
@@ -17847,7 +18609,7 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $825 = tempRet0;
  $826 = (_bitshift64Ashr(($820|0),($821|0),21)|0);
  $827 = tempRet0;
- $828 = (_i64Add(($792|0),($793|0),($826|0),($827|0))|0);
+ $828 = (_i64Add(($826|0),($827|0),($792|0),($793|0))|0);
  $829 = tempRet0;
  $830 = (_bitshift64Shl(($826|0),($827|0),21)|0);
  $831 = tempRet0;
@@ -17906,7 +18668,7 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $883 = (_bitshift64Lshr(($800|0),($801|0),8)|0);
  $884 = tempRet0;
  $885 = $883&255;
- $886 = (($s) + 1|0);
+ $886 = ((($s)) + 1|0);
  HEAP8[$886>>0] = $885;
  $887 = (_bitshift64Lshr(($800|0),($801|0),16)|0);
  $888 = tempRet0;
@@ -17919,12 +18681,12 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $893 = (_bitshift64Lshr(($808|0),($809|0),3)|0);
  $894 = tempRet0;
  $895 = $893&255;
- $896 = (($s) + 3|0);
+ $896 = ((($s)) + 3|0);
  HEAP8[$896>>0] = $895;
  $897 = (_bitshift64Lshr(($808|0),($809|0),11)|0);
  $898 = tempRet0;
  $899 = $897&255;
- $900 = (($s) + 4|0);
+ $900 = ((($s)) + 4|0);
  HEAP8[$900>>0] = $899;
  $901 = (_bitshift64Lshr(($808|0),($809|0),19)|0);
  $902 = tempRet0;
@@ -17937,7 +18699,7 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $907 = (_bitshift64Lshr(($816|0),($817|0),6)|0);
  $908 = tempRet0;
  $909 = $907&255;
- $910 = (($s) + 6|0);
+ $910 = ((($s)) + 6|0);
  HEAP8[$910>>0] = $909;
  $911 = (_bitshift64Lshr(($816|0),($817|0),14)|0);
  $912 = tempRet0;
@@ -17950,12 +18712,12 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $917 = (_bitshift64Lshr(($824|0),($825|0),1)|0);
  $918 = tempRet0;
  $919 = $917&255;
- $920 = (($s) + 8|0);
+ $920 = ((($s)) + 8|0);
  HEAP8[$920>>0] = $919;
  $921 = (_bitshift64Lshr(($824|0),($825|0),9)|0);
  $922 = tempRet0;
  $923 = $921&255;
- $924 = (($s) + 9|0);
+ $924 = ((($s)) + 9|0);
  HEAP8[$924>>0] = $923;
  $925 = (_bitshift64Lshr(($824|0),($825|0),17)|0);
  $926 = tempRet0;
@@ -17968,12 +18730,12 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $931 = (_bitshift64Lshr(($832|0),($833|0),4)|0);
  $932 = tempRet0;
  $933 = $931&255;
- $934 = (($s) + 11|0);
+ $934 = ((($s)) + 11|0);
  HEAP8[$934>>0] = $933;
  $935 = (_bitshift64Lshr(($832|0),($833|0),12)|0);
  $936 = tempRet0;
  $937 = $935&255;
- $938 = (($s) + 12|0);
+ $938 = ((($s)) + 12|0);
  HEAP8[$938>>0] = $937;
  $939 = (_bitshift64Lshr(($832|0),($833|0),20)|0);
  $940 = tempRet0;
@@ -17986,7 +18748,7 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $945 = (_bitshift64Lshr(($840|0),($841|0),7)|0);
  $946 = tempRet0;
  $947 = $945&255;
- $948 = (($s) + 14|0);
+ $948 = ((($s)) + 14|0);
  HEAP8[$948>>0] = $947;
  $949 = (_bitshift64Lshr(($840|0),($841|0),15)|0);
  $950 = tempRet0;
@@ -17999,12 +18761,12 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $955 = (_bitshift64Lshr(($848|0),($849|0),2)|0);
  $956 = tempRet0;
  $957 = $955&255;
- $958 = (($s) + 16|0);
+ $958 = ((($s)) + 16|0);
  HEAP8[$958>>0] = $957;
  $959 = (_bitshift64Lshr(($848|0),($849|0),10)|0);
  $960 = tempRet0;
  $961 = $959&255;
- $962 = (($s) + 17|0);
+ $962 = ((($s)) + 17|0);
  HEAP8[$962>>0] = $961;
  $963 = (_bitshift64Lshr(($848|0),($849|0),18)|0);
  $964 = tempRet0;
@@ -18017,19 +18779,19 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $969 = (_bitshift64Lshr(($856|0),($857|0),5)|0);
  $970 = tempRet0;
  $971 = $969&255;
- $972 = (($s) + 19|0);
+ $972 = ((($s)) + 19|0);
  HEAP8[$972>>0] = $971;
  $973 = (_bitshift64Lshr(($856|0),($857|0),13)|0);
  $974 = tempRet0;
  $975 = $973&255;
- $976 = (($s) + 20|0);
+ $976 = ((($s)) + 20|0);
  HEAP8[$976>>0] = $975;
  $977 = $864&255;
  HEAP8[$45>>0] = $977;
  $978 = (_bitshift64Lshr(($864|0),($865|0),8)|0);
  $979 = tempRet0;
  $980 = $978&255;
- $981 = (($s) + 22|0);
+ $981 = ((($s)) + 22|0);
  HEAP8[$981>>0] = $980;
  $982 = (_bitshift64Lshr(($864|0),($865|0),16)|0);
  $983 = tempRet0;
@@ -18042,12 +18804,12 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $988 = (_bitshift64Lshr(($872|0),($873|0),3)|0);
  $989 = tempRet0;
  $990 = $988&255;
- $991 = (($s) + 24|0);
+ $991 = ((($s)) + 24|0);
  HEAP8[$991>>0] = $990;
  $992 = (_bitshift64Lshr(($872|0),($873|0),11)|0);
  $993 = tempRet0;
  $994 = $992&255;
- $995 = (($s) + 25|0);
+ $995 = ((($s)) + 25|0);
  HEAP8[$995>>0] = $994;
  $996 = (_bitshift64Lshr(($872|0),($873|0),19)|0);
  $997 = tempRet0;
@@ -18060,7 +18822,7 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $1002 = (_bitshift64Lshr(($880|0),($881|0),6)|0);
  $1003 = tempRet0;
  $1004 = $1002&255;
- $1005 = (($s) + 27|0);
+ $1005 = ((($s)) + 27|0);
  HEAP8[$1005>>0] = $1004;
  $1006 = (_bitshift64Lshr(($880|0),($881|0),14)|0);
  $1007 = tempRet0;
@@ -18073,18 +18835,18 @@ function _crypto_sign_ed25519_ref10_sc_reduce($s) {
  $1012 = (_bitshift64Lshr(($876|0),($877|0),1)|0);
  $1013 = tempRet0;
  $1014 = $1012&255;
- $1015 = (($s) + 29|0);
+ $1015 = ((($s)) + 29|0);
  HEAP8[$1015>>0] = $1014;
  $1016 = (_bitshift64Lshr(($876|0),($877|0),9)|0);
  $1017 = tempRet0;
  $1018 = $1016&255;
- $1019 = (($s) + 30|0);
+ $1019 = ((($s)) + 30|0);
  HEAP8[$1019>>0] = $1018;
  $1020 = (_bitshift64Lshr(($876|0),($877|0),17)|0);
  $1021 = tempRet0;
  $1022 = $1020&255;
  HEAP8[$67>>0] = $1022;
- STACKTOP = sp;return;
+ return;
 }
 function _load_351($in) {
  $in = $in|0;
@@ -18092,21 +18854,21 @@ function _load_351($in) {
  sp = STACKTOP;
  $0 = HEAP8[$in>>0]|0;
  $1 = $0&255;
- $2 = (($in) + 1|0);
+ $2 = ((($in)) + 1|0);
  $3 = HEAP8[$2>>0]|0;
  $4 = $3&255;
  $5 = (_bitshift64Shl(($4|0),0,8)|0);
  $6 = tempRet0;
  $7 = $5 | $1;
- $8 = (($in) + 2|0);
+ $8 = ((($in)) + 2|0);
  $9 = HEAP8[$8>>0]|0;
  $10 = $9&255;
  $11 = (_bitshift64Shl(($10|0),0,16)|0);
  $12 = tempRet0;
  $13 = $7 | $11;
  $14 = $6 | $12;
- tempRet0 = $14;
- STACKTOP = sp;return ($13|0);
+ tempRet0 = ($14);
+ return ($13|0);
 }
 function _load_452($in) {
  $in = $in|0;
@@ -18115,43 +18877,43 @@ function _load_452($in) {
  sp = STACKTOP;
  $0 = HEAP8[$in>>0]|0;
  $1 = $0&255;
- $2 = (($in) + 1|0);
+ $2 = ((($in)) + 1|0);
  $3 = HEAP8[$2>>0]|0;
  $4 = $3&255;
  $5 = (_bitshift64Shl(($4|0),0,8)|0);
  $6 = tempRet0;
  $7 = $5 | $1;
- $8 = (($in) + 2|0);
+ $8 = ((($in)) + 2|0);
  $9 = HEAP8[$8>>0]|0;
  $10 = $9&255;
  $11 = (_bitshift64Shl(($10|0),0,16)|0);
  $12 = tempRet0;
  $13 = $7 | $11;
  $14 = $6 | $12;
- $15 = (($in) + 3|0);
+ $15 = ((($in)) + 3|0);
  $16 = HEAP8[$15>>0]|0;
  $17 = $16&255;
  $18 = (_bitshift64Shl(($17|0),0,24)|0);
  $19 = tempRet0;
  $20 = $13 | $18;
  $21 = $14 | $19;
- tempRet0 = $21;
- STACKTOP = sp;return ($20|0);
+ tempRet0 = ($21);
+ return ($20|0);
 }
 function _sph_sha512_init($cc) {
  $cc = $cc|0;
  var $0 = 0, $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, dest = 0, label = 0, sp = 0, src = 0, stop = 0;
  sp = STACKTOP;
- $0 = (($cc) + 128|0);
- dest=$0+0|0; src=31840+0|0; stop=dest+64|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
- $1 = (($cc) + 192|0);
+ $0 = ((($cc)) + 128|0);
+ dest=$0; src=8; stop=dest+64|0; do { HEAP32[dest>>2]=HEAP32[src>>2]|0; dest=dest+4|0; src=src+4|0; } while ((dest|0) < (stop|0));
+ $1 = ((($cc)) + 192|0);
  $2 = $1;
  $3 = $2;
  HEAP32[$3>>2] = 0;
  $4 = (($2) + 4)|0;
  $5 = $4;
  HEAP32[$5>>2] = 0;
- STACKTOP = sp;return;
+ return;
 }
 function _sph_sha384($cc,$data,$len) {
  $cc = $cc|0;
@@ -18160,10 +18922,10 @@ function _sph_sha384($cc,$data,$len) {
  var $$01$ = 0, $$012 = 0, $$03 = 0, $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0;
  var $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0, $29 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $current$04 = 0, $current$1 = 0, label = 0, sp = 0;
  sp = STACKTOP;
- $0 = (($cc) + 192|0);
+ $0 = ((($cc)) + 192|0);
  $1 = ($len|0)==(0);
  if ($1) {
-  STACKTOP = sp;return;
+  return;
  }
  $2 = $0;
  $3 = $2;
@@ -18172,7 +18934,7 @@ function _sph_sha384($cc,$data,$len) {
  $6 = $5;
  $7 = HEAP32[$6>>2]|0;
  $8 = $4 & 127;
- $9 = (($cc) + 128|0);
+ $9 = ((($cc)) + 128|0);
  $$012 = $len;$$03 = $data;$current$04 = $8;
  while(1) {
   $10 = (128 - ($current$04))|0;
@@ -18211,7 +18973,7 @@ function _sph_sha384($cc,$data,$len) {
    $$012 = $15;$$03 = $13;$current$04 = $current$1;
   }
  }
- STACKTOP = sp;return;
+ return;
 }
 function _sph_sha512_close($cc,$dst) {
  $cc = $cc|0;
@@ -18220,7 +18982,7 @@ function _sph_sha512_close($cc,$dst) {
  sp = STACKTOP;
  _sha384_close($cc,$dst,8);
  _sph_sha512_init($cc);
- STACKTOP = sp;return;
+ return;
 }
 function _sha3_round($data,$r) {
  $data = $data|0;
@@ -18272,8 +19034,8 @@ function _sha3_round($data,$r) {
  var $891 = 0, $892 = 0, $893 = 0, $894 = 0, $895 = 0, $896 = 0, $897 = 0, $898 = 0, $899 = 0, $9 = 0, $90 = 0, $900 = 0, $901 = 0, $902 = 0, $903 = 0, $904 = 0, $905 = 0, $906 = 0, $907 = 0, $908 = 0;
  var $909 = 0, $91 = 0, $910 = 0, $911 = 0, $912 = 0, $913 = 0, $914 = 0, $915 = 0, $916 = 0, $917 = 0, $918 = 0, $919 = 0, $92 = 0, $920 = 0, $921 = 0, $922 = 0, $923 = 0, $924 = 0, $925 = 0, $926 = 0;
  var $927 = 0, $928 = 0, $929 = 0, $93 = 0, $930 = 0, $931 = 0, $932 = 0, $933 = 0, $934 = 0, $935 = 0, $936 = 0, $937 = 0, $938 = 0, $939 = 0, $94 = 0, $940 = 0, $941 = 0, $942 = 0, $943 = 0, $944 = 0;
- var $945 = 0, $946 = 0, $947 = 0, $948 = 0, $949 = 0, $95 = 0, $950 = 0, $951 = 0, $952 = 0, $953 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, $W = 0, $exitcond = 0, $exitcond19 = 0, $i$011 = 0, $i$110 = 0, $i$29 = 0;
- var label = 0, sp = 0;
+ var $945 = 0, $946 = 0, $947 = 0, $948 = 0, $949 = 0, $95 = 0, $950 = 0, $951 = 0, $952 = 0, $953 = 0, $954 = 0, $955 = 0, $956 = 0, $957 = 0, $958 = 0, $959 = 0, $96 = 0, $960 = 0, $961 = 0, $962 = 0;
+ var $963 = 0, $964 = 0, $965 = 0, $966 = 0, $967 = 0, $968 = 0, $969 = 0, $97 = 0, $98 = 0, $99 = 0, $W = 0, $exitcond = 0, $exitcond19 = 0, $i$011 = 0, $i$110 = 0, $i$29 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 640|0;
  $W = sp;
@@ -18395,56 +19157,56 @@ function _sha3_round($data,$r) {
  $93 = (($90) + 4)|0;
  $94 = $93;
  $95 = HEAP32[$94>>2]|0;
- $96 = (($r) + 8|0);
+ $96 = ((($r)) + 8|0);
  $97 = $96;
  $98 = $97;
  $99 = HEAP32[$98>>2]|0;
  $100 = (($97) + 4)|0;
  $101 = $100;
  $102 = HEAP32[$101>>2]|0;
- $103 = (($r) + 16|0);
+ $103 = ((($r)) + 16|0);
  $104 = $103;
  $105 = $104;
  $106 = HEAP32[$105>>2]|0;
  $107 = (($104) + 4)|0;
  $108 = $107;
  $109 = HEAP32[$108>>2]|0;
- $110 = (($r) + 24|0);
+ $110 = ((($r)) + 24|0);
  $111 = $110;
  $112 = $111;
  $113 = HEAP32[$112>>2]|0;
  $114 = (($111) + 4)|0;
  $115 = $114;
  $116 = HEAP32[$115>>2]|0;
- $117 = (($r) + 32|0);
+ $117 = ((($r)) + 32|0);
  $118 = $117;
  $119 = $118;
  $120 = HEAP32[$119>>2]|0;
  $121 = (($118) + 4)|0;
  $122 = $121;
  $123 = HEAP32[$122>>2]|0;
- $124 = (($r) + 40|0);
+ $124 = ((($r)) + 40|0);
  $125 = $124;
  $126 = $125;
  $127 = HEAP32[$126>>2]|0;
  $128 = (($125) + 4)|0;
  $129 = $128;
  $130 = HEAP32[$129>>2]|0;
- $131 = (($r) + 48|0);
+ $131 = ((($r)) + 48|0);
  $132 = $131;
  $133 = $132;
  $134 = HEAP32[$133>>2]|0;
  $135 = (($132) + 4)|0;
  $136 = $135;
  $137 = HEAP32[$136>>2]|0;
- $138 = (($r) + 56|0);
+ $138 = ((($r)) + 56|0);
  $139 = $138;
  $140 = $139;
  $141 = HEAP32[$140>>2]|0;
  $142 = (($139) + 4)|0;
  $143 = $142;
  $144 = HEAP32[$143>>2]|0;
- $145 = $120;$146 = $123;$170 = $134;$171 = $127;$173 = $137;$174 = $130;$193 = $141;$194 = $144;$203 = $92;$204 = $95;$228 = $99;$230 = $102;$234 = $106;$236 = $109;$241 = $113;$242 = $116;$i$29 = 0;
+ $145 = $120;$146 = $123;$170 = $127;$171 = $134;$173 = $130;$174 = $137;$193 = $141;$194 = $144;$203 = $92;$204 = $95;$228 = $99;$230 = $102;$234 = $106;$236 = $109;$241 = $113;$242 = $116;$i$29 = 0;
  while(1) {
   $147 = (_bitshift64Shl(($145|0),($146|0),50)|0);
   $148 = tempRet0;
@@ -18468,13 +19230,13 @@ function _sha3_round($data,$r) {
   $166 = $162 | $164;
   $167 = $159 ^ $165;
   $168 = $160 ^ $166;
-  $169 = $171 ^ $170;
-  $172 = $174 ^ $173;
+  $169 = $170 ^ $171;
+  $172 = $173 ^ $174;
   $175 = $169 & $145;
   $176 = $172 & $146;
-  $177 = $175 ^ $170;
-  $178 = $176 ^ $173;
-  $179 = (31904 + ($i$29<<3)|0);
+  $177 = $175 ^ $171;
+  $178 = $176 ^ $174;
+  $179 = (72 + ($i$29<<3)|0);
   $180 = $179;
   $181 = $180;
   $182 = HEAP32[$181>>2]|0;
@@ -18554,14 +19316,14 @@ function _sha3_round($data,$r) {
   $266 = $262 | $264;
   $267 = $259 ^ $265;
   $268 = $260 ^ $266;
-  $269 = $145 ^ $171;
-  $270 = $146 ^ $174;
+  $269 = $145 ^ $170;
+  $270 = $146 ^ $173;
   $271 = $243 & $269;
   $272 = $244 & $270;
-  $273 = $271 ^ $171;
-  $274 = $272 ^ $174;
+  $273 = $271 ^ $170;
+  $274 = $272 ^ $173;
   $275 = $i$29 | 1;
-  $276 = (31904 + ($275<<3)|0);
+  $276 = (72 + ($275<<3)|0);
   $277 = $276;
   $278 = $277;
   $279 = HEAP32[$278>>2]|0;
@@ -18575,7 +19337,7 @@ function _sha3_round($data,$r) {
   $287 = (($284) + 4)|0;
   $288 = $287;
   $289 = HEAP32[$288>>2]|0;
-  $290 = (_i64Add(($279|0),($282|0),($170|0),($173|0))|0);
+  $290 = (_i64Add(($279|0),($282|0),($171|0),($174|0))|0);
   $291 = tempRet0;
   $292 = (_i64Add(($290|0),($291|0),($286|0),($289|0))|0);
   $293 = tempRet0;
@@ -18648,7 +19410,7 @@ function _sha3_round($data,$r) {
   $360 = $358 ^ $145;
   $361 = $359 ^ $146;
   $362 = $i$29 | 2;
-  $363 = (31904 + ($362<<3)|0);
+  $363 = (72 + ($362<<3)|0);
   $364 = $363;
   $365 = $364;
   $366 = HEAP32[$365>>2]|0;
@@ -18662,7 +19424,7 @@ function _sha3_round($data,$r) {
   $374 = (($371) + 4)|0;
   $375 = $374;
   $376 = HEAP32[$375>>2]|0;
-  $377 = (_i64Add(($366|0),($369|0),($171|0),($174|0))|0);
+  $377 = (_i64Add(($366|0),($369|0),($170|0),($173|0))|0);
   $378 = tempRet0;
   $379 = (_i64Add(($377|0),($378|0),($373|0),($376|0))|0);
   $380 = tempRet0;
@@ -18735,7 +19497,7 @@ function _sha3_round($data,$r) {
   $447 = $445 ^ $243;
   $448 = $446 ^ $244;
   $449 = $i$29 | 3;
-  $450 = (31904 + ($449<<3)|0);
+  $450 = (72 + ($449<<3)|0);
   $451 = $450;
   $452 = $451;
   $453 = HEAP32[$452>>2]|0;
@@ -18822,7 +19584,7 @@ function _sha3_round($data,$r) {
   $534 = $532 ^ $330;
   $535 = $533 ^ $331;
   $536 = $i$29 | 4;
-  $537 = (31904 + ($536<<3)|0);
+  $537 = (72 + ($536<<3)|0);
   $538 = $537;
   $539 = $538;
   $540 = HEAP32[$539>>2]|0;
@@ -18909,7 +19671,7 @@ function _sha3_round($data,$r) {
   $621 = $619 ^ $417;
   $622 = $620 ^ $418;
   $623 = $i$29 | 5;
-  $624 = (31904 + ($623<<3)|0);
+  $624 = (72 + ($623<<3)|0);
   $625 = $624;
   $626 = $625;
   $627 = HEAP32[$626>>2]|0;
@@ -18923,9 +19685,9 @@ function _sha3_round($data,$r) {
   $635 = (($632) + 4)|0;
   $636 = $635;
   $637 = HEAP32[$636>>2]|0;
-  $638 = (_i64Add(($627|0),($630|0),($330|0),($331|0))|0);
+  $638 = (_i64Add(($634|0),($637|0),($627|0),($630|0))|0);
   $639 = tempRet0;
-  $640 = (_i64Add(($638|0),($639|0),($634|0),($637|0))|0);
+  $640 = (_i64Add(($638|0),($639|0),($330|0),($331|0))|0);
   $641 = tempRet0;
   $642 = (_i64Add(($640|0),($641|0),($621|0),($622|0))|0);
   $643 = tempRet0;
@@ -18996,7 +19758,7 @@ function _sha3_round($data,$r) {
   $708 = $706 ^ $504;
   $709 = $707 ^ $505;
   $710 = $i$29 | 6;
-  $711 = (31904 + ($710<<3)|0);
+  $711 = (72 + ($710<<3)|0);
   $712 = $711;
   $713 = $712;
   $714 = HEAP32[$713>>2]|0;
@@ -19083,7 +19845,7 @@ function _sha3_round($data,$r) {
   $795 = $793 ^ $591;
   $796 = $794 ^ $592;
   $797 = $i$29 | 7;
-  $798 = (31904 + ($797<<3)|0);
+  $798 = (72 + ($797<<3)|0);
   $799 = $798;
   $800 = $799;
   $801 = HEAP32[$800>>2]|0;
@@ -19144,8 +19906,9 @@ function _sha3_round($data,$r) {
   $856 = (($i$29) + 8)|0;
   $857 = ($856|0)<(80);
   if ($857) {
-   $145 = $852;$146 = $853;$170 = $678;$171 = $765;$173 = $679;$174 = $766;$193 = $591;$194 = $592;$203 = $854;$204 = $855;$228 = $767;$230 = $768;$234 = $680;$236 = $681;$241 = $593;$242 = $594;$i$29 = $856;
+   $145 = $852;$146 = $853;$170 = $765;$171 = $678;$173 = $766;$174 = $679;$193 = $591;$194 = $592;$203 = $854;$204 = $855;$228 = $767;$230 = $768;$234 = $680;$236 = $681;$241 = $593;$242 = $594;$i$29 = $856;
   } else {
+   $864 = $854;$865 = $855;$878 = $767;$879 = $768;$892 = $680;$893 = $681;$906 = $593;$907 = $594;$920 = $852;$921 = $853;$934 = $765;$935 = $766;$948 = $678;$949 = $679;$962 = $591;$963 = $592;
    break;
   }
  }
@@ -19155,112 +19918,112 @@ function _sha3_round($data,$r) {
  $861 = (($858) + 4)|0;
  $862 = $861;
  $863 = HEAP32[$862>>2]|0;
- $864 = (_i64Add(($860|0),($863|0),($854|0),($855|0))|0);
- $865 = tempRet0;
- $866 = $r;
- $867 = $866;
- HEAP32[$867>>2] = $864;
- $868 = (($866) + 4)|0;
+ $866 = (_i64Add(($860|0),($863|0),($864|0),($865|0))|0);
+ $867 = tempRet0;
+ $868 = $r;
  $869 = $868;
- HEAP32[$869>>2] = $865;
- $870 = $96;
+ HEAP32[$869>>2] = $866;
+ $870 = (($868) + 4)|0;
  $871 = $870;
- $872 = HEAP32[$871>>2]|0;
- $873 = (($870) + 4)|0;
- $874 = $873;
- $875 = HEAP32[$874>>2]|0;
- $876 = (_i64Add(($872|0),($875|0),($767|0),($768|0))|0);
- $877 = tempRet0;
- $878 = $96;
- $879 = $878;
- HEAP32[$879>>2] = $876;
- $880 = (($878) + 4)|0;
- $881 = $880;
- HEAP32[$881>>2] = $877;
- $882 = $103;
+ HEAP32[$871>>2] = $867;
+ $872 = $96;
+ $873 = $872;
+ $874 = HEAP32[$873>>2]|0;
+ $875 = (($872) + 4)|0;
+ $876 = $875;
+ $877 = HEAP32[$876>>2]|0;
+ $880 = (_i64Add(($874|0),($877|0),($878|0),($879|0))|0);
+ $881 = tempRet0;
+ $882 = $96;
  $883 = $882;
- $884 = HEAP32[$883>>2]|0;
- $885 = (($882) + 4)|0;
- $886 = $885;
- $887 = HEAP32[$886>>2]|0;
- $888 = (_i64Add(($884|0),($887|0),($680|0),($681|0))|0);
- $889 = tempRet0;
- $890 = $103;
- $891 = $890;
- HEAP32[$891>>2] = $888;
- $892 = (($890) + 4)|0;
- $893 = $892;
- HEAP32[$893>>2] = $889;
- $894 = $110;
- $895 = $894;
- $896 = HEAP32[$895>>2]|0;
- $897 = (($894) + 4)|0;
- $898 = $897;
- $899 = HEAP32[$898>>2]|0;
- $900 = (_i64Add(($896|0),($899|0),($593|0),($594|0))|0);
- $901 = tempRet0;
- $902 = $110;
- $903 = $902;
- HEAP32[$903>>2] = $900;
- $904 = (($902) + 4)|0;
- $905 = $904;
- HEAP32[$905>>2] = $901;
- $906 = $117;
- $907 = $906;
- $908 = HEAP32[$907>>2]|0;
- $909 = (($906) + 4)|0;
- $910 = $909;
- $911 = HEAP32[$910>>2]|0;
- $912 = (_i64Add(($908|0),($911|0),($852|0),($853|0))|0);
- $913 = tempRet0;
+ HEAP32[$883>>2] = $880;
+ $884 = (($882) + 4)|0;
+ $885 = $884;
+ HEAP32[$885>>2] = $881;
+ $886 = $103;
+ $887 = $886;
+ $888 = HEAP32[$887>>2]|0;
+ $889 = (($886) + 4)|0;
+ $890 = $889;
+ $891 = HEAP32[$890>>2]|0;
+ $894 = (_i64Add(($888|0),($891|0),($892|0),($893|0))|0);
+ $895 = tempRet0;
+ $896 = $103;
+ $897 = $896;
+ HEAP32[$897>>2] = $894;
+ $898 = (($896) + 4)|0;
+ $899 = $898;
+ HEAP32[$899>>2] = $895;
+ $900 = $110;
+ $901 = $900;
+ $902 = HEAP32[$901>>2]|0;
+ $903 = (($900) + 4)|0;
+ $904 = $903;
+ $905 = HEAP32[$904>>2]|0;
+ $908 = (_i64Add(($902|0),($905|0),($906|0),($907|0))|0);
+ $909 = tempRet0;
+ $910 = $110;
+ $911 = $910;
+ HEAP32[$911>>2] = $908;
+ $912 = (($910) + 4)|0;
+ $913 = $912;
+ HEAP32[$913>>2] = $909;
  $914 = $117;
  $915 = $914;
- HEAP32[$915>>2] = $912;
- $916 = (($914) + 4)|0;
- $917 = $916;
- HEAP32[$917>>2] = $913;
- $918 = $124;
- $919 = $918;
- $920 = HEAP32[$919>>2]|0;
- $921 = (($918) + 4)|0;
- $922 = $921;
- $923 = HEAP32[$922>>2]|0;
- $924 = (_i64Add(($920|0),($923|0),($765|0),($766|0))|0);
- $925 = tempRet0;
- $926 = $124;
+ $916 = HEAP32[$915>>2]|0;
+ $917 = (($914) + 4)|0;
+ $918 = $917;
+ $919 = HEAP32[$918>>2]|0;
+ $922 = (_i64Add(($916|0),($919|0),($920|0),($921|0))|0);
+ $923 = tempRet0;
+ $924 = $117;
+ $925 = $924;
+ HEAP32[$925>>2] = $922;
+ $926 = (($924) + 4)|0;
  $927 = $926;
- HEAP32[$927>>2] = $924;
- $928 = (($926) + 4)|0;
+ HEAP32[$927>>2] = $923;
+ $928 = $124;
  $929 = $928;
- HEAP32[$929>>2] = $925;
- $930 = $131;
- $931 = $930;
- $932 = HEAP32[$931>>2]|0;
- $933 = (($930) + 4)|0;
- $934 = $933;
- $935 = HEAP32[$934>>2]|0;
- $936 = (_i64Add(($932|0),($935|0),($678|0),($679|0))|0);
+ $930 = HEAP32[$929>>2]|0;
+ $931 = (($928) + 4)|0;
+ $932 = $931;
+ $933 = HEAP32[$932>>2]|0;
+ $936 = (_i64Add(($930|0),($933|0),($934|0),($935|0))|0);
  $937 = tempRet0;
- $938 = $131;
+ $938 = $124;
  $939 = $938;
  HEAP32[$939>>2] = $936;
  $940 = (($938) + 4)|0;
  $941 = $940;
  HEAP32[$941>>2] = $937;
- $942 = $138;
+ $942 = $131;
  $943 = $942;
  $944 = HEAP32[$943>>2]|0;
  $945 = (($942) + 4)|0;
  $946 = $945;
  $947 = HEAP32[$946>>2]|0;
- $948 = (_i64Add(($944|0),($947|0),($591|0),($592|0))|0);
- $949 = tempRet0;
- $950 = $138;
- $951 = $950;
- HEAP32[$951>>2] = $948;
- $952 = (($950) + 4)|0;
+ $950 = (_i64Add(($944|0),($947|0),($948|0),($949|0))|0);
+ $951 = tempRet0;
+ $952 = $131;
  $953 = $952;
- HEAP32[$953>>2] = $949;
+ HEAP32[$953>>2] = $950;
+ $954 = (($952) + 4)|0;
+ $955 = $954;
+ HEAP32[$955>>2] = $951;
+ $956 = $138;
+ $957 = $956;
+ $958 = HEAP32[$957>>2]|0;
+ $959 = (($956) + 4)|0;
+ $960 = $959;
+ $961 = HEAP32[$960>>2]|0;
+ $964 = (_i64Add(($958|0),($961|0),($962|0),($963|0))|0);
+ $965 = tempRet0;
+ $966 = $138;
+ $967 = $966;
+ HEAP32[$967>>2] = $964;
+ $968 = (($966) + 4)|0;
+ $969 = $968;
+ HEAP32[$969>>2] = $965;
  STACKTOP = sp;return;
 }
 function _sha384_close($cc,$dst,$rnum) {
@@ -19270,7 +20033,7 @@ function _sha384_close($cc,$dst,$rnum) {
  var label = 0, sp = 0;
  sp = STACKTOP;
  _sha384_addbits_and_close($cc,0,0,$dst,$rnum);
- STACKTOP = sp;return;
+ return;
 }
 function _sha384_addbits_and_close($cc,$ub,$n,$dst,$rnum) {
  $cc = $cc|0;
@@ -19282,7 +20045,7 @@ function _sha384_addbits_and_close($cc,$ub,$n,$dst,$rnum) {
  var $27 = 0, $28 = 0, $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0;
  var $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $exitcond = 0, $u$01 = 0, dest = 0, label = 0, sp = 0, stop = 0;
  sp = STACKTOP;
- $0 = (($cc) + 192|0);
+ $0 = ((($cc)) + 192|0);
  $1 = $0;
  $2 = $1;
  $3 = HEAP32[$2>>2]|0;
@@ -19303,14 +20066,14 @@ function _sha384_addbits_and_close($cc,$ub,$n,$dst,$rnum) {
  if ($15) {
   $17 = $7 ^ 127;
   _memset(($16|0),0,($17|0))|0;
-  $18 = (($cc) + 128|0);
+  $18 = ((($cc)) + 128|0);
   _sha3_round($cc,$18);
-  dest=$cc+0|0; stop=dest+112|0; do { HEAP8[dest>>0]=0|0; dest=dest+1|0; } while ((dest|0) < (stop|0));
+  dest=$cc; stop=dest+112|0; do { HEAP8[dest>>0]=0|0; dest=dest+1|0; } while ((dest|0) < (stop|0));
  } else {
   $19 = (111 - ($7))|0;
   _memset(($16|0),0,($19|0))|0;
  }
- $20 = (($cc) + 112|0);
+ $20 = ((($cc)) + 112|0);
  $21 = $0;
  $22 = $21;
  $23 = HEAP32[$22>>2]|0;
@@ -19320,7 +20083,7 @@ function _sha384_addbits_and_close($cc,$ub,$n,$dst,$rnum) {
  $27 = (_bitshift64Lshr(($23|0),($26|0),61)|0);
  $28 = tempRet0;
  _sph_enc64be_aligned($20,$27,$28);
- $29 = (($cc) + 120|0);
+ $29 = ((($cc)) + 120|0);
  $30 = $0;
  $31 = $30;
  $32 = HEAP32[$31>>2]|0;
@@ -19332,11 +20095,11 @@ function _sha384_addbits_and_close($cc,$ub,$n,$dst,$rnum) {
  $38 = (_i64Add(($36|0),($37|0),($n|0),0)|0);
  $39 = tempRet0;
  _sph_enc64be_aligned($29,$38,$39);
- $40 = (($cc) + 128|0);
+ $40 = ((($cc)) + 128|0);
  _sha3_round($cc,$40);
  $41 = ($rnum|0)==(0);
  if ($41) {
-  STACKTOP = sp;return;
+  return;
  } else {
   $u$01 = 0;
  }
@@ -19359,63 +20122,7 @@ function _sha384_addbits_and_close($cc,$ub,$n,$dst,$rnum) {
    $u$01 = $51;
   }
  }
- STACKTOP = sp;return;
-}
-function _sph_dec64be_aligned($src) {
- $src = $src|0;
- var $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0;
- var $27 = 0, $28 = 0, $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0;
- var $45 = 0, $46 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, label = 0, sp = 0;
- sp = STACKTOP;
- $0 = HEAP8[$src>>0]|0;
- $1 = $0&255;
- $2 = (_bitshift64Shl(($1|0),0,56)|0);
- $3 = tempRet0;
- $4 = (($src) + 1|0);
- $5 = HEAP8[$4>>0]|0;
- $6 = $5&255;
- $7 = (_bitshift64Shl(($6|0),0,48)|0);
- $8 = tempRet0;
- $9 = $7 | $2;
- $10 = $8 | $3;
- $11 = (($src) + 2|0);
- $12 = HEAP8[$11>>0]|0;
- $13 = $12&255;
- $14 = (_bitshift64Shl(($13|0),0,40)|0);
- $15 = tempRet0;
- $16 = $9 | $14;
- $17 = $10 | $15;
- $18 = (($src) + 3|0);
- $19 = HEAP8[$18>>0]|0;
- $20 = $19&255;
- $21 = $17 | $20;
- $22 = (($src) + 4|0);
- $23 = HEAP8[$22>>0]|0;
- $24 = $23&255;
- $25 = (_bitshift64Shl(($24|0),0,24)|0);
- $26 = tempRet0;
- $27 = $16 | $25;
- $28 = $21 | $26;
- $29 = (($src) + 5|0);
- $30 = HEAP8[$29>>0]|0;
- $31 = $30&255;
- $32 = (_bitshift64Shl(($31|0),0,16)|0);
- $33 = tempRet0;
- $34 = $27 | $32;
- $35 = $28 | $33;
- $36 = (($src) + 6|0);
- $37 = HEAP8[$36>>0]|0;
- $38 = $37&255;
- $39 = (_bitshift64Shl(($38|0),0,8)|0);
- $40 = tempRet0;
- $41 = $34 | $39;
- $42 = $35 | $40;
- $43 = (($src) + 7|0);
- $44 = HEAP8[$43>>0]|0;
- $45 = $44&255;
- $46 = $41 | $45;
- tempRet0 = $42;
- STACKTOP = sp;return ($46|0);
+ return;
 }
 function _sph_enc64be_aligned($dst,$0,$1) {
  $dst = $dst|0;
@@ -19431,35 +20138,35 @@ function _sph_enc64be_aligned($dst,$0,$1) {
  $5 = (_bitshift64Lshr(($0|0),($1|0),48)|0);
  $6 = tempRet0;
  $7 = $5&255;
- $8 = (($dst) + 1|0);
+ $8 = ((($dst)) + 1|0);
  HEAP8[$8>>0] = $7;
  $9 = (_bitshift64Lshr(($0|0),($1|0),40)|0);
  $10 = tempRet0;
  $11 = $9&255;
- $12 = (($dst) + 2|0);
+ $12 = ((($dst)) + 2|0);
  HEAP8[$12>>0] = $11;
  $13 = $1&255;
- $14 = (($dst) + 3|0);
+ $14 = ((($dst)) + 3|0);
  HEAP8[$14>>0] = $13;
  $15 = (_bitshift64Lshr(($0|0),($1|0),24)|0);
  $16 = tempRet0;
  $17 = $15&255;
- $18 = (($dst) + 4|0);
+ $18 = ((($dst)) + 4|0);
  HEAP8[$18>>0] = $17;
  $19 = (_bitshift64Lshr(($0|0),($1|0),16)|0);
  $20 = tempRet0;
  $21 = $19&255;
- $22 = (($dst) + 5|0);
+ $22 = ((($dst)) + 5|0);
  HEAP8[$22>>0] = $21;
  $23 = (_bitshift64Lshr(($0|0),($1|0),8)|0);
  $24 = tempRet0;
  $25 = $23&255;
- $26 = (($dst) + 6|0);
+ $26 = ((($dst)) + 6|0);
  HEAP8[$26>>0] = $25;
  $27 = $0&255;
- $28 = (($dst) + 7|0);
+ $28 = ((($dst)) + 7|0);
  HEAP8[$28>>0] = $27;
- STACKTOP = sp;return;
+ return;
 }
 function _sph_enc64be($dst,$0,$1) {
  $dst = $dst|0;
@@ -19475,129 +20182,578 @@ function _sph_enc64be($dst,$0,$1) {
  $5 = (_bitshift64Lshr(($0|0),($1|0),48)|0);
  $6 = tempRet0;
  $7 = $5&255;
- $8 = (($dst) + 1|0);
+ $8 = ((($dst)) + 1|0);
  HEAP8[$8>>0] = $7;
  $9 = (_bitshift64Lshr(($0|0),($1|0),40)|0);
  $10 = tempRet0;
  $11 = $9&255;
- $12 = (($dst) + 2|0);
+ $12 = ((($dst)) + 2|0);
  HEAP8[$12>>0] = $11;
  $13 = $1&255;
- $14 = (($dst) + 3|0);
+ $14 = ((($dst)) + 3|0);
  HEAP8[$14>>0] = $13;
  $15 = (_bitshift64Lshr(($0|0),($1|0),24)|0);
  $16 = tempRet0;
  $17 = $15&255;
- $18 = (($dst) + 4|0);
+ $18 = ((($dst)) + 4|0);
  HEAP8[$18>>0] = $17;
  $19 = (_bitshift64Lshr(($0|0),($1|0),16)|0);
  $20 = tempRet0;
  $21 = $19&255;
- $22 = (($dst) + 5|0);
+ $22 = ((($dst)) + 5|0);
  HEAP8[$22>>0] = $21;
  $23 = (_bitshift64Lshr(($0|0),($1|0),8)|0);
  $24 = tempRet0;
  $25 = $23&255;
- $26 = (($dst) + 6|0);
+ $26 = ((($dst)) + 6|0);
  HEAP8[$26>>0] = $25;
  $27 = $0&255;
- $28 = (($dst) + 7|0);
+ $28 = ((($dst)) + 7|0);
  HEAP8[$28>>0] = $27;
- STACKTOP = sp;return;
+ return;
+}
+function _sph_dec64be_aligned($src) {
+ $src = $src|0;
+ var $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0;
+ var $27 = 0, $28 = 0, $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0;
+ var $45 = 0, $46 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $0 = HEAP8[$src>>0]|0;
+ $1 = $0&255;
+ $2 = (_bitshift64Shl(($1|0),0,56)|0);
+ $3 = tempRet0;
+ $4 = ((($src)) + 1|0);
+ $5 = HEAP8[$4>>0]|0;
+ $6 = $5&255;
+ $7 = (_bitshift64Shl(($6|0),0,48)|0);
+ $8 = tempRet0;
+ $9 = $7 | $2;
+ $10 = $8 | $3;
+ $11 = ((($src)) + 2|0);
+ $12 = HEAP8[$11>>0]|0;
+ $13 = $12&255;
+ $14 = (_bitshift64Shl(($13|0),0,40)|0);
+ $15 = tempRet0;
+ $16 = $9 | $14;
+ $17 = $10 | $15;
+ $18 = ((($src)) + 3|0);
+ $19 = HEAP8[$18>>0]|0;
+ $20 = $19&255;
+ $21 = $17 | $20;
+ $22 = ((($src)) + 4|0);
+ $23 = HEAP8[$22>>0]|0;
+ $24 = $23&255;
+ $25 = (_bitshift64Shl(($24|0),0,24)|0);
+ $26 = tempRet0;
+ $27 = $16 | $25;
+ $28 = $21 | $26;
+ $29 = ((($src)) + 5|0);
+ $30 = HEAP8[$29>>0]|0;
+ $31 = $30&255;
+ $32 = (_bitshift64Shl(($31|0),0,16)|0);
+ $33 = tempRet0;
+ $34 = $27 | $32;
+ $35 = $28 | $33;
+ $36 = ((($src)) + 6|0);
+ $37 = HEAP8[$36>>0]|0;
+ $38 = $37&255;
+ $39 = (_bitshift64Shl(($38|0),0,8)|0);
+ $40 = tempRet0;
+ $41 = $34 | $39;
+ $42 = $35 | $40;
+ $43 = ((($src)) + 7|0);
+ $44 = HEAP8[$43>>0]|0;
+ $45 = $44&255;
+ $46 = $41 | $45;
+ tempRet0 = ($42);
+ return ($46|0);
+}
+function ___errno_location() {
+ var $$0 = 0, $0 = 0, $1 = 0, $2 = 0, $3 = 0, $4 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $0 = HEAP32[32512>>2]|0;
+ $1 = ($0|0)==(0|0);
+ if ($1) {
+  $$0 = 32560;
+ } else {
+  $2 = (_pthread_self()|0);
+  $3 = ((($2)) + 60|0);
+  $4 = HEAP32[$3>>2]|0;
+  $$0 = $4;
+ }
+ return ($$0|0);
+}
+function ___syscall_ret($r) {
+ $r = $r|0;
+ var $$0 = 0, $0 = 0, $1 = 0, $2 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $0 = ($r>>>0)>(4294963200);
+ if ($0) {
+  $1 = (0 - ($r))|0;
+  $2 = (___errno_location()|0);
+  HEAP32[$2>>2] = $1;
+  $$0 = -1;
+ } else {
+  $$0 = $r;
+ }
+ return ($$0|0);
+}
+function ___lockfile($f) {
+ $f = $f|0;
+ var label = 0, sp = 0;
+ sp = STACKTOP;
+ return 0;
+}
+function ___unlockfile($f) {
+ $f = $f|0;
+ var label = 0, sp = 0;
+ sp = STACKTOP;
+ return;
+}
+function ___stdio_close($f) {
+ $f = $f|0;
+ var $0 = 0, $1 = 0, $2 = 0, $3 = 0, $vararg_buffer = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ STACKTOP = STACKTOP + 16|0;
+ $vararg_buffer = sp;
+ $0 = ((($f)) + 60|0);
+ $1 = HEAP32[$0>>2]|0;
+ HEAP32[$vararg_buffer>>2] = $1;
+ $2 = (___syscall6(6,($vararg_buffer|0))|0);
+ $3 = (___syscall_ret($2)|0);
+ STACKTOP = sp;return ($3|0);
+}
+function ___stdio_seek($f,$off,$whence) {
+ $f = $f|0;
+ $off = $off|0;
+ $whence = $whence|0;
+ var $$pre = 0, $0 = 0, $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $ret = 0, $vararg_buffer = 0, $vararg_ptr1 = 0, $vararg_ptr2 = 0, $vararg_ptr3 = 0, $vararg_ptr4 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ STACKTOP = STACKTOP + 32|0;
+ $vararg_buffer = sp;
+ $ret = sp + 20|0;
+ $0 = ((($f)) + 60|0);
+ $1 = HEAP32[$0>>2]|0;
+ HEAP32[$vararg_buffer>>2] = $1;
+ $vararg_ptr1 = ((($vararg_buffer)) + 4|0);
+ HEAP32[$vararg_ptr1>>2] = 0;
+ $vararg_ptr2 = ((($vararg_buffer)) + 8|0);
+ HEAP32[$vararg_ptr2>>2] = $off;
+ $vararg_ptr3 = ((($vararg_buffer)) + 12|0);
+ HEAP32[$vararg_ptr3>>2] = $ret;
+ $vararg_ptr4 = ((($vararg_buffer)) + 16|0);
+ HEAP32[$vararg_ptr4>>2] = $whence;
+ $2 = (___syscall140(140,($vararg_buffer|0))|0);
+ $3 = (___syscall_ret($2)|0);
+ $4 = ($3|0)<(0);
+ if ($4) {
+  HEAP32[$ret>>2] = -1;
+  $5 = -1;
+ } else {
+  $$pre = HEAP32[$ret>>2]|0;
+  $5 = $$pre;
+ }
+ STACKTOP = sp;return ($5|0);
+}
+function ___stdio_write($f,$buf,$len) {
+ $f = $f|0;
+ $buf = $buf|0;
+ $len = $len|0;
+ var $$0 = 0, $$phi$trans$insert = 0, $$pre = 0, $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0;
+ var $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0, $29 = 0, $3 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0;
+ var $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $cnt$0 = 0, $cnt$1 = 0, $iov$0 = 0, $iov$0$lcssa11 = 0, $iov$1 = 0, $iovcnt$0 = 0;
+ var $iovcnt$0$lcssa12 = 0, $iovcnt$1 = 0, $iovs = 0, $rem$0 = 0, $vararg_buffer = 0, $vararg_buffer3 = 0, $vararg_ptr1 = 0, $vararg_ptr2 = 0, $vararg_ptr6 = 0, $vararg_ptr7 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ STACKTOP = STACKTOP + 48|0;
+ $vararg_buffer3 = sp + 16|0;
+ $vararg_buffer = sp;
+ $iovs = sp + 32|0;
+ $0 = ((($f)) + 28|0);
+ $1 = HEAP32[$0>>2]|0;
+ HEAP32[$iovs>>2] = $1;
+ $2 = ((($iovs)) + 4|0);
+ $3 = ((($f)) + 20|0);
+ $4 = HEAP32[$3>>2]|0;
+ $5 = $4;
+ $6 = (($5) - ($1))|0;
+ HEAP32[$2>>2] = $6;
+ $7 = ((($iovs)) + 8|0);
+ HEAP32[$7>>2] = $buf;
+ $8 = ((($iovs)) + 12|0);
+ HEAP32[$8>>2] = $len;
+ $9 = (($6) + ($len))|0;
+ $10 = ((($f)) + 60|0);
+ $11 = ((($f)) + 44|0);
+ $iov$0 = $iovs;$iovcnt$0 = 2;$rem$0 = $9;
+ while(1) {
+  $12 = HEAP32[32512>>2]|0;
+  $13 = ($12|0)==(0|0);
+  if ($13) {
+   $17 = HEAP32[$10>>2]|0;
+   HEAP32[$vararg_buffer3>>2] = $17;
+   $vararg_ptr6 = ((($vararg_buffer3)) + 4|0);
+   HEAP32[$vararg_ptr6>>2] = $iov$0;
+   $vararg_ptr7 = ((($vararg_buffer3)) + 8|0);
+   HEAP32[$vararg_ptr7>>2] = $iovcnt$0;
+   $18 = (___syscall146(146,($vararg_buffer3|0))|0);
+   $19 = (___syscall_ret($18)|0);
+   $cnt$0 = $19;
+  } else {
+   _pthread_cleanup_push((1|0),($f|0));
+   $14 = HEAP32[$10>>2]|0;
+   HEAP32[$vararg_buffer>>2] = $14;
+   $vararg_ptr1 = ((($vararg_buffer)) + 4|0);
+   HEAP32[$vararg_ptr1>>2] = $iov$0;
+   $vararg_ptr2 = ((($vararg_buffer)) + 8|0);
+   HEAP32[$vararg_ptr2>>2] = $iovcnt$0;
+   $15 = (___syscall146(146,($vararg_buffer|0))|0);
+   $16 = (___syscall_ret($15)|0);
+   _pthread_cleanup_pop(0);
+   $cnt$0 = $16;
+  }
+  $20 = ($rem$0|0)==($cnt$0|0);
+  if ($20) {
+   label = 6;
+   break;
+  }
+  $27 = ($cnt$0|0)<(0);
+  if ($27) {
+   $iov$0$lcssa11 = $iov$0;$iovcnt$0$lcssa12 = $iovcnt$0;
+   label = 8;
+   break;
+  }
+  $35 = (($rem$0) - ($cnt$0))|0;
+  $36 = ((($iov$0)) + 4|0);
+  $37 = HEAP32[$36>>2]|0;
+  $38 = ($cnt$0>>>0)>($37>>>0);
+  if ($38) {
+   $39 = HEAP32[$11>>2]|0;
+   HEAP32[$0>>2] = $39;
+   HEAP32[$3>>2] = $39;
+   $40 = (($cnt$0) - ($37))|0;
+   $41 = ((($iov$0)) + 8|0);
+   $42 = (($iovcnt$0) + -1)|0;
+   $$phi$trans$insert = ((($iov$0)) + 12|0);
+   $$pre = HEAP32[$$phi$trans$insert>>2]|0;
+   $50 = $$pre;$cnt$1 = $40;$iov$1 = $41;$iovcnt$1 = $42;
+  } else {
+   $43 = ($iovcnt$0|0)==(2);
+   if ($43) {
+    $44 = HEAP32[$0>>2]|0;
+    $45 = (($44) + ($cnt$0)|0);
+    HEAP32[$0>>2] = $45;
+    $50 = $37;$cnt$1 = $cnt$0;$iov$1 = $iov$0;$iovcnt$1 = 2;
+   } else {
+    $50 = $37;$cnt$1 = $cnt$0;$iov$1 = $iov$0;$iovcnt$1 = $iovcnt$0;
+   }
+  }
+  $46 = HEAP32[$iov$1>>2]|0;
+  $47 = (($46) + ($cnt$1)|0);
+  HEAP32[$iov$1>>2] = $47;
+  $48 = ((($iov$1)) + 4|0);
+  $49 = (($50) - ($cnt$1))|0;
+  HEAP32[$48>>2] = $49;
+  $iov$0 = $iov$1;$iovcnt$0 = $iovcnt$1;$rem$0 = $35;
+ }
+ if ((label|0) == 6) {
+  $21 = HEAP32[$11>>2]|0;
+  $22 = ((($f)) + 48|0);
+  $23 = HEAP32[$22>>2]|0;
+  $24 = (($21) + ($23)|0);
+  $25 = ((($f)) + 16|0);
+  HEAP32[$25>>2] = $24;
+  $26 = $21;
+  HEAP32[$0>>2] = $26;
+  HEAP32[$3>>2] = $26;
+  $$0 = $len;
+ }
+ else if ((label|0) == 8) {
+  $28 = ((($f)) + 16|0);
+  HEAP32[$28>>2] = 0;
+  HEAP32[$0>>2] = 0;
+  HEAP32[$3>>2] = 0;
+  $29 = HEAP32[$f>>2]|0;
+  $30 = $29 | 32;
+  HEAP32[$f>>2] = $30;
+  $31 = ($iovcnt$0$lcssa12|0)==(2);
+  if ($31) {
+   $$0 = 0;
+  } else {
+   $32 = ((($iov$0$lcssa11)) + 4|0);
+   $33 = HEAP32[$32>>2]|0;
+   $34 = (($len) - ($33))|0;
+   $$0 = $34;
+  }
+ }
+ STACKTOP = sp;return ($$0|0);
+}
+function ___stdout_write($f,$buf,$len) {
+ $f = $f|0;
+ $buf = $buf|0;
+ $len = $len|0;
+ var $0 = 0, $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $tio = 0, $vararg_buffer = 0, $vararg_ptr1 = 0, $vararg_ptr2 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ STACKTOP = STACKTOP + 80|0;
+ $vararg_buffer = sp;
+ $tio = sp + 12|0;
+ $0 = ((($f)) + 36|0);
+ HEAP32[$0>>2] = 3;
+ $1 = HEAP32[$f>>2]|0;
+ $2 = $1 & 64;
+ $3 = ($2|0)==(0);
+ if ($3) {
+  $4 = ((($f)) + 60|0);
+  $5 = HEAP32[$4>>2]|0;
+  HEAP32[$vararg_buffer>>2] = $5;
+  $vararg_ptr1 = ((($vararg_buffer)) + 4|0);
+  HEAP32[$vararg_ptr1>>2] = 21505;
+  $vararg_ptr2 = ((($vararg_buffer)) + 8|0);
+  HEAP32[$vararg_ptr2>>2] = $tio;
+  $6 = (___syscall54(54,($vararg_buffer|0))|0);
+  $7 = ($6|0)==(0);
+  if (!($7)) {
+   $8 = ((($f)) + 75|0);
+   HEAP8[$8>>0] = -1;
+  }
+ }
+ $9 = (___stdio_write($f,$buf,$len)|0);
+ STACKTOP = sp;return ($9|0);
+}
+function _fflush($f) {
+ $f = $f|0;
+ var $$0 = 0, $$01 = 0, $$012 = 0, $$014 = 0, $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $20 = 0, $21 = 0, $22 = 0;
+ var $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $phitmp = 0, $r$0$lcssa = 0, $r$03 = 0, $r$1 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $0 = ($f|0)==(0|0);
+ do {
+  if ($0) {
+   $7 = HEAP32[32556>>2]|0;
+   $8 = ($7|0)==(0|0);
+   if ($8) {
+    $27 = 0;
+   } else {
+    $9 = HEAP32[32556>>2]|0;
+    $10 = (_fflush($9)|0);
+    $27 = $10;
+   }
+   ___lock(((32540)|0));
+   $$012 = HEAP32[(32536)>>2]|0;
+   $11 = ($$012|0)==(0|0);
+   if ($11) {
+    $r$0$lcssa = $27;
+   } else {
+    $$014 = $$012;$r$03 = $27;
+    while(1) {
+     $12 = ((($$014)) + 76|0);
+     $13 = HEAP32[$12>>2]|0;
+     $14 = ($13|0)>(-1);
+     if ($14) {
+      $15 = (___lockfile($$014)|0);
+      $24 = $15;
+     } else {
+      $24 = 0;
+     }
+     $16 = ((($$014)) + 20|0);
+     $17 = HEAP32[$16>>2]|0;
+     $18 = ((($$014)) + 28|0);
+     $19 = HEAP32[$18>>2]|0;
+     $20 = ($17>>>0)>($19>>>0);
+     if ($20) {
+      $21 = (___fflush_unlocked($$014)|0);
+      $22 = $21 | $r$03;
+      $r$1 = $22;
+     } else {
+      $r$1 = $r$03;
+     }
+     $23 = ($24|0)==(0);
+     if (!($23)) {
+      ___unlockfile($$014);
+     }
+     $25 = ((($$014)) + 56|0);
+     $$01 = HEAP32[$25>>2]|0;
+     $26 = ($$01|0)==(0|0);
+     if ($26) {
+      $r$0$lcssa = $r$1;
+      break;
+     } else {
+      $$014 = $$01;$r$03 = $r$1;
+     }
+    }
+   }
+   ___unlock(((32540)|0));
+   $$0 = $r$0$lcssa;
+  } else {
+   $1 = ((($f)) + 76|0);
+   $2 = HEAP32[$1>>2]|0;
+   $3 = ($2|0)>(-1);
+   if (!($3)) {
+    $4 = (___fflush_unlocked($f)|0);
+    $$0 = $4;
+    break;
+   }
+   $5 = (___lockfile($f)|0);
+   $phitmp = ($5|0)==(0);
+   $6 = (___fflush_unlocked($f)|0);
+   if ($phitmp) {
+    $$0 = $6;
+   } else {
+    ___unlockfile($f);
+    $$0 = $6;
+   }
+  }
+ } while(0);
+ return ($$0|0);
+}
+function _cleanup392($p) {
+ $p = $p|0;
+ var $0 = 0, $1 = 0, $2 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $0 = ((($p)) + 68|0);
+ $1 = HEAP32[$0>>2]|0;
+ $2 = ($1|0)==(0);
+ if ($2) {
+  ___unlockfile($p);
+ }
+ return;
+}
+function ___fflush_unlocked($f) {
+ $f = $f|0;
+ var $$0 = 0, $0 = 0, $1 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0;
+ var $9 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $0 = ((($f)) + 20|0);
+ $1 = HEAP32[$0>>2]|0;
+ $2 = ((($f)) + 28|0);
+ $3 = HEAP32[$2>>2]|0;
+ $4 = ($1>>>0)>($3>>>0);
+ if ($4) {
+  $5 = ((($f)) + 36|0);
+  $6 = HEAP32[$5>>2]|0;
+  (FUNCTION_TABLE_iiii[$6 & 3]($f,0,0)|0);
+  $7 = HEAP32[$0>>2]|0;
+  $8 = ($7|0)==(0|0);
+  if ($8) {
+   $$0 = -1;
+  } else {
+   label = 3;
+  }
+ } else {
+  label = 3;
+ }
+ if ((label|0) == 3) {
+  $9 = ((($f)) + 4|0);
+  $10 = HEAP32[$9>>2]|0;
+  $11 = ((($f)) + 8|0);
+  $12 = HEAP32[$11>>2]|0;
+  $13 = ($10>>>0)<($12>>>0);
+  if ($13) {
+   $14 = ((($f)) + 40|0);
+   $15 = HEAP32[$14>>2]|0;
+   $16 = $10;
+   $17 = $12;
+   $18 = (($16) - ($17))|0;
+   (FUNCTION_TABLE_iiii[$15 & 3]($f,$18,1)|0);
+  }
+  $19 = ((($f)) + 16|0);
+  HEAP32[$19>>2] = 0;
+  HEAP32[$2>>2] = 0;
+  HEAP32[$0>>2] = 0;
+  HEAP32[$11>>2] = 0;
+  HEAP32[$9>>2] = 0;
+  $$0 = 0;
+ }
+ return ($$0|0);
 }
 function _malloc($bytes) {
  $bytes = $bytes|0;
- var $$pre = 0, $$pre$i = 0, $$pre$i$i = 0, $$pre$i23$i = 0, $$pre$i25 = 0, $$pre$phi$i$iZ2D = 0, $$pre$phi$i24$iZ2D = 0, $$pre$phi$i26Z2D = 0, $$pre$phi$iZ2D = 0, $$pre$phi59$i$iZ2D = 0, $$pre$phiZ2D = 0, $$pre105 = 0, $$pre58$i$i = 0, $$rsize$0$i = 0, $$rsize$3$i = 0, $$sum = 0, $$sum$i$i = 0, $$sum$i$i$i = 0, $$sum$i12$i = 0, $$sum$i13$i = 0;
- var $$sum$i16$i = 0, $$sum$i19$i = 0, $$sum$i2338 = 0, $$sum$i32 = 0, $$sum$i39 = 0, $$sum1 = 0, $$sum1$i = 0, $$sum1$i$i = 0, $$sum1$i14$i = 0, $$sum1$i20$i = 0, $$sum1$i24 = 0, $$sum10 = 0, $$sum10$i = 0, $$sum10$i$i = 0, $$sum10$pre$i$i = 0, $$sum102$i = 0, $$sum103$i = 0, $$sum104$i = 0, $$sum105$i = 0, $$sum106$i = 0;
- var $$sum107$i = 0, $$sum108$i = 0, $$sum109$i = 0, $$sum11$i = 0, $$sum11$i$i = 0, $$sum11$i22$i = 0, $$sum110$i = 0, $$sum111$i = 0, $$sum1112 = 0, $$sum112$i = 0, $$sum113$i = 0, $$sum114$i = 0, $$sum115$i = 0, $$sum12$i = 0, $$sum12$i$i = 0, $$sum13$i = 0, $$sum13$i$i = 0, $$sum14$i$i = 0, $$sum14$pre$i = 0, $$sum15$i = 0;
- var $$sum15$i$i = 0, $$sum16$i = 0, $$sum16$i$i = 0, $$sum17$i = 0, $$sum17$i$i = 0, $$sum18$i = 0, $$sum1819$i$i = 0, $$sum2 = 0, $$sum2$i = 0, $$sum2$i$i = 0, $$sum2$i$i$i = 0, $$sum2$i15$i = 0, $$sum2$i17$i = 0, $$sum2$i21$i = 0, $$sum2$pre$i = 0, $$sum20$i$i = 0, $$sum21$i$i = 0, $$sum22$i$i = 0, $$sum23$i$i = 0, $$sum24$i$i = 0;
- var $$sum25$i$i = 0, $$sum26$pre$i$i = 0, $$sum27$i$i = 0, $$sum28$i$i = 0, $$sum29$i$i = 0, $$sum3$i = 0, $$sum3$i$i = 0, $$sum3$i27 = 0, $$sum30$i$i = 0, $$sum3132$i$i = 0, $$sum34$i$i = 0, $$sum3536$i$i = 0, $$sum3738$i$i = 0, $$sum39$i$i = 0, $$sum4 = 0, $$sum4$i = 0, $$sum4$i28 = 0, $$sum40$i$i = 0, $$sum41$i$i = 0, $$sum42$i$i = 0;
- var $$sum5$i = 0, $$sum5$i$i = 0, $$sum56 = 0, $$sum6$i = 0, $$sum67$i$i = 0, $$sum7$i = 0, $$sum8$i = 0, $$sum8$pre = 0, $$sum9 = 0, $$sum9$i = 0, $$sum9$i$i = 0, $$tsize$1$i = 0, $$v$0$i = 0, $0 = 0, $1 = 0, $10 = 0, $100 = 0, $1000 = 0, $1001 = 0, $1002 = 0;
- var $1003 = 0, $1004 = 0, $1005 = 0, $1006 = 0, $1007 = 0, $1008 = 0, $1009 = 0, $101 = 0, $1010 = 0, $1011 = 0, $1012 = 0, $1013 = 0, $1014 = 0, $1015 = 0, $1016 = 0, $1017 = 0, $1018 = 0, $1019 = 0, $102 = 0, $1020 = 0;
- var $1021 = 0, $1022 = 0, $1023 = 0, $1024 = 0, $1025 = 0, $1026 = 0, $1027 = 0, $1028 = 0, $1029 = 0, $103 = 0, $1030 = 0, $1031 = 0, $1032 = 0, $1033 = 0, $1034 = 0, $1035 = 0, $1036 = 0, $1037 = 0, $1038 = 0, $1039 = 0;
- var $104 = 0, $1040 = 0, $1041 = 0, $1042 = 0, $1043 = 0, $1044 = 0, $1045 = 0, $1046 = 0, $1047 = 0, $1048 = 0, $1049 = 0, $105 = 0, $1050 = 0, $1051 = 0, $1052 = 0, $1053 = 0, $1054 = 0, $1055 = 0, $1056 = 0, $1057 = 0;
- var $1058 = 0, $1059 = 0, $106 = 0, $1060 = 0, $1061 = 0, $1062 = 0, $1063 = 0, $1064 = 0, $1065 = 0, $1066 = 0, $1067 = 0, $1068 = 0, $1069 = 0, $107 = 0, $1070 = 0, $1071 = 0, $1072 = 0, $1073 = 0, $1074 = 0, $108 = 0;
- var $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0, $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0;
- var $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0, $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0;
- var $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0, $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0;
- var $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0, $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0;
- var $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0, $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0, $197 = 0, $198 = 0, $199 = 0;
- var $2 = 0, $20 = 0, $200 = 0, $201 = 0, $202 = 0, $203 = 0, $204 = 0, $205 = 0, $206 = 0, $207 = 0, $208 = 0, $209 = 0, $21 = 0, $210 = 0, $211 = 0, $212 = 0, $213 = 0, $214 = 0, $215 = 0, $216 = 0;
- var $217 = 0, $218 = 0, $219 = 0, $22 = 0, $220 = 0, $221 = 0, $222 = 0, $223 = 0, $224 = 0, $225 = 0, $226 = 0, $227 = 0, $228 = 0, $229 = 0, $23 = 0, $230 = 0, $231 = 0, $232 = 0, $233 = 0, $234 = 0;
- var $235 = 0, $236 = 0, $237 = 0, $238 = 0, $239 = 0, $24 = 0, $240 = 0, $241 = 0, $242 = 0, $243 = 0, $244 = 0, $245 = 0, $246 = 0, $247 = 0, $248 = 0, $249 = 0, $25 = 0, $250 = 0, $251 = 0, $252 = 0;
- var $253 = 0, $254 = 0, $255 = 0, $256 = 0, $257 = 0, $258 = 0, $259 = 0, $26 = 0, $260 = 0, $261 = 0, $262 = 0, $263 = 0, $264 = 0, $265 = 0, $266 = 0, $267 = 0, $268 = 0, $269 = 0, $27 = 0, $270 = 0;
- var $271 = 0, $272 = 0, $273 = 0, $274 = 0, $275 = 0, $276 = 0, $277 = 0, $278 = 0, $279 = 0, $28 = 0, $280 = 0, $281 = 0, $282 = 0, $283 = 0, $284 = 0, $285 = 0, $286 = 0, $287 = 0, $288 = 0, $289 = 0;
- var $29 = 0, $290 = 0, $291 = 0, $292 = 0, $293 = 0, $294 = 0, $295 = 0, $296 = 0, $297 = 0, $298 = 0, $299 = 0, $3 = 0, $30 = 0, $300 = 0, $301 = 0, $302 = 0, $303 = 0, $304 = 0, $305 = 0, $306 = 0;
- var $307 = 0, $308 = 0, $309 = 0, $31 = 0, $310 = 0, $311 = 0, $312 = 0, $313 = 0, $314 = 0, $315 = 0, $316 = 0, $317 = 0, $318 = 0, $319 = 0, $32 = 0, $320 = 0, $321 = 0, $322 = 0, $323 = 0, $324 = 0;
- var $325 = 0, $326 = 0, $327 = 0, $328 = 0, $329 = 0, $33 = 0, $330 = 0, $331 = 0, $332 = 0, $333 = 0, $334 = 0, $335 = 0, $336 = 0, $337 = 0, $338 = 0, $339 = 0, $34 = 0, $340 = 0, $341 = 0, $342 = 0;
- var $343 = 0, $344 = 0, $345 = 0, $346 = 0, $347 = 0, $348 = 0, $349 = 0, $35 = 0, $350 = 0, $351 = 0, $352 = 0, $353 = 0, $354 = 0, $355 = 0, $356 = 0, $357 = 0, $358 = 0, $359 = 0, $36 = 0, $360 = 0;
- var $361 = 0, $362 = 0, $363 = 0, $364 = 0, $365 = 0, $366 = 0, $367 = 0, $368 = 0, $369 = 0, $37 = 0, $370 = 0, $371 = 0, $372 = 0, $373 = 0, $374 = 0, $375 = 0, $376 = 0, $377 = 0, $378 = 0, $379 = 0;
- var $38 = 0, $380 = 0, $381 = 0, $382 = 0, $383 = 0, $384 = 0, $385 = 0, $386 = 0, $387 = 0, $388 = 0, $389 = 0, $39 = 0, $390 = 0, $391 = 0, $392 = 0, $393 = 0, $394 = 0, $395 = 0, $396 = 0, $397 = 0;
- var $398 = 0, $399 = 0, $4 = 0, $40 = 0, $400 = 0, $401 = 0, $402 = 0, $403 = 0, $404 = 0, $405 = 0, $406 = 0, $407 = 0, $408 = 0, $409 = 0, $41 = 0, $410 = 0, $411 = 0, $412 = 0, $413 = 0, $414 = 0;
- var $415 = 0, $416 = 0, $417 = 0, $418 = 0, $419 = 0, $42 = 0, $420 = 0, $421 = 0, $422 = 0, $423 = 0, $424 = 0, $425 = 0, $426 = 0, $427 = 0, $428 = 0, $429 = 0, $43 = 0, $430 = 0, $431 = 0, $432 = 0;
- var $433 = 0, $434 = 0, $435 = 0, $436 = 0, $437 = 0, $438 = 0, $439 = 0, $44 = 0, $440 = 0, $441 = 0, $442 = 0, $443 = 0, $444 = 0, $445 = 0, $446 = 0, $447 = 0, $448 = 0, $449 = 0, $45 = 0, $450 = 0;
- var $451 = 0, $452 = 0, $453 = 0, $454 = 0, $455 = 0, $456 = 0, $457 = 0, $458 = 0, $459 = 0, $46 = 0, $460 = 0, $461 = 0, $462 = 0, $463 = 0, $464 = 0, $465 = 0, $466 = 0, $467 = 0, $468 = 0, $469 = 0;
- var $47 = 0, $470 = 0, $471 = 0, $472 = 0, $473 = 0, $474 = 0, $475 = 0, $476 = 0, $477 = 0, $478 = 0, $479 = 0, $48 = 0, $480 = 0, $481 = 0, $482 = 0, $483 = 0, $484 = 0, $485 = 0, $486 = 0, $487 = 0;
- var $488 = 0, $489 = 0, $49 = 0, $490 = 0, $491 = 0, $492 = 0, $493 = 0, $494 = 0, $495 = 0, $496 = 0, $497 = 0, $498 = 0, $499 = 0, $5 = 0, $50 = 0, $500 = 0, $501 = 0, $502 = 0, $503 = 0, $504 = 0;
- var $505 = 0, $506 = 0, $507 = 0, $508 = 0, $509 = 0, $51 = 0, $510 = 0, $511 = 0, $512 = 0, $513 = 0, $514 = 0, $515 = 0, $516 = 0, $517 = 0, $518 = 0, $519 = 0, $52 = 0, $520 = 0, $521 = 0, $522 = 0;
- var $523 = 0, $524 = 0, $525 = 0, $526 = 0, $527 = 0, $528 = 0, $529 = 0, $53 = 0, $530 = 0, $531 = 0, $532 = 0, $533 = 0, $534 = 0, $535 = 0, $536 = 0, $537 = 0, $538 = 0, $539 = 0, $54 = 0, $540 = 0;
- var $541 = 0, $542 = 0, $543 = 0, $544 = 0, $545 = 0, $546 = 0, $547 = 0, $548 = 0, $549 = 0, $55 = 0, $550 = 0, $551 = 0, $552 = 0, $553 = 0, $554 = 0, $555 = 0, $556 = 0, $557 = 0, $558 = 0, $559 = 0;
- var $56 = 0, $560 = 0, $561 = 0, $562 = 0, $563 = 0, $564 = 0, $565 = 0, $566 = 0, $567 = 0, $568 = 0, $569 = 0, $57 = 0, $570 = 0, $571 = 0, $572 = 0, $573 = 0, $574 = 0, $575 = 0, $576 = 0, $577 = 0;
- var $578 = 0, $579 = 0, $58 = 0, $580 = 0, $581 = 0, $582 = 0, $583 = 0, $584 = 0, $585 = 0, $586 = 0, $587 = 0, $588 = 0, $589 = 0, $59 = 0, $590 = 0, $591 = 0, $592 = 0, $593 = 0, $594 = 0, $595 = 0;
- var $596 = 0, $597 = 0, $598 = 0, $599 = 0, $6 = 0, $60 = 0, $600 = 0, $601 = 0, $602 = 0, $603 = 0, $604 = 0, $605 = 0, $606 = 0, $607 = 0, $608 = 0, $609 = 0, $61 = 0, $610 = 0, $611 = 0, $612 = 0;
- var $613 = 0, $614 = 0, $615 = 0, $616 = 0, $617 = 0, $618 = 0, $619 = 0, $62 = 0, $620 = 0, $621 = 0, $622 = 0, $623 = 0, $624 = 0, $625 = 0, $626 = 0, $627 = 0, $628 = 0, $629 = 0, $63 = 0, $630 = 0;
- var $631 = 0, $632 = 0, $633 = 0, $634 = 0, $635 = 0, $636 = 0, $637 = 0, $638 = 0, $639 = 0, $64 = 0, $640 = 0, $641 = 0, $642 = 0, $643 = 0, $644 = 0, $645 = 0, $646 = 0, $647 = 0, $648 = 0, $649 = 0;
- var $65 = 0, $650 = 0, $651 = 0, $652 = 0, $653 = 0, $654 = 0, $655 = 0, $656 = 0, $657 = 0, $658 = 0, $659 = 0, $66 = 0, $660 = 0, $661 = 0, $662 = 0, $663 = 0, $664 = 0, $665 = 0, $666 = 0, $667 = 0;
- var $668 = 0, $669 = 0, $67 = 0, $670 = 0, $671 = 0, $672 = 0, $673 = 0, $674 = 0, $675 = 0, $676 = 0, $677 = 0, $678 = 0, $679 = 0, $68 = 0, $680 = 0, $681 = 0, $682 = 0, $683 = 0, $684 = 0, $685 = 0;
- var $686 = 0, $687 = 0, $688 = 0, $689 = 0, $69 = 0, $690 = 0, $691 = 0, $692 = 0, $693 = 0, $694 = 0, $695 = 0, $696 = 0, $697 = 0, $698 = 0, $699 = 0, $7 = 0, $70 = 0, $700 = 0, $701 = 0, $702 = 0;
- var $703 = 0, $704 = 0, $705 = 0, $706 = 0, $707 = 0, $708 = 0, $709 = 0, $71 = 0, $710 = 0, $711 = 0, $712 = 0, $713 = 0, $714 = 0, $715 = 0, $716 = 0, $717 = 0, $718 = 0, $719 = 0, $72 = 0, $720 = 0;
- var $721 = 0, $722 = 0, $723 = 0, $724 = 0, $725 = 0, $726 = 0, $727 = 0, $728 = 0, $729 = 0, $73 = 0, $730 = 0, $731 = 0, $732 = 0, $733 = 0, $734 = 0, $735 = 0, $736 = 0, $737 = 0, $738 = 0, $739 = 0;
- var $74 = 0, $740 = 0, $741 = 0, $742 = 0, $743 = 0, $744 = 0, $745 = 0, $746 = 0, $747 = 0, $748 = 0, $749 = 0, $75 = 0, $750 = 0, $751 = 0, $752 = 0, $753 = 0, $754 = 0, $755 = 0, $756 = 0, $757 = 0;
- var $758 = 0, $759 = 0, $76 = 0, $760 = 0, $761 = 0, $762 = 0, $763 = 0, $764 = 0, $765 = 0, $766 = 0, $767 = 0, $768 = 0, $769 = 0, $77 = 0, $770 = 0, $771 = 0, $772 = 0, $773 = 0, $774 = 0, $775 = 0;
- var $776 = 0, $777 = 0, $778 = 0, $779 = 0, $78 = 0, $780 = 0, $781 = 0, $782 = 0, $783 = 0, $784 = 0, $785 = 0, $786 = 0, $787 = 0, $788 = 0, $789 = 0, $79 = 0, $790 = 0, $791 = 0, $792 = 0, $793 = 0;
- var $794 = 0, $795 = 0, $796 = 0, $797 = 0, $798 = 0, $799 = 0, $8 = 0, $80 = 0, $800 = 0, $801 = 0, $802 = 0, $803 = 0, $804 = 0, $805 = 0, $806 = 0, $807 = 0, $808 = 0, $809 = 0, $81 = 0, $810 = 0;
- var $811 = 0, $812 = 0, $813 = 0, $814 = 0, $815 = 0, $816 = 0, $817 = 0, $818 = 0, $819 = 0, $82 = 0, $820 = 0, $821 = 0, $822 = 0, $823 = 0, $824 = 0, $825 = 0, $826 = 0, $827 = 0, $828 = 0, $829 = 0;
- var $83 = 0, $830 = 0, $831 = 0, $832 = 0, $833 = 0, $834 = 0, $835 = 0, $836 = 0, $837 = 0, $838 = 0, $839 = 0, $84 = 0, $840 = 0, $841 = 0, $842 = 0, $843 = 0, $844 = 0, $845 = 0, $846 = 0, $847 = 0;
- var $848 = 0, $849 = 0, $85 = 0, $850 = 0, $851 = 0, $852 = 0, $853 = 0, $854 = 0, $855 = 0, $856 = 0, $857 = 0, $858 = 0, $859 = 0, $86 = 0, $860 = 0, $861 = 0, $862 = 0, $863 = 0, $864 = 0, $865 = 0;
- var $866 = 0, $867 = 0, $868 = 0, $869 = 0, $87 = 0, $870 = 0, $871 = 0, $872 = 0, $873 = 0, $874 = 0, $875 = 0, $876 = 0, $877 = 0, $878 = 0, $879 = 0, $88 = 0, $880 = 0, $881 = 0, $882 = 0, $883 = 0;
- var $884 = 0, $885 = 0, $886 = 0, $887 = 0, $888 = 0, $889 = 0, $89 = 0, $890 = 0, $891 = 0, $892 = 0, $893 = 0, $894 = 0, $895 = 0, $896 = 0, $897 = 0, $898 = 0, $899 = 0, $9 = 0, $90 = 0, $900 = 0;
- var $901 = 0, $902 = 0, $903 = 0, $904 = 0, $905 = 0, $906 = 0, $907 = 0, $908 = 0, $909 = 0, $91 = 0, $910 = 0, $911 = 0, $912 = 0, $913 = 0, $914 = 0, $915 = 0, $916 = 0, $917 = 0, $918 = 0, $919 = 0;
- var $92 = 0, $920 = 0, $921 = 0, $922 = 0, $923 = 0, $924 = 0, $925 = 0, $926 = 0, $927 = 0, $928 = 0, $929 = 0, $93 = 0, $930 = 0, $931 = 0, $932 = 0, $933 = 0, $934 = 0, $935 = 0, $936 = 0, $937 = 0;
- var $938 = 0, $939 = 0, $94 = 0, $940 = 0, $941 = 0, $942 = 0, $943 = 0, $944 = 0, $945 = 0, $946 = 0, $947 = 0, $948 = 0, $949 = 0, $95 = 0, $950 = 0, $951 = 0, $952 = 0, $953 = 0, $954 = 0, $955 = 0;
- var $956 = 0, $957 = 0, $958 = 0, $959 = 0, $96 = 0, $960 = 0, $961 = 0, $962 = 0, $963 = 0, $964 = 0, $965 = 0, $966 = 0, $967 = 0, $968 = 0, $969 = 0, $97 = 0, $970 = 0, $971 = 0, $972 = 0, $973 = 0;
- var $974 = 0, $975 = 0, $976 = 0, $977 = 0, $978 = 0, $979 = 0, $98 = 0, $980 = 0, $981 = 0, $982 = 0, $983 = 0, $984 = 0, $985 = 0, $986 = 0, $987 = 0, $988 = 0, $989 = 0, $99 = 0, $990 = 0, $991 = 0;
- var $992 = 0, $993 = 0, $994 = 0, $995 = 0, $996 = 0, $997 = 0, $998 = 0, $999 = 0, $F$0$i$i = 0, $F1$0$i = 0, $F4$0 = 0, $F4$0$i$i = 0, $F5$0$i = 0, $I1$0$c$i$i = 0, $I1$0$i$i = 0, $I7$0$i = 0, $I7$0$i$i = 0, $K12$027$i = 0, $K2$015$i$i = 0, $K8$053$i$i = 0;
- var $R$0$i = 0, $R$0$i$i = 0, $R$0$i18 = 0, $R$1$i = 0, $R$1$i$i = 0, $R$1$i20 = 0, $RP$0$i = 0, $RP$0$i$i = 0, $RP$0$i17 = 0, $T$0$lcssa$i = 0, $T$0$lcssa$i$i = 0, $T$0$lcssa$i26$i = 0, $T$014$i$i = 0, $T$026$i = 0, $T$052$i$i = 0, $br$0$i = 0, $br$030$i = 0, $cond$i = 0, $cond$i$i = 0, $cond$i21 = 0;
- var $exitcond$i$i = 0, $i$02$i$i = 0, $idx$0$i = 0, $mem$0 = 0, $nb$0 = 0, $oldfirst$0$i$i = 0, $or$cond$i = 0, $or$cond$i$i = 0, $or$cond$i27$i = 0, $or$cond$i29 = 0, $or$cond1$i = 0, $or$cond19$i = 0, $or$cond2$i = 0, $or$cond24$i = 0, $or$cond3$i = 0, $or$cond4$i = 0, $or$cond47$i = 0, $or$cond5$i = 0, $or$cond6$i = 0, $or$cond8$i = 0;
- var $qsize$0$i$i = 0, $rsize$0$i = 0, $rsize$0$i15 = 0, $rsize$1$i = 0, $rsize$2$i = 0, $rsize$3$lcssa$i = 0, $rsize$331$i = 0, $rst$0$i = 0, $rst$1$i = 0, $sizebits$0$i = 0, $sp$0$i$i = 0, $sp$0$i$i$i = 0, $sp$073$i = 0, $sp$166$i = 0, $ssize$0$i = 0, $ssize$1$i = 0, $ssize$129$i = 0, $ssize$2$i = 0, $t$0$i = 0, $t$0$i14 = 0;
- var $t$1$i = 0, $t$2$ph$i = 0, $t$2$v$3$i = 0, $t$230$i = 0, $tbase$245$i = 0, $tsize$03141$i = 0, $tsize$1$i = 0, $tsize$244$i = 0, $v$0$i = 0, $v$0$i16 = 0, $v$1$i = 0, $v$2$i = 0, $v$3$lcssa$i = 0, $v$332$i = 0, label = 0, sp = 0;
+ var $$3$i = 0, $$lcssa = 0, $$lcssa211 = 0, $$lcssa215 = 0, $$lcssa216 = 0, $$lcssa217 = 0, $$lcssa219 = 0, $$lcssa222 = 0, $$lcssa224 = 0, $$lcssa226 = 0, $$lcssa228 = 0, $$lcssa230 = 0, $$lcssa232 = 0, $$pre = 0, $$pre$i = 0, $$pre$i$i = 0, $$pre$i22$i = 0, $$pre$i25 = 0, $$pre$phi$i$iZ2D = 0, $$pre$phi$i23$iZ2D = 0;
+ var $$pre$phi$i26Z2D = 0, $$pre$phi$iZ2D = 0, $$pre$phi58$i$iZ2D = 0, $$pre$phiZ2D = 0, $$pre105 = 0, $$pre106 = 0, $$pre14$i$i = 0, $$pre43$i = 0, $$pre56$i$i = 0, $$pre57$i$i = 0, $$pre8$i = 0, $$rsize$0$i = 0, $$rsize$3$i = 0, $$sum = 0, $$sum$i$i = 0, $$sum$i$i$i = 0, $$sum$i13$i = 0, $$sum$i14$i = 0, $$sum$i17$i = 0, $$sum$i19$i = 0;
+ var $$sum$i2334 = 0, $$sum$i32 = 0, $$sum$i35 = 0, $$sum1 = 0, $$sum1$i = 0, $$sum1$i$i = 0, $$sum1$i15$i = 0, $$sum1$i20$i = 0, $$sum1$i24 = 0, $$sum10 = 0, $$sum10$i = 0, $$sum10$i$i = 0, $$sum11$i = 0, $$sum11$i$i = 0, $$sum1112 = 0, $$sum112$i = 0, $$sum113$i = 0, $$sum114$i = 0, $$sum115$i = 0, $$sum116$i = 0;
+ var $$sum117$i = 0, $$sum118$i = 0, $$sum119$i = 0, $$sum12$i = 0, $$sum12$i$i = 0, $$sum120$i = 0, $$sum121$i = 0, $$sum122$i = 0, $$sum123$i = 0, $$sum124$i = 0, $$sum125$i = 0, $$sum13$i = 0, $$sum13$i$i = 0, $$sum14$i$i = 0, $$sum15$i = 0, $$sum15$i$i = 0, $$sum16$i = 0, $$sum16$i$i = 0, $$sum17$i = 0, $$sum17$i$i = 0;
+ var $$sum18$i = 0, $$sum1819$i$i = 0, $$sum2 = 0, $$sum2$i = 0, $$sum2$i$i = 0, $$sum2$i$i$i = 0, $$sum2$i16$i = 0, $$sum2$i18$i = 0, $$sum2$i21$i = 0, $$sum20$i$i = 0, $$sum21$i$i = 0, $$sum22$i$i = 0, $$sum23$i$i = 0, $$sum24$i$i = 0, $$sum25$i$i = 0, $$sum27$i$i = 0, $$sum28$i$i = 0, $$sum29$i$i = 0, $$sum3$i = 0, $$sum3$i27 = 0;
+ var $$sum30$i$i = 0, $$sum3132$i$i = 0, $$sum34$i$i = 0, $$sum3536$i$i = 0, $$sum3738$i$i = 0, $$sum39$i$i = 0, $$sum4 = 0, $$sum4$i = 0, $$sum4$i$i = 0, $$sum4$i28 = 0, $$sum40$i$i = 0, $$sum41$i$i = 0, $$sum42$i$i = 0, $$sum5$i = 0, $$sum5$i$i = 0, $$sum56 = 0, $$sum6$i = 0, $$sum67$i$i = 0, $$sum7$i = 0, $$sum8$i = 0;
+ var $$sum9 = 0, $$sum9$i = 0, $$sum9$i$i = 0, $$tsize$1$i = 0, $$v$0$i = 0, $0 = 0, $1 = 0, $10 = 0, $100 = 0, $1000 = 0, $1001 = 0, $1002 = 0, $1003 = 0, $1004 = 0, $1005 = 0, $1006 = 0, $1007 = 0, $1008 = 0, $1009 = 0, $101 = 0;
+ var $1010 = 0, $1011 = 0, $1012 = 0, $1013 = 0, $1014 = 0, $1015 = 0, $1016 = 0, $1017 = 0, $1018 = 0, $1019 = 0, $102 = 0, $1020 = 0, $1021 = 0, $1022 = 0, $1023 = 0, $1024 = 0, $1025 = 0, $1026 = 0, $1027 = 0, $1028 = 0;
+ var $1029 = 0, $103 = 0, $1030 = 0, $1031 = 0, $1032 = 0, $1033 = 0, $1034 = 0, $1035 = 0, $1036 = 0, $1037 = 0, $1038 = 0, $1039 = 0, $104 = 0, $1040 = 0, $1041 = 0, $1042 = 0, $1043 = 0, $1044 = 0, $1045 = 0, $1046 = 0;
+ var $1047 = 0, $1048 = 0, $1049 = 0, $105 = 0, $1050 = 0, $1051 = 0, $1052 = 0, $1053 = 0, $1054 = 0, $1055 = 0, $1056 = 0, $1057 = 0, $1058 = 0, $1059 = 0, $106 = 0, $1060 = 0, $1061 = 0, $1062 = 0, $1063 = 0, $1064 = 0;
+ var $1065 = 0, $1066 = 0, $1067 = 0, $1068 = 0, $1069 = 0, $107 = 0, $1070 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0, $116 = 0, $117 = 0, $118 = 0, $119 = 0;
+ var $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0, $134 = 0, $135 = 0, $136 = 0, $137 = 0;
+ var $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0, $152 = 0, $153 = 0, $154 = 0, $155 = 0;
+ var $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0, $170 = 0, $171 = 0, $172 = 0, $173 = 0;
+ var $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0, $189 = 0, $19 = 0, $190 = 0, $191 = 0;
+ var $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0, $197 = 0, $198 = 0, $199 = 0, $2 = 0, $20 = 0, $200 = 0, $201 = 0, $202 = 0, $203 = 0, $204 = 0, $205 = 0, $206 = 0, $207 = 0, $208 = 0, $209 = 0;
+ var $21 = 0, $210 = 0, $211 = 0, $212 = 0, $213 = 0, $214 = 0, $215 = 0, $216 = 0, $217 = 0, $218 = 0, $219 = 0, $22 = 0, $220 = 0, $221 = 0, $222 = 0, $223 = 0, $224 = 0, $225 = 0, $226 = 0, $227 = 0;
+ var $228 = 0, $229 = 0, $23 = 0, $230 = 0, $231 = 0, $232 = 0, $233 = 0, $234 = 0, $235 = 0, $236 = 0, $237 = 0, $238 = 0, $239 = 0, $24 = 0, $240 = 0, $241 = 0, $242 = 0, $243 = 0, $244 = 0, $245 = 0;
+ var $246 = 0, $247 = 0, $248 = 0, $249 = 0, $25 = 0, $250 = 0, $251 = 0, $252 = 0, $253 = 0, $254 = 0, $255 = 0, $256 = 0, $257 = 0, $258 = 0, $259 = 0, $26 = 0, $260 = 0, $261 = 0, $262 = 0, $263 = 0;
+ var $264 = 0, $265 = 0, $266 = 0, $267 = 0, $268 = 0, $269 = 0, $27 = 0, $270 = 0, $271 = 0, $272 = 0, $273 = 0, $274 = 0, $275 = 0, $276 = 0, $277 = 0, $278 = 0, $279 = 0, $28 = 0, $280 = 0, $281 = 0;
+ var $282 = 0, $283 = 0, $284 = 0, $285 = 0, $286 = 0, $287 = 0, $288 = 0, $289 = 0, $29 = 0, $290 = 0, $291 = 0, $292 = 0, $293 = 0, $294 = 0, $295 = 0, $296 = 0, $297 = 0, $298 = 0, $299 = 0, $3 = 0;
+ var $30 = 0, $300 = 0, $301 = 0, $302 = 0, $303 = 0, $304 = 0, $305 = 0, $306 = 0, $307 = 0, $308 = 0, $309 = 0, $31 = 0, $310 = 0, $311 = 0, $312 = 0, $313 = 0, $314 = 0, $315 = 0, $316 = 0, $317 = 0;
+ var $318 = 0, $319 = 0, $32 = 0, $320 = 0, $321 = 0, $322 = 0, $323 = 0, $324 = 0, $325 = 0, $326 = 0, $327 = 0, $328 = 0, $329 = 0, $33 = 0, $330 = 0, $331 = 0, $332 = 0, $333 = 0, $334 = 0, $335 = 0;
+ var $336 = 0, $337 = 0, $338 = 0, $339 = 0, $34 = 0, $340 = 0, $341 = 0, $342 = 0, $343 = 0, $344 = 0, $345 = 0, $346 = 0, $347 = 0, $348 = 0, $349 = 0, $35 = 0, $350 = 0, $351 = 0, $352 = 0, $353 = 0;
+ var $354 = 0, $355 = 0, $356 = 0, $357 = 0, $358 = 0, $359 = 0, $36 = 0, $360 = 0, $361 = 0, $362 = 0, $363 = 0, $364 = 0, $365 = 0, $366 = 0, $367 = 0, $368 = 0, $369 = 0, $37 = 0, $370 = 0, $371 = 0;
+ var $372 = 0, $373 = 0, $374 = 0, $375 = 0, $376 = 0, $377 = 0, $378 = 0, $379 = 0, $38 = 0, $380 = 0, $381 = 0, $382 = 0, $383 = 0, $384 = 0, $385 = 0, $386 = 0, $387 = 0, $388 = 0, $389 = 0, $39 = 0;
+ var $390 = 0, $391 = 0, $392 = 0, $393 = 0, $394 = 0, $395 = 0, $396 = 0, $397 = 0, $398 = 0, $399 = 0, $4 = 0, $40 = 0, $400 = 0, $401 = 0, $402 = 0, $403 = 0, $404 = 0, $405 = 0, $406 = 0, $407 = 0;
+ var $408 = 0, $409 = 0, $41 = 0, $410 = 0, $411 = 0, $412 = 0, $413 = 0, $414 = 0, $415 = 0, $416 = 0, $417 = 0, $418 = 0, $419 = 0, $42 = 0, $420 = 0, $421 = 0, $422 = 0, $423 = 0, $424 = 0, $425 = 0;
+ var $426 = 0, $427 = 0, $428 = 0, $429 = 0, $43 = 0, $430 = 0, $431 = 0, $432 = 0, $433 = 0, $434 = 0, $435 = 0, $436 = 0, $437 = 0, $438 = 0, $439 = 0, $44 = 0, $440 = 0, $441 = 0, $442 = 0, $443 = 0;
+ var $444 = 0, $445 = 0, $446 = 0, $447 = 0, $448 = 0, $449 = 0, $45 = 0, $450 = 0, $451 = 0, $452 = 0, $453 = 0, $454 = 0, $455 = 0, $456 = 0, $457 = 0, $458 = 0, $459 = 0, $46 = 0, $460 = 0, $461 = 0;
+ var $462 = 0, $463 = 0, $464 = 0, $465 = 0, $466 = 0, $467 = 0, $468 = 0, $469 = 0, $47 = 0, $470 = 0, $471 = 0, $472 = 0, $473 = 0, $474 = 0, $475 = 0, $476 = 0, $477 = 0, $478 = 0, $479 = 0, $48 = 0;
+ var $480 = 0, $481 = 0, $482 = 0, $483 = 0, $484 = 0, $485 = 0, $486 = 0, $487 = 0, $488 = 0, $489 = 0, $49 = 0, $490 = 0, $491 = 0, $492 = 0, $493 = 0, $494 = 0, $495 = 0, $496 = 0, $497 = 0, $498 = 0;
+ var $499 = 0, $5 = 0, $50 = 0, $500 = 0, $501 = 0, $502 = 0, $503 = 0, $504 = 0, $505 = 0, $506 = 0, $507 = 0, $508 = 0, $509 = 0, $51 = 0, $510 = 0, $511 = 0, $512 = 0, $513 = 0, $514 = 0, $515 = 0;
+ var $516 = 0, $517 = 0, $518 = 0, $519 = 0, $52 = 0, $520 = 0, $521 = 0, $522 = 0, $523 = 0, $524 = 0, $525 = 0, $526 = 0, $527 = 0, $528 = 0, $529 = 0, $53 = 0, $530 = 0, $531 = 0, $532 = 0, $533 = 0;
+ var $534 = 0, $535 = 0, $536 = 0, $537 = 0, $538 = 0, $539 = 0, $54 = 0, $540 = 0, $541 = 0, $542 = 0, $543 = 0, $544 = 0, $545 = 0, $546 = 0, $547 = 0, $548 = 0, $549 = 0, $55 = 0, $550 = 0, $551 = 0;
+ var $552 = 0, $553 = 0, $554 = 0, $555 = 0, $556 = 0, $557 = 0, $558 = 0, $559 = 0, $56 = 0, $560 = 0, $561 = 0, $562 = 0, $563 = 0, $564 = 0, $565 = 0, $566 = 0, $567 = 0, $568 = 0, $569 = 0, $57 = 0;
+ var $570 = 0, $571 = 0, $572 = 0, $573 = 0, $574 = 0, $575 = 0, $576 = 0, $577 = 0, $578 = 0, $579 = 0, $58 = 0, $580 = 0, $581 = 0, $582 = 0, $583 = 0, $584 = 0, $585 = 0, $586 = 0, $587 = 0, $588 = 0;
+ var $589 = 0, $59 = 0, $590 = 0, $591 = 0, $592 = 0, $593 = 0, $594 = 0, $595 = 0, $596 = 0, $597 = 0, $598 = 0, $599 = 0, $6 = 0, $60 = 0, $600 = 0, $601 = 0, $602 = 0, $603 = 0, $604 = 0, $605 = 0;
+ var $606 = 0, $607 = 0, $608 = 0, $609 = 0, $61 = 0, $610 = 0, $611 = 0, $612 = 0, $613 = 0, $614 = 0, $615 = 0, $616 = 0, $617 = 0, $618 = 0, $619 = 0, $62 = 0, $620 = 0, $621 = 0, $622 = 0, $623 = 0;
+ var $624 = 0, $625 = 0, $626 = 0, $627 = 0, $628 = 0, $629 = 0, $63 = 0, $630 = 0, $631 = 0, $632 = 0, $633 = 0, $634 = 0, $635 = 0, $636 = 0, $637 = 0, $638 = 0, $639 = 0, $64 = 0, $640 = 0, $641 = 0;
+ var $642 = 0, $643 = 0, $644 = 0, $645 = 0, $646 = 0, $647 = 0, $648 = 0, $649 = 0, $65 = 0, $650 = 0, $651 = 0, $652 = 0, $653 = 0, $654 = 0, $655 = 0, $656 = 0, $657 = 0, $658 = 0, $659 = 0, $66 = 0;
+ var $660 = 0, $661 = 0, $662 = 0, $663 = 0, $664 = 0, $665 = 0, $666 = 0, $667 = 0, $668 = 0, $669 = 0, $67 = 0, $670 = 0, $671 = 0, $672 = 0, $673 = 0, $674 = 0, $675 = 0, $676 = 0, $677 = 0, $678 = 0;
+ var $679 = 0, $68 = 0, $680 = 0, $681 = 0, $682 = 0, $683 = 0, $684 = 0, $685 = 0, $686 = 0, $687 = 0, $688 = 0, $689 = 0, $69 = 0, $690 = 0, $691 = 0, $692 = 0, $693 = 0, $694 = 0, $695 = 0, $696 = 0;
+ var $697 = 0, $698 = 0, $699 = 0, $7 = 0, $70 = 0, $700 = 0, $701 = 0, $702 = 0, $703 = 0, $704 = 0, $705 = 0, $706 = 0, $707 = 0, $708 = 0, $709 = 0, $71 = 0, $710 = 0, $711 = 0, $712 = 0, $713 = 0;
+ var $714 = 0, $715 = 0, $716 = 0, $717 = 0, $718 = 0, $719 = 0, $72 = 0, $720 = 0, $721 = 0, $722 = 0, $723 = 0, $724 = 0, $725 = 0, $726 = 0, $727 = 0, $728 = 0, $729 = 0, $73 = 0, $730 = 0, $731 = 0;
+ var $732 = 0, $733 = 0, $734 = 0, $735 = 0, $736 = 0, $737 = 0, $738 = 0, $739 = 0, $74 = 0, $740 = 0, $741 = 0, $742 = 0, $743 = 0, $744 = 0, $745 = 0, $746 = 0, $747 = 0, $748 = 0, $749 = 0, $75 = 0;
+ var $750 = 0, $751 = 0, $752 = 0, $753 = 0, $754 = 0, $755 = 0, $756 = 0, $757 = 0, $758 = 0, $759 = 0, $76 = 0, $760 = 0, $761 = 0, $762 = 0, $763 = 0, $764 = 0, $765 = 0, $766 = 0, $767 = 0, $768 = 0;
+ var $769 = 0, $77 = 0, $770 = 0, $771 = 0, $772 = 0, $773 = 0, $774 = 0, $775 = 0, $776 = 0, $777 = 0, $778 = 0, $779 = 0, $78 = 0, $780 = 0, $781 = 0, $782 = 0, $783 = 0, $784 = 0, $785 = 0, $786 = 0;
+ var $787 = 0, $788 = 0, $789 = 0, $79 = 0, $790 = 0, $791 = 0, $792 = 0, $793 = 0, $794 = 0, $795 = 0, $796 = 0, $797 = 0, $798 = 0, $799 = 0, $8 = 0, $80 = 0, $800 = 0, $801 = 0, $802 = 0, $803 = 0;
+ var $804 = 0, $805 = 0, $806 = 0, $807 = 0, $808 = 0, $809 = 0, $81 = 0, $810 = 0, $811 = 0, $812 = 0, $813 = 0, $814 = 0, $815 = 0, $816 = 0, $817 = 0, $818 = 0, $819 = 0, $82 = 0, $820 = 0, $821 = 0;
+ var $822 = 0, $823 = 0, $824 = 0, $825 = 0, $826 = 0, $827 = 0, $828 = 0, $829 = 0, $83 = 0, $830 = 0, $831 = 0, $832 = 0, $833 = 0, $834 = 0, $835 = 0, $836 = 0, $837 = 0, $838 = 0, $839 = 0, $84 = 0;
+ var $840 = 0, $841 = 0, $842 = 0, $843 = 0, $844 = 0, $845 = 0, $846 = 0, $847 = 0, $848 = 0, $849 = 0, $85 = 0, $850 = 0, $851 = 0, $852 = 0, $853 = 0, $854 = 0, $855 = 0, $856 = 0, $857 = 0, $858 = 0;
+ var $859 = 0, $86 = 0, $860 = 0, $861 = 0, $862 = 0, $863 = 0, $864 = 0, $865 = 0, $866 = 0, $867 = 0, $868 = 0, $869 = 0, $87 = 0, $870 = 0, $871 = 0, $872 = 0, $873 = 0, $874 = 0, $875 = 0, $876 = 0;
+ var $877 = 0, $878 = 0, $879 = 0, $88 = 0, $880 = 0, $881 = 0, $882 = 0, $883 = 0, $884 = 0, $885 = 0, $886 = 0, $887 = 0, $888 = 0, $889 = 0, $89 = 0, $890 = 0, $891 = 0, $892 = 0, $893 = 0, $894 = 0;
+ var $895 = 0, $896 = 0, $897 = 0, $898 = 0, $899 = 0, $9 = 0, $90 = 0, $900 = 0, $901 = 0, $902 = 0, $903 = 0, $904 = 0, $905 = 0, $906 = 0, $907 = 0, $908 = 0, $909 = 0, $91 = 0, $910 = 0, $911 = 0;
+ var $912 = 0, $913 = 0, $914 = 0, $915 = 0, $916 = 0, $917 = 0, $918 = 0, $919 = 0, $92 = 0, $920 = 0, $921 = 0, $922 = 0, $923 = 0, $924 = 0, $925 = 0, $926 = 0, $927 = 0, $928 = 0, $929 = 0, $93 = 0;
+ var $930 = 0, $931 = 0, $932 = 0, $933 = 0, $934 = 0, $935 = 0, $936 = 0, $937 = 0, $938 = 0, $939 = 0, $94 = 0, $940 = 0, $941 = 0, $942 = 0, $943 = 0, $944 = 0, $945 = 0, $946 = 0, $947 = 0, $948 = 0;
+ var $949 = 0, $95 = 0, $950 = 0, $951 = 0, $952 = 0, $953 = 0, $954 = 0, $955 = 0, $956 = 0, $957 = 0, $958 = 0, $959 = 0, $96 = 0, $960 = 0, $961 = 0, $962 = 0, $963 = 0, $964 = 0, $965 = 0, $966 = 0;
+ var $967 = 0, $968 = 0, $969 = 0, $97 = 0, $970 = 0, $971 = 0, $972 = 0, $973 = 0, $974 = 0, $975 = 0, $976 = 0, $977 = 0, $978 = 0, $979 = 0, $98 = 0, $980 = 0, $981 = 0, $982 = 0, $983 = 0, $984 = 0;
+ var $985 = 0, $986 = 0, $987 = 0, $988 = 0, $989 = 0, $99 = 0, $990 = 0, $991 = 0, $992 = 0, $993 = 0, $994 = 0, $995 = 0, $996 = 0, $997 = 0, $998 = 0, $999 = 0, $F$0$i$i = 0, $F1$0$i = 0, $F4$0 = 0, $F4$0$i$i = 0;
+ var $F5$0$i = 0, $I1$0$i$i = 0, $I7$0$i = 0, $I7$0$i$i = 0, $K12$029$i = 0, $K2$07$i$i = 0, $K8$051$i$i = 0, $R$0$i = 0, $R$0$i$i = 0, $R$0$i$i$lcssa = 0, $R$0$i$lcssa = 0, $R$0$i18 = 0, $R$0$i18$lcssa = 0, $R$1$i = 0, $R$1$i$i = 0, $R$1$i20 = 0, $RP$0$i = 0, $RP$0$i$i = 0, $RP$0$i$i$lcssa = 0, $RP$0$i$lcssa = 0;
+ var $RP$0$i17 = 0, $RP$0$i17$lcssa = 0, $T$0$lcssa$i = 0, $T$0$lcssa$i$i = 0, $T$0$lcssa$i25$i = 0, $T$028$i = 0, $T$028$i$lcssa = 0, $T$050$i$i = 0, $T$050$i$i$lcssa = 0, $T$06$i$i = 0, $T$06$i$i$lcssa = 0, $br$0$ph$i = 0, $cond$i = 0, $cond$i$i = 0, $cond$i21 = 0, $exitcond$i$i = 0, $i$02$i$i = 0, $idx$0$i = 0, $mem$0 = 0, $nb$0 = 0;
+ var $not$$i = 0, $not$$i$i = 0, $not$$i26$i = 0, $oldfirst$0$i$i = 0, $or$cond$i = 0, $or$cond$i30 = 0, $or$cond1$i = 0, $or$cond19$i = 0, $or$cond2$i = 0, $or$cond3$i = 0, $or$cond5$i = 0, $or$cond57$i = 0, $or$cond6$i = 0, $or$cond8$i = 0, $or$cond9$i = 0, $qsize$0$i$i = 0, $rsize$0$i = 0, $rsize$0$i$lcssa = 0, $rsize$0$i15 = 0, $rsize$1$i = 0;
+ var $rsize$2$i = 0, $rsize$3$lcssa$i = 0, $rsize$331$i = 0, $rst$0$i = 0, $rst$1$i = 0, $sizebits$0$i = 0, $sp$0$i$i = 0, $sp$0$i$i$i = 0, $sp$084$i = 0, $sp$084$i$lcssa = 0, $sp$183$i = 0, $sp$183$i$lcssa = 0, $ssize$0$$i = 0, $ssize$0$i = 0, $ssize$1$ph$i = 0, $ssize$2$i = 0, $t$0$i = 0, $t$0$i14 = 0, $t$1$i = 0, $t$2$ph$i = 0;
+ var $t$2$v$3$i = 0, $t$230$i = 0, $tbase$255$i = 0, $tsize$0$ph$i = 0, $tsize$0323944$i = 0, $tsize$1$i = 0, $tsize$254$i = 0, $v$0$i = 0, $v$0$i$lcssa = 0, $v$0$i16 = 0, $v$1$i = 0, $v$2$i = 0, $v$3$lcssa$i = 0, $v$3$ph$i = 0, $v$332$i = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = ($bytes>>>0)<(245);
  do {
   if ($0) {
    $1 = ($bytes>>>0)<(11);
-   if ($1) {
-    $5 = 16;
-   } else {
-    $2 = (($bytes) + 11)|0;
-    $3 = $2 & -8;
-    $5 = $3;
-   }
-   $4 = $5 >>> 3;
-   $6 = HEAP32[32544>>2]|0;
-   $7 = $6 >>> $4;
+   $2 = (($bytes) + 11)|0;
+   $3 = $2 & -8;
+   $4 = $1 ? 16 : $3;
+   $5 = $4 >>> 3;
+   $6 = HEAP32[32676>>2]|0;
+   $7 = $6 >>> $5;
    $8 = $7 & 3;
    $9 = ($8|0)==(0);
    if (!($9)) {
     $10 = $7 & 1;
     $11 = $10 ^ 1;
-    $12 = (($11) + ($4))|0;
+    $12 = (($11) + ($5))|0;
     $13 = $12 << 1;
-    $14 = ((32544 + ($13<<2)|0) + 40|0);
+    $14 = (32716 + ($13<<2)|0);
     $$sum10 = (($13) + 2)|0;
-    $15 = ((32544 + ($$sum10<<2)|0) + 40|0);
+    $15 = (32716 + ($$sum10<<2)|0);
     $16 = HEAP32[$15>>2]|0;
-    $17 = (($16) + 8|0);
+    $17 = ((($16)) + 8|0);
     $18 = HEAP32[$17>>2]|0;
     $19 = ($14|0)==($18|0);
     do {
@@ -19605,15 +20761,15 @@ function _malloc($bytes) {
       $20 = 1 << $12;
       $21 = $20 ^ -1;
       $22 = $6 & $21;
-      HEAP32[32544>>2] = $22;
+      HEAP32[32676>>2] = $22;
      } else {
-      $23 = HEAP32[((32544 + 16|0))>>2]|0;
+      $23 = HEAP32[(32692)>>2]|0;
       $24 = ($18>>>0)<($23>>>0);
       if ($24) {
        _abort();
        // unreachable;
       }
-      $25 = (($18) + 12|0);
+      $25 = ((($18)) + 12|0);
       $26 = HEAP32[$25>>2]|0;
       $27 = ($26|0)==($16|0);
       if ($27) {
@@ -19628,7 +20784,7 @@ function _malloc($bytes) {
     } while(0);
     $28 = $12 << 3;
     $29 = $28 | 3;
-    $30 = (($16) + 4|0);
+    $30 = ((($16)) + 4|0);
     HEAP32[$30>>2] = $29;
     $$sum1112 = $28 | 4;
     $31 = (($16) + ($$sum1112)|0);
@@ -19636,15 +20792,15 @@ function _malloc($bytes) {
     $33 = $32 | 1;
     HEAP32[$31>>2] = $33;
     $mem$0 = $17;
-    STACKTOP = sp;return ($mem$0|0);
+    return ($mem$0|0);
    }
-   $34 = HEAP32[((32544 + 8|0))>>2]|0;
-   $35 = ($5>>>0)>($34>>>0);
+   $34 = HEAP32[(32684)>>2]|0;
+   $35 = ($4>>>0)>($34>>>0);
    if ($35) {
     $36 = ($7|0)==(0);
     if (!($36)) {
-     $37 = $7 << $4;
-     $38 = 2 << $4;
+     $37 = $7 << $5;
+     $38 = 2 << $5;
      $39 = (0 - ($38))|0;
      $40 = $38 | $39;
      $41 = $37 & $40;
@@ -19672,11 +20828,11 @@ function _malloc($bytes) {
      $63 = $59 >>> $61;
      $64 = (($62) + ($63))|0;
      $65 = $64 << 1;
-     $66 = ((32544 + ($65<<2)|0) + 40|0);
+     $66 = (32716 + ($65<<2)|0);
      $$sum4 = (($65) + 2)|0;
-     $67 = ((32544 + ($$sum4<<2)|0) + 40|0);
+     $67 = (32716 + ($$sum4<<2)|0);
      $68 = HEAP32[$67>>2]|0;
-     $69 = (($68) + 8|0);
+     $69 = ((($68)) + 8|0);
      $70 = HEAP32[$69>>2]|0;
      $71 = ($66|0)==($70|0);
      do {
@@ -19684,23 +20840,23 @@ function _malloc($bytes) {
        $72 = 1 << $64;
        $73 = $72 ^ -1;
        $74 = $6 & $73;
-       HEAP32[32544>>2] = $74;
-       $88 = $34;
+       HEAP32[32676>>2] = $74;
+       $89 = $34;
       } else {
-       $75 = HEAP32[((32544 + 16|0))>>2]|0;
+       $75 = HEAP32[(32692)>>2]|0;
        $76 = ($70>>>0)<($75>>>0);
        if ($76) {
         _abort();
         // unreachable;
        }
-       $77 = (($70) + 12|0);
+       $77 = ((($70)) + 12|0);
        $78 = HEAP32[$77>>2]|0;
        $79 = ($78|0)==($68|0);
        if ($79) {
         HEAP32[$77>>2] = $66;
         HEAP32[$67>>2] = $70;
-        $$pre = HEAP32[((32544 + 8|0))>>2]|0;
-        $88 = $$pre;
+        $$pre = HEAP32[(32684)>>2]|0;
+        $89 = $$pre;
         break;
        } else {
         _abort();
@@ -19709,38 +20865,38 @@ function _malloc($bytes) {
       }
      } while(0);
      $80 = $64 << 3;
-     $81 = (($80) - ($5))|0;
-     $82 = $5 | 3;
-     $83 = (($68) + 4|0);
+     $81 = (($80) - ($4))|0;
+     $82 = $4 | 3;
+     $83 = ((($68)) + 4|0);
      HEAP32[$83>>2] = $82;
-     $84 = (($68) + ($5)|0);
+     $84 = (($68) + ($4)|0);
      $85 = $81 | 1;
-     $$sum56 = $5 | 4;
+     $$sum56 = $4 | 4;
      $86 = (($68) + ($$sum56)|0);
      HEAP32[$86>>2] = $85;
      $87 = (($68) + ($80)|0);
      HEAP32[$87>>2] = $81;
-     $89 = ($88|0)==(0);
-     if (!($89)) {
-      $90 = HEAP32[((32544 + 20|0))>>2]|0;
-      $91 = $88 >>> 3;
+     $88 = ($89|0)==(0);
+     if (!($88)) {
+      $90 = HEAP32[(32696)>>2]|0;
+      $91 = $89 >>> 3;
       $92 = $91 << 1;
-      $93 = ((32544 + ($92<<2)|0) + 40|0);
-      $94 = HEAP32[32544>>2]|0;
+      $93 = (32716 + ($92<<2)|0);
+      $94 = HEAP32[32676>>2]|0;
       $95 = 1 << $91;
       $96 = $94 & $95;
       $97 = ($96|0)==(0);
       if ($97) {
        $98 = $94 | $95;
-       HEAP32[32544>>2] = $98;
-       $$sum8$pre = (($92) + 2)|0;
-       $$pre105 = ((32544 + ($$sum8$pre<<2)|0) + 40|0);
-       $$pre$phiZ2D = $$pre105;$F4$0 = $93;
+       HEAP32[32676>>2] = $98;
+       $$pre105 = (($92) + 2)|0;
+       $$pre106 = (32716 + ($$pre105<<2)|0);
+       $$pre$phiZ2D = $$pre106;$F4$0 = $93;
       } else {
        $$sum9 = (($92) + 2)|0;
-       $99 = ((32544 + ($$sum9<<2)|0) + 40|0);
+       $99 = (32716 + ($$sum9<<2)|0);
        $100 = HEAP32[$99>>2]|0;
-       $101 = HEAP32[((32544 + 16|0))>>2]|0;
+       $101 = HEAP32[(32692)>>2]|0;
        $102 = ($100>>>0)<($101>>>0);
        if ($102) {
         _abort();
@@ -19750,22 +20906,22 @@ function _malloc($bytes) {
        }
       }
       HEAP32[$$pre$phiZ2D>>2] = $90;
-      $103 = (($F4$0) + 12|0);
+      $103 = ((($F4$0)) + 12|0);
       HEAP32[$103>>2] = $90;
-      $104 = (($90) + 8|0);
+      $104 = ((($90)) + 8|0);
       HEAP32[$104>>2] = $F4$0;
-      $105 = (($90) + 12|0);
+      $105 = ((($90)) + 12|0);
       HEAP32[$105>>2] = $93;
      }
-     HEAP32[((32544 + 8|0))>>2] = $81;
-     HEAP32[((32544 + 20|0))>>2] = $84;
+     HEAP32[(32684)>>2] = $81;
+     HEAP32[(32696)>>2] = $84;
      $mem$0 = $69;
-     STACKTOP = sp;return ($mem$0|0);
+     return ($mem$0|0);
     }
-    $106 = HEAP32[((32544 + 4|0))>>2]|0;
+    $106 = HEAP32[(32680)>>2]|0;
     $107 = ($106|0)==(0);
     if ($107) {
-     $nb$0 = $5;
+     $nb$0 = $4;
     } else {
      $108 = (0 - ($106))|0;
      $109 = $106 & $108;
@@ -19790,22 +20946,23 @@ function _malloc($bytes) {
      $128 = $124 | $127;
      $129 = $125 >>> $127;
      $130 = (($128) + ($129))|0;
-     $131 = ((32544 + ($130<<2)|0) + 304|0);
+     $131 = (32980 + ($130<<2)|0);
      $132 = HEAP32[$131>>2]|0;
-     $133 = (($132) + 4|0);
+     $133 = ((($132)) + 4|0);
      $134 = HEAP32[$133>>2]|0;
      $135 = $134 & -8;
-     $136 = (($135) - ($5))|0;
+     $136 = (($135) - ($4))|0;
      $rsize$0$i = $136;$t$0$i = $132;$v$0$i = $132;
      while(1) {
-      $137 = (($t$0$i) + 16|0);
+      $137 = ((($t$0$i)) + 16|0);
       $138 = HEAP32[$137>>2]|0;
       $139 = ($138|0)==(0|0);
       if ($139) {
-       $140 = (($t$0$i) + 20|0);
+       $140 = ((($t$0$i)) + 20|0);
        $141 = HEAP32[$140>>2]|0;
        $142 = ($141|0)==(0|0);
        if ($142) {
+        $rsize$0$i$lcssa = $rsize$0$i;$v$0$i$lcssa = $v$0$i;
         break;
        } else {
         $144 = $141;
@@ -19813,39 +20970,39 @@ function _malloc($bytes) {
       } else {
        $144 = $138;
       }
-      $143 = (($144) + 4|0);
+      $143 = ((($144)) + 4|0);
       $145 = HEAP32[$143>>2]|0;
       $146 = $145 & -8;
-      $147 = (($146) - ($5))|0;
+      $147 = (($146) - ($4))|0;
       $148 = ($147>>>0)<($rsize$0$i>>>0);
       $$rsize$0$i = $148 ? $147 : $rsize$0$i;
       $$v$0$i = $148 ? $144 : $v$0$i;
       $rsize$0$i = $$rsize$0$i;$t$0$i = $144;$v$0$i = $$v$0$i;
      }
-     $149 = HEAP32[((32544 + 16|0))>>2]|0;
-     $150 = ($v$0$i>>>0)<($149>>>0);
+     $149 = HEAP32[(32692)>>2]|0;
+     $150 = ($v$0$i$lcssa>>>0)<($149>>>0);
      if ($150) {
       _abort();
       // unreachable;
      }
-     $151 = (($v$0$i) + ($5)|0);
-     $152 = ($v$0$i>>>0)<($151>>>0);
+     $151 = (($v$0$i$lcssa) + ($4)|0);
+     $152 = ($v$0$i$lcssa>>>0)<($151>>>0);
      if (!($152)) {
       _abort();
       // unreachable;
      }
-     $153 = (($v$0$i) + 24|0);
+     $153 = ((($v$0$i$lcssa)) + 24|0);
      $154 = HEAP32[$153>>2]|0;
-     $155 = (($v$0$i) + 12|0);
+     $155 = ((($v$0$i$lcssa)) + 12|0);
      $156 = HEAP32[$155>>2]|0;
-     $157 = ($156|0)==($v$0$i|0);
+     $157 = ($156|0)==($v$0$i$lcssa|0);
      do {
       if ($157) {
-       $167 = (($v$0$i) + 20|0);
+       $167 = ((($v$0$i$lcssa)) + 20|0);
        $168 = HEAP32[$167>>2]|0;
        $169 = ($168|0)==(0|0);
        if ($169) {
-        $170 = (($v$0$i) + 16|0);
+        $170 = ((($v$0$i$lcssa)) + 16|0);
         $171 = HEAP32[$170>>2]|0;
         $172 = ($171|0)==(0|0);
         if ($172) {
@@ -19858,49 +21015,50 @@ function _malloc($bytes) {
         $R$0$i = $168;$RP$0$i = $167;
        }
        while(1) {
-        $173 = (($R$0$i) + 20|0);
+        $173 = ((($R$0$i)) + 20|0);
         $174 = HEAP32[$173>>2]|0;
         $175 = ($174|0)==(0|0);
         if (!($175)) {
          $R$0$i = $174;$RP$0$i = $173;
          continue;
         }
-        $176 = (($R$0$i) + 16|0);
+        $176 = ((($R$0$i)) + 16|0);
         $177 = HEAP32[$176>>2]|0;
         $178 = ($177|0)==(0|0);
         if ($178) {
+         $R$0$i$lcssa = $R$0$i;$RP$0$i$lcssa = $RP$0$i;
          break;
         } else {
          $R$0$i = $177;$RP$0$i = $176;
         }
        }
-       $179 = ($RP$0$i>>>0)<($149>>>0);
+       $179 = ($RP$0$i$lcssa>>>0)<($149>>>0);
        if ($179) {
         _abort();
         // unreachable;
        } else {
-        HEAP32[$RP$0$i>>2] = 0;
-        $R$1$i = $R$0$i;
+        HEAP32[$RP$0$i$lcssa>>2] = 0;
+        $R$1$i = $R$0$i$lcssa;
         break;
        }
       } else {
-       $158 = (($v$0$i) + 8|0);
+       $158 = ((($v$0$i$lcssa)) + 8|0);
        $159 = HEAP32[$158>>2]|0;
        $160 = ($159>>>0)<($149>>>0);
        if ($160) {
         _abort();
         // unreachable;
        }
-       $161 = (($159) + 12|0);
+       $161 = ((($159)) + 12|0);
        $162 = HEAP32[$161>>2]|0;
-       $163 = ($162|0)==($v$0$i|0);
+       $163 = ($162|0)==($v$0$i$lcssa|0);
        if (!($163)) {
         _abort();
         // unreachable;
        }
-       $164 = (($156) + 8|0);
+       $164 = ((($156)) + 8|0);
        $165 = HEAP32[$164>>2]|0;
-       $166 = ($165|0)==($v$0$i|0);
+       $166 = ($165|0)==($v$0$i$lcssa|0);
        if ($166) {
         HEAP32[$161>>2] = $156;
         HEAP32[$164>>2] = $159;
@@ -19915,36 +21073,36 @@ function _malloc($bytes) {
      $180 = ($154|0)==(0|0);
      do {
       if (!($180)) {
-       $181 = (($v$0$i) + 28|0);
+       $181 = ((($v$0$i$lcssa)) + 28|0);
        $182 = HEAP32[$181>>2]|0;
-       $183 = ((32544 + ($182<<2)|0) + 304|0);
+       $183 = (32980 + ($182<<2)|0);
        $184 = HEAP32[$183>>2]|0;
-       $185 = ($v$0$i|0)==($184|0);
+       $185 = ($v$0$i$lcssa|0)==($184|0);
        if ($185) {
         HEAP32[$183>>2] = $R$1$i;
         $cond$i = ($R$1$i|0)==(0|0);
         if ($cond$i) {
          $186 = 1 << $182;
          $187 = $186 ^ -1;
-         $188 = HEAP32[((32544 + 4|0))>>2]|0;
+         $188 = HEAP32[(32680)>>2]|0;
          $189 = $188 & $187;
-         HEAP32[((32544 + 4|0))>>2] = $189;
+         HEAP32[(32680)>>2] = $189;
          break;
         }
        } else {
-        $190 = HEAP32[((32544 + 16|0))>>2]|0;
+        $190 = HEAP32[(32692)>>2]|0;
         $191 = ($154>>>0)<($190>>>0);
         if ($191) {
          _abort();
          // unreachable;
         }
-        $192 = (($154) + 16|0);
+        $192 = ((($154)) + 16|0);
         $193 = HEAP32[$192>>2]|0;
-        $194 = ($193|0)==($v$0$i|0);
+        $194 = ($193|0)==($v$0$i$lcssa|0);
         if ($194) {
          HEAP32[$192>>2] = $R$1$i;
         } else {
-         $195 = (($154) + 20|0);
+         $195 = ((($154)) + 20|0);
          HEAP32[$195>>2] = $R$1$i;
         }
         $196 = ($R$1$i|0)==(0|0);
@@ -19952,15 +21110,15 @@ function _malloc($bytes) {
          break;
         }
        }
-       $197 = HEAP32[((32544 + 16|0))>>2]|0;
+       $197 = HEAP32[(32692)>>2]|0;
        $198 = ($R$1$i>>>0)<($197>>>0);
        if ($198) {
         _abort();
         // unreachable;
        }
-       $199 = (($R$1$i) + 24|0);
+       $199 = ((($R$1$i)) + 24|0);
        HEAP32[$199>>2] = $154;
-       $200 = (($v$0$i) + 16|0);
+       $200 = ((($v$0$i$lcssa)) + 16|0);
        $201 = HEAP32[$200>>2]|0;
        $202 = ($201|0)==(0|0);
        do {
@@ -19970,77 +21128,77 @@ function _malloc($bytes) {
           _abort();
           // unreachable;
          } else {
-          $204 = (($R$1$i) + 16|0);
+          $204 = ((($R$1$i)) + 16|0);
           HEAP32[$204>>2] = $201;
-          $205 = (($201) + 24|0);
+          $205 = ((($201)) + 24|0);
           HEAP32[$205>>2] = $R$1$i;
           break;
          }
         }
        } while(0);
-       $206 = (($v$0$i) + 20|0);
+       $206 = ((($v$0$i$lcssa)) + 20|0);
        $207 = HEAP32[$206>>2]|0;
        $208 = ($207|0)==(0|0);
        if (!($208)) {
-        $209 = HEAP32[((32544 + 16|0))>>2]|0;
+        $209 = HEAP32[(32692)>>2]|0;
         $210 = ($207>>>0)<($209>>>0);
         if ($210) {
          _abort();
          // unreachable;
         } else {
-         $211 = (($R$1$i) + 20|0);
+         $211 = ((($R$1$i)) + 20|0);
          HEAP32[$211>>2] = $207;
-         $212 = (($207) + 24|0);
+         $212 = ((($207)) + 24|0);
          HEAP32[$212>>2] = $R$1$i;
          break;
         }
        }
       }
      } while(0);
-     $213 = ($rsize$0$i>>>0)<(16);
+     $213 = ($rsize$0$i$lcssa>>>0)<(16);
      if ($213) {
-      $214 = (($rsize$0$i) + ($5))|0;
+      $214 = (($rsize$0$i$lcssa) + ($4))|0;
       $215 = $214 | 3;
-      $216 = (($v$0$i) + 4|0);
+      $216 = ((($v$0$i$lcssa)) + 4|0);
       HEAP32[$216>>2] = $215;
       $$sum4$i = (($214) + 4)|0;
-      $217 = (($v$0$i) + ($$sum4$i)|0);
+      $217 = (($v$0$i$lcssa) + ($$sum4$i)|0);
       $218 = HEAP32[$217>>2]|0;
       $219 = $218 | 1;
       HEAP32[$217>>2] = $219;
      } else {
-      $220 = $5 | 3;
-      $221 = (($v$0$i) + 4|0);
+      $220 = $4 | 3;
+      $221 = ((($v$0$i$lcssa)) + 4|0);
       HEAP32[$221>>2] = $220;
-      $222 = $rsize$0$i | 1;
-      $$sum$i39 = $5 | 4;
-      $223 = (($v$0$i) + ($$sum$i39)|0);
+      $222 = $rsize$0$i$lcssa | 1;
+      $$sum$i35 = $4 | 4;
+      $223 = (($v$0$i$lcssa) + ($$sum$i35)|0);
       HEAP32[$223>>2] = $222;
-      $$sum1$i = (($rsize$0$i) + ($5))|0;
-      $224 = (($v$0$i) + ($$sum1$i)|0);
-      HEAP32[$224>>2] = $rsize$0$i;
-      $225 = HEAP32[((32544 + 8|0))>>2]|0;
+      $$sum1$i = (($rsize$0$i$lcssa) + ($4))|0;
+      $224 = (($v$0$i$lcssa) + ($$sum1$i)|0);
+      HEAP32[$224>>2] = $rsize$0$i$lcssa;
+      $225 = HEAP32[(32684)>>2]|0;
       $226 = ($225|0)==(0);
       if (!($226)) {
-       $227 = HEAP32[((32544 + 20|0))>>2]|0;
+       $227 = HEAP32[(32696)>>2]|0;
        $228 = $225 >>> 3;
        $229 = $228 << 1;
-       $230 = ((32544 + ($229<<2)|0) + 40|0);
-       $231 = HEAP32[32544>>2]|0;
+       $230 = (32716 + ($229<<2)|0);
+       $231 = HEAP32[32676>>2]|0;
        $232 = 1 << $228;
        $233 = $231 & $232;
        $234 = ($233|0)==(0);
        if ($234) {
         $235 = $231 | $232;
-        HEAP32[32544>>2] = $235;
-        $$sum2$pre$i = (($229) + 2)|0;
-        $$pre$i = ((32544 + ($$sum2$pre$i<<2)|0) + 40|0);
-        $$pre$phi$iZ2D = $$pre$i;$F1$0$i = $230;
+        HEAP32[32676>>2] = $235;
+        $$pre$i = (($229) + 2)|0;
+        $$pre8$i = (32716 + ($$pre$i<<2)|0);
+        $$pre$phi$iZ2D = $$pre8$i;$F1$0$i = $230;
        } else {
         $$sum3$i = (($229) + 2)|0;
-        $236 = ((32544 + ($$sum3$i<<2)|0) + 40|0);
+        $236 = (32716 + ($$sum3$i<<2)|0);
         $237 = HEAP32[$236>>2]|0;
-        $238 = HEAP32[((32544 + 16|0))>>2]|0;
+        $238 = HEAP32[(32692)>>2]|0;
         $239 = ($237>>>0)<($238>>>0);
         if ($239) {
          _abort();
@@ -20050,22 +21208,22 @@ function _malloc($bytes) {
         }
        }
        HEAP32[$$pre$phi$iZ2D>>2] = $227;
-       $240 = (($F1$0$i) + 12|0);
+       $240 = ((($F1$0$i)) + 12|0);
        HEAP32[$240>>2] = $227;
-       $241 = (($227) + 8|0);
+       $241 = ((($227)) + 8|0);
        HEAP32[$241>>2] = $F1$0$i;
-       $242 = (($227) + 12|0);
+       $242 = ((($227)) + 12|0);
        HEAP32[$242>>2] = $230;
       }
-      HEAP32[((32544 + 8|0))>>2] = $rsize$0$i;
-      HEAP32[((32544 + 20|0))>>2] = $151;
+      HEAP32[(32684)>>2] = $rsize$0$i$lcssa;
+      HEAP32[(32696)>>2] = $151;
      }
-     $243 = (($v$0$i) + 8|0);
+     $243 = ((($v$0$i$lcssa)) + 8|0);
      $mem$0 = $243;
-     STACKTOP = sp;return ($mem$0|0);
+     return ($mem$0|0);
     }
    } else {
-    $nb$0 = $5;
+    $nb$0 = $4;
    }
   } else {
    $244 = ($bytes>>>0)>(4294967231);
@@ -20074,7 +21232,7 @@ function _malloc($bytes) {
    } else {
     $245 = (($bytes) + 11)|0;
     $246 = $245 & -8;
-    $247 = HEAP32[((32544 + 4|0))>>2]|0;
+    $247 = HEAP32[(32680)>>2]|0;
     $248 = ($247|0)==(0);
     if ($248) {
      $nb$0 = $246;
@@ -20114,25 +21272,22 @@ function _malloc($bytes) {
        $idx$0$i = $274;
       }
      }
-     $275 = ((32544 + ($idx$0$i<<2)|0) + 304|0);
+     $275 = (32980 + ($idx$0$i<<2)|0);
      $276 = HEAP32[$275>>2]|0;
      $277 = ($276|0)==(0|0);
-     L126: do {
+     L123: do {
       if ($277) {
        $rsize$2$i = $249;$t$1$i = 0;$v$2$i = 0;
+       label = 86;
       } else {
        $278 = ($idx$0$i|0)==(31);
-       if ($278) {
-        $282 = 0;
-       } else {
-        $279 = $idx$0$i >>> 1;
-        $280 = (25 - ($279))|0;
-        $282 = $280;
-       }
-       $281 = $246 << $282;
-       $rsize$0$i15 = $249;$rst$0$i = 0;$sizebits$0$i = $281;$t$0$i14 = $276;$v$0$i16 = 0;
+       $279 = $idx$0$i >>> 1;
+       $280 = (25 - ($279))|0;
+       $281 = $278 ? 0 : $280;
+       $282 = $246 << $281;
+       $rsize$0$i15 = $249;$rst$0$i = 0;$sizebits$0$i = $282;$t$0$i14 = $276;$v$0$i16 = 0;
        while(1) {
-        $283 = (($t$0$i14) + 4|0);
+        $283 = ((($t$0$i14)) + 4|0);
         $284 = HEAP32[$283>>2]|0;
         $285 = $284 & -8;
         $286 = (($285) - ($246))|0;
@@ -20140,18 +21295,19 @@ function _malloc($bytes) {
         if ($287) {
          $288 = ($285|0)==($246|0);
          if ($288) {
-          $rsize$2$i = $286;$t$1$i = $t$0$i14;$v$2$i = $t$0$i14;
-          break L126;
+          $rsize$331$i = $286;$t$230$i = $t$0$i14;$v$332$i = $t$0$i14;
+          label = 90;
+          break L123;
          } else {
           $rsize$1$i = $286;$v$1$i = $t$0$i14;
          }
         } else {
          $rsize$1$i = $rsize$0$i15;$v$1$i = $v$0$i16;
         }
-        $289 = (($t$0$i14) + 20|0);
+        $289 = ((($t$0$i14)) + 20|0);
         $290 = HEAP32[$289>>2]|0;
         $291 = $sizebits$0$i >>> 31;
-        $292 = ((($t$0$i14) + ($291<<2)|0) + 16|0);
+        $292 = (((($t$0$i14)) + 16|0) + ($291<<2)|0);
         $293 = HEAP32[$292>>2]|0;
         $294 = ($290|0)==(0|0);
         $295 = ($290|0)==($293|0);
@@ -20161,6 +21317,7 @@ function _malloc($bytes) {
         $297 = $sizebits$0$i << 1;
         if ($296) {
          $rsize$2$i = $rsize$1$i;$t$1$i = $rst$1$i;$v$2$i = $v$1$i;
+         label = 86;
          break;
         } else {
          $rsize$0$i15 = $rsize$1$i;$rst$0$i = $rst$1$i;$sizebits$0$i = $297;$t$0$i14 = $293;$v$0$i16 = $v$1$i;
@@ -20168,69 +21325,76 @@ function _malloc($bytes) {
        }
       }
      } while(0);
-     $298 = ($t$1$i|0)==(0|0);
-     $299 = ($v$2$i|0)==(0|0);
-     $or$cond$i = $298 & $299;
-     if ($or$cond$i) {
-      $300 = 2 << $idx$0$i;
-      $301 = (0 - ($300))|0;
-      $302 = $300 | $301;
-      $303 = $247 & $302;
-      $304 = ($303|0)==(0);
-      if ($304) {
-       $nb$0 = $246;
-       break;
+     if ((label|0) == 86) {
+      $298 = ($t$1$i|0)==(0|0);
+      $299 = ($v$2$i|0)==(0|0);
+      $or$cond$i = $298 & $299;
+      if ($or$cond$i) {
+       $300 = 2 << $idx$0$i;
+       $301 = (0 - ($300))|0;
+       $302 = $300 | $301;
+       $303 = $247 & $302;
+       $304 = ($303|0)==(0);
+       if ($304) {
+        $nb$0 = $246;
+        break;
+       }
+       $305 = (0 - ($303))|0;
+       $306 = $303 & $305;
+       $307 = (($306) + -1)|0;
+       $308 = $307 >>> 12;
+       $309 = $308 & 16;
+       $310 = $307 >>> $309;
+       $311 = $310 >>> 5;
+       $312 = $311 & 8;
+       $313 = $312 | $309;
+       $314 = $310 >>> $312;
+       $315 = $314 >>> 2;
+       $316 = $315 & 4;
+       $317 = $313 | $316;
+       $318 = $314 >>> $316;
+       $319 = $318 >>> 1;
+       $320 = $319 & 2;
+       $321 = $317 | $320;
+       $322 = $318 >>> $320;
+       $323 = $322 >>> 1;
+       $324 = $323 & 1;
+       $325 = $321 | $324;
+       $326 = $322 >>> $324;
+       $327 = (($325) + ($326))|0;
+       $328 = (32980 + ($327<<2)|0);
+       $329 = HEAP32[$328>>2]|0;
+       $t$2$ph$i = $329;$v$3$ph$i = 0;
+      } else {
+       $t$2$ph$i = $t$1$i;$v$3$ph$i = $v$2$i;
       }
-      $305 = (0 - ($303))|0;
-      $306 = $303 & $305;
-      $307 = (($306) + -1)|0;
-      $308 = $307 >>> 12;
-      $309 = $308 & 16;
-      $310 = $307 >>> $309;
-      $311 = $310 >>> 5;
-      $312 = $311 & 8;
-      $313 = $312 | $309;
-      $314 = $310 >>> $312;
-      $315 = $314 >>> 2;
-      $316 = $315 & 4;
-      $317 = $313 | $316;
-      $318 = $314 >>> $316;
-      $319 = $318 >>> 1;
-      $320 = $319 & 2;
-      $321 = $317 | $320;
-      $322 = $318 >>> $320;
-      $323 = $322 >>> 1;
-      $324 = $323 & 1;
-      $325 = $321 | $324;
-      $326 = $322 >>> $324;
-      $327 = (($325) + ($326))|0;
-      $328 = ((32544 + ($327<<2)|0) + 304|0);
-      $329 = HEAP32[$328>>2]|0;
-      $t$2$ph$i = $329;
-     } else {
-      $t$2$ph$i = $t$1$i;
+      $330 = ($t$2$ph$i|0)==(0|0);
+      if ($330) {
+       $rsize$3$lcssa$i = $rsize$2$i;$v$3$lcssa$i = $v$3$ph$i;
+      } else {
+       $rsize$331$i = $rsize$2$i;$t$230$i = $t$2$ph$i;$v$332$i = $v$3$ph$i;
+       label = 90;
+      }
      }
-     $330 = ($t$2$ph$i|0)==(0|0);
-     if ($330) {
-      $rsize$3$lcssa$i = $rsize$2$i;$v$3$lcssa$i = $v$2$i;
-     } else {
-      $rsize$331$i = $rsize$2$i;$t$230$i = $t$2$ph$i;$v$332$i = $v$2$i;
+     if ((label|0) == 90) {
       while(1) {
-       $331 = (($t$230$i) + 4|0);
+       label = 0;
+       $331 = ((($t$230$i)) + 4|0);
        $332 = HEAP32[$331>>2]|0;
        $333 = $332 & -8;
        $334 = (($333) - ($246))|0;
        $335 = ($334>>>0)<($rsize$331$i>>>0);
        $$rsize$3$i = $335 ? $334 : $rsize$331$i;
        $t$2$v$3$i = $335 ? $t$230$i : $v$332$i;
-       $336 = (($t$230$i) + 16|0);
+       $336 = ((($t$230$i)) + 16|0);
        $337 = HEAP32[$336>>2]|0;
        $338 = ($337|0)==(0|0);
        if (!($338)) {
         $rsize$331$i = $$rsize$3$i;$t$230$i = $337;$v$332$i = $t$2$v$3$i;
+        label = 90;
         continue;
        }
-       $339 = (($t$230$i) + 20|0);
+       $339 = ((($t$230$i)) + 20|0);
        $340 = HEAP32[$339>>2]|0;
        $341 = ($340|0)==(0|0);
        if ($341) {
@@ -20238,6 +21402,7 @@ function _malloc($bytes) {
         break;
        } else {
         $rsize$331$i = $$rsize$3$i;$t$230$i = $340;$v$332$i = $t$2$v$3$i;
+        label = 90;
        }
       }
      }
@@ -20245,11 +21410,11 @@ function _malloc($bytes) {
      if ($342) {
       $nb$0 = $246;
      } else {
-      $343 = HEAP32[((32544 + 8|0))>>2]|0;
+      $343 = HEAP32[(32684)>>2]|0;
       $344 = (($343) - ($246))|0;
       $345 = ($rsize$3$lcssa$i>>>0)<($344>>>0);
       if ($345) {
-       $346 = HEAP32[((32544 + 16|0))>>2]|0;
+       $346 = HEAP32[(32692)>>2]|0;
        $347 = ($v$3$lcssa$i>>>0)<($346>>>0);
        if ($347) {
         _abort();
@@ -20261,18 +21426,18 @@ function _malloc($bytes) {
         _abort();
         // unreachable;
        }
-       $350 = (($v$3$lcssa$i) + 24|0);
+       $350 = ((($v$3$lcssa$i)) + 24|0);
        $351 = HEAP32[$350>>2]|0;
-       $352 = (($v$3$lcssa$i) + 12|0);
+       $352 = ((($v$3$lcssa$i)) + 12|0);
        $353 = HEAP32[$352>>2]|0;
        $354 = ($353|0)==($v$3$lcssa$i|0);
        do {
         if ($354) {
-         $364 = (($v$3$lcssa$i) + 20|0);
+         $364 = ((($v$3$lcssa$i)) + 20|0);
          $365 = HEAP32[$364>>2]|0;
          $366 = ($365|0)==(0|0);
          if ($366) {
-          $367 = (($v$3$lcssa$i) + 16|0);
+          $367 = ((($v$3$lcssa$i)) + 16|0);
           $368 = HEAP32[$367>>2]|0;
           $369 = ($368|0)==(0|0);
           if ($369) {
@@ -20285,47 +21450,48 @@ function _malloc($bytes) {
           $R$0$i18 = $365;$RP$0$i17 = $364;
          }
          while(1) {
-          $370 = (($R$0$i18) + 20|0);
+          $370 = ((($R$0$i18)) + 20|0);
           $371 = HEAP32[$370>>2]|0;
           $372 = ($371|0)==(0|0);
           if (!($372)) {
            $R$0$i18 = $371;$RP$0$i17 = $370;
            continue;
           }
-          $373 = (($R$0$i18) + 16|0);
+          $373 = ((($R$0$i18)) + 16|0);
           $374 = HEAP32[$373>>2]|0;
           $375 = ($374|0)==(0|0);
           if ($375) {
+           $R$0$i18$lcssa = $R$0$i18;$RP$0$i17$lcssa = $RP$0$i17;
            break;
           } else {
            $R$0$i18 = $374;$RP$0$i17 = $373;
           }
          }
-         $376 = ($RP$0$i17>>>0)<($346>>>0);
+         $376 = ($RP$0$i17$lcssa>>>0)<($346>>>0);
          if ($376) {
           _abort();
           // unreachable;
          } else {
-          HEAP32[$RP$0$i17>>2] = 0;
-          $R$1$i20 = $R$0$i18;
+          HEAP32[$RP$0$i17$lcssa>>2] = 0;
+          $R$1$i20 = $R$0$i18$lcssa;
           break;
          }
         } else {
-         $355 = (($v$3$lcssa$i) + 8|0);
+         $355 = ((($v$3$lcssa$i)) + 8|0);
          $356 = HEAP32[$355>>2]|0;
          $357 = ($356>>>0)<($346>>>0);
          if ($357) {
           _abort();
           // unreachable;
          }
-         $358 = (($356) + 12|0);
+         $358 = ((($356)) + 12|0);
          $359 = HEAP32[$358>>2]|0;
          $360 = ($359|0)==($v$3$lcssa$i|0);
          if (!($360)) {
           _abort();
           // unreachable;
          }
-         $361 = (($353) + 8|0);
+         $361 = ((($353)) + 8|0);
          $362 = HEAP32[$361>>2]|0;
          $363 = ($362|0)==($v$3$lcssa$i|0);
          if ($363) {
@@ -20342,9 +21508,9 @@ function _malloc($bytes) {
        $377 = ($351|0)==(0|0);
        do {
         if (!($377)) {
-         $378 = (($v$3$lcssa$i) + 28|0);
+         $378 = ((($v$3$lcssa$i)) + 28|0);
          $379 = HEAP32[$378>>2]|0;
-         $380 = ((32544 + ($379<<2)|0) + 304|0);
+         $380 = (32980 + ($379<<2)|0);
          $381 = HEAP32[$380>>2]|0;
          $382 = ($v$3$lcssa$i|0)==($381|0);
          if ($382) {
@@ -20353,25 +21519,25 @@ function _malloc($bytes) {
           if ($cond$i21) {
            $383 = 1 << $379;
            $384 = $383 ^ -1;
-           $385 = HEAP32[((32544 + 4|0))>>2]|0;
+           $385 = HEAP32[(32680)>>2]|0;
            $386 = $385 & $384;
-           HEAP32[((32544 + 4|0))>>2] = $386;
+           HEAP32[(32680)>>2] = $386;
            break;
           }
          } else {
-          $387 = HEAP32[((32544 + 16|0))>>2]|0;
+          $387 = HEAP32[(32692)>>2]|0;
           $388 = ($351>>>0)<($387>>>0);
           if ($388) {
            _abort();
            // unreachable;
           }
-          $389 = (($351) + 16|0);
+          $389 = ((($351)) + 16|0);
           $390 = HEAP32[$389>>2]|0;
           $391 = ($390|0)==($v$3$lcssa$i|0);
           if ($391) {
            HEAP32[$389>>2] = $R$1$i20;
           } else {
-           $392 = (($351) + 20|0);
+           $392 = ((($351)) + 20|0);
            HEAP32[$392>>2] = $R$1$i20;
           }
           $393 = ($R$1$i20|0)==(0|0);
@@ -20379,15 +21545,15 @@ function _malloc($bytes) {
            break;
           }
          }
-         $394 = HEAP32[((32544 + 16|0))>>2]|0;
+         $394 = HEAP32[(32692)>>2]|0;
          $395 = ($R$1$i20>>>0)<($394>>>0);
          if ($395) {
           _abort();
           // unreachable;
          }
-         $396 = (($R$1$i20) + 24|0);
+         $396 = ((($R$1$i20)) + 24|0);
          HEAP32[$396>>2] = $351;
-         $397 = (($v$3$lcssa$i) + 16|0);
+         $397 = ((($v$3$lcssa$i)) + 16|0);
          $398 = HEAP32[$397>>2]|0;
          $399 = ($398|0)==(0|0);
          do {
@@ -20397,27 +21563,27 @@ function _malloc($bytes) {
             _abort();
             // unreachable;
            } else {
-            $401 = (($R$1$i20) + 16|0);
+            $401 = ((($R$1$i20)) + 16|0);
             HEAP32[$401>>2] = $398;
-            $402 = (($398) + 24|0);
+            $402 = ((($398)) + 24|0);
             HEAP32[$402>>2] = $R$1$i20;
             break;
            }
           }
          } while(0);
-         $403 = (($v$3$lcssa$i) + 20|0);
+         $403 = ((($v$3$lcssa$i)) + 20|0);
          $404 = HEAP32[$403>>2]|0;
          $405 = ($404|0)==(0|0);
          if (!($405)) {
-          $406 = HEAP32[((32544 + 16|0))>>2]|0;
+          $406 = HEAP32[(32692)>>2]|0;
           $407 = ($404>>>0)<($406>>>0);
           if ($407) {
            _abort();
            // unreachable;
           } else {
-           $408 = (($R$1$i20) + 20|0);
+           $408 = ((($R$1$i20)) + 20|0);
            HEAP32[$408>>2] = $404;
-           $409 = (($404) + 24|0);
+           $409 = ((($404)) + 24|0);
            HEAP32[$409>>2] = $R$1$i20;
            break;
           }
@@ -20425,11 +21591,11 @@ function _malloc($bytes) {
         }
        } while(0);
        $410 = ($rsize$3$lcssa$i>>>0)<(16);
-       L204: do {
+       L199: do {
         if ($410) {
          $411 = (($rsize$3$lcssa$i) + ($246))|0;
          $412 = $411 | 3;
-         $413 = (($v$3$lcssa$i) + 4|0);
+         $413 = ((($v$3$lcssa$i)) + 4|0);
          HEAP32[$413>>2] = $412;
          $$sum18$i = (($411) + 4)|0;
          $414 = (($v$3$lcssa$i) + ($$sum18$i)|0);
@@ -20438,11 +21604,11 @@ function _malloc($bytes) {
          HEAP32[$414>>2] = $416;
         } else {
          $417 = $246 | 3;
-         $418 = (($v$3$lcssa$i) + 4|0);
+         $418 = ((($v$3$lcssa$i)) + 4|0);
          HEAP32[$418>>2] = $417;
          $419 = $rsize$3$lcssa$i | 1;
-         $$sum$i2338 = $246 | 4;
-         $420 = (($v$3$lcssa$i) + ($$sum$i2338)|0);
+         $$sum$i2334 = $246 | 4;
+         $420 = (($v$3$lcssa$i) + ($$sum$i2334)|0);
          HEAP32[$420>>2] = $419;
          $$sum1$i24 = (($rsize$3$lcssa$i) + ($246))|0;
          $421 = (($v$3$lcssa$i) + ($$sum1$i24)|0);
@@ -20451,34 +21617,32 @@ function _malloc($bytes) {
          $423 = ($rsize$3$lcssa$i>>>0)<(256);
          if ($423) {
           $424 = $422 << 1;
-          $425 = ((32544 + ($424<<2)|0) + 40|0);
-          $426 = HEAP32[32544>>2]|0;
+          $425 = (32716 + ($424<<2)|0);
+          $426 = HEAP32[32676>>2]|0;
           $427 = 1 << $422;
           $428 = $426 & $427;
           $429 = ($428|0)==(0);
-          do {
-           if ($429) {
-            $430 = $426 | $427;
-            HEAP32[32544>>2] = $430;
-            $$sum14$pre$i = (($424) + 2)|0;
-            $$pre$i25 = ((32544 + ($$sum14$pre$i<<2)|0) + 40|0);
-            $$pre$phi$i26Z2D = $$pre$i25;$F5$0$i = $425;
-           } else {
-            $$sum17$i = (($424) + 2)|0;
-            $431 = ((32544 + ($$sum17$i<<2)|0) + 40|0);
-            $432 = HEAP32[$431>>2]|0;
-            $433 = HEAP32[((32544 + 16|0))>>2]|0;
-            $434 = ($432>>>0)<($433>>>0);
-            if (!($434)) {
-             $$pre$phi$i26Z2D = $431;$F5$0$i = $432;
-             break;
-            }
+          if ($429) {
+           $430 = $426 | $427;
+           HEAP32[32676>>2] = $430;
+           $$pre$i25 = (($424) + 2)|0;
+           $$pre43$i = (32716 + ($$pre$i25<<2)|0);
+           $$pre$phi$i26Z2D = $$pre43$i;$F5$0$i = $425;
+          } else {
+           $$sum17$i = (($424) + 2)|0;
+           $431 = (32716 + ($$sum17$i<<2)|0);
+           $432 = HEAP32[$431>>2]|0;
+           $433 = HEAP32[(32692)>>2]|0;
+           $434 = ($432>>>0)<($433>>>0);
+           if ($434) {
             _abort();
             // unreachable;
+           } else {
+            $$pre$phi$i26Z2D = $431;$F5$0$i = $432;
            }
-          } while(0);
+          }
           HEAP32[$$pre$phi$i26Z2D>>2] = $348;
-          $435 = (($F5$0$i) + 12|0);
+          $435 = ((($F5$0$i)) + 12|0);
           HEAP32[$435>>2] = $348;
           $$sum15$i = (($246) + 8)|0;
           $436 = (($v$3$lcssa$i) + ($$sum15$i)|0);
@@ -20522,7 +21686,7 @@ function _malloc($bytes) {
            $I7$0$i = $462;
           }
          }
-         $463 = ((32544 + ($I7$0$i<<2)|0) + 304|0);
+         $463 = (32980 + ($I7$0$i<<2)|0);
          $$sum2$i = (($246) + 28)|0;
          $464 = (($v$3$lcssa$i) + ($$sum2$i)|0);
          HEAP32[$464>>2] = $I7$0$i;
@@ -20532,13 +21696,13 @@ function _malloc($bytes) {
          $466 = (($v$3$lcssa$i) + ($$sum4$i28)|0);
          HEAP32[$466>>2] = 0;
          HEAP32[$465>>2] = 0;
-         $467 = HEAP32[((32544 + 4|0))>>2]|0;
+         $467 = HEAP32[(32680)>>2]|0;
          $468 = 1 << $I7$0$i;
          $469 = $467 & $468;
          $470 = ($469|0)==(0);
          if ($470) {
           $471 = $467 | $468;
-          HEAP32[((32544 + 4|0))>>2] = $471;
+          HEAP32[(32680)>>2] = $471;
           HEAP32[$463>>2] = $348;
           $$sum5$i = (($246) + 24)|0;
           $472 = (($v$3$lcssa$i) + ($$sum5$i)|0);
@@ -20552,72 +21716,69 @@ function _malloc($bytes) {
           break;
          }
          $475 = HEAP32[$463>>2]|0;
-         $476 = ($I7$0$i|0)==(31);
-         if ($476) {
-          $484 = 0;
-         } else {
-          $477 = $I7$0$i >>> 1;
-          $478 = (25 - ($477))|0;
-          $484 = $478;
-         }
-         $479 = (($475) + 4|0);
-         $480 = HEAP32[$479>>2]|0;
-         $481 = $480 & -8;
-         $482 = ($481|0)==($rsize$3$lcssa$i|0);
-         L225: do {
-          if ($482) {
+         $476 = ((($475)) + 4|0);
+         $477 = HEAP32[$476>>2]|0;
+         $478 = $477 & -8;
+         $479 = ($478|0)==($rsize$3$lcssa$i|0);
+         L217: do {
+          if ($479) {
            $T$0$lcssa$i = $475;
           } else {
-           $483 = $rsize$3$lcssa$i << $484;
-           $K12$027$i = $483;$T$026$i = $475;
+           $480 = ($I7$0$i|0)==(31);
+           $481 = $I7$0$i >>> 1;
+           $482 = (25 - ($481))|0;
+           $483 = $480 ? 0 : $482;
+           $484 = $rsize$3$lcssa$i << $483;
+           $K12$029$i = $484;$T$028$i = $475;
            while(1) {
-            $491 = $K12$027$i >>> 31;
-            $492 = ((($T$026$i) + ($491<<2)|0) + 16|0);
+            $491 = $K12$029$i >>> 31;
+            $492 = (((($T$028$i)) + 16|0) + ($491<<2)|0);
             $487 = HEAP32[$492>>2]|0;
             $493 = ($487|0)==(0|0);
             if ($493) {
+             $$lcssa232 = $492;$T$028$i$lcssa = $T$028$i;
              break;
             }
-            $485 = $K12$027$i << 1;
-            $486 = (($487) + 4|0);
+            $485 = $K12$029$i << 1;
+            $486 = ((($487)) + 4|0);
             $488 = HEAP32[$486>>2]|0;
             $489 = $488 & -8;
             $490 = ($489|0)==($rsize$3$lcssa$i|0);
             if ($490) {
              $T$0$lcssa$i = $487;
-             break L225;
+             break L217;
             } else {
-             $K12$027$i = $485;$T$026$i = $487;
+             $K12$029$i = $485;$T$028$i = $487;
             }
            }
-           $494 = HEAP32[((32544 + 16|0))>>2]|0;
-           $495 = ($492>>>0)<($494>>>0);
+           $494 = HEAP32[(32692)>>2]|0;
+           $495 = ($$lcssa232>>>0)<($494>>>0);
            if ($495) {
             _abort();
             // unreachable;
            } else {
-            HEAP32[$492>>2] = $348;
+            HEAP32[$$lcssa232>>2] = $348;
             $$sum11$i = (($246) + 24)|0;
             $496 = (($v$3$lcssa$i) + ($$sum11$i)|0);
-            HEAP32[$496>>2] = $T$026$i;
+            HEAP32[$496>>2] = $T$028$i$lcssa;
             $$sum12$i = (($246) + 12)|0;
             $497 = (($v$3$lcssa$i) + ($$sum12$i)|0);
             HEAP32[$497>>2] = $348;
             $$sum13$i = (($246) + 8)|0;
             $498 = (($v$3$lcssa$i) + ($$sum13$i)|0);
             HEAP32[$498>>2] = $348;
-            break L204;
+            break L199;
            }
           }
          } while(0);
-         $499 = (($T$0$lcssa$i) + 8|0);
+         $499 = ((($T$0$lcssa$i)) + 8|0);
          $500 = HEAP32[$499>>2]|0;
-         $501 = HEAP32[((32544 + 16|0))>>2]|0;
-         $502 = ($T$0$lcssa$i>>>0)>=($501>>>0);
-         $503 = ($500>>>0)>=($501>>>0);
-         $or$cond24$i = $502 & $503;
-         if ($or$cond24$i) {
-          $504 = (($500) + 12|0);
+         $501 = HEAP32[(32692)>>2]|0;
+         $502 = ($500>>>0)>=($501>>>0);
+         $not$$i = ($T$0$lcssa$i>>>0)>=($501>>>0);
+         $503 = $502 & $not$$i;
+         if ($503) {
+          $504 = ((($500)) + 12|0);
           HEAP32[$504>>2] = $348;
           HEAP32[$499>>2] = $348;
           $$sum8$i = (($246) + 8)|0;
@@ -20636,9 +21797,9 @@ function _malloc($bytes) {
          }
         }
        } while(0);
-       $508 = (($v$3$lcssa$i) + 8|0);
+       $508 = ((($v$3$lcssa$i)) + 8|0);
        $mem$0 = $508;
-       STACKTOP = sp;return ($mem$0|0);
+       return ($mem$0|0);
       } else {
        $nb$0 = $246;
       }
@@ -20647,16 +21808,16 @@ function _malloc($bytes) {
    }
   }
  } while(0);
- $509 = HEAP32[((32544 + 8|0))>>2]|0;
+ $509 = HEAP32[(32684)>>2]|0;
  $510 = ($509>>>0)<($nb$0>>>0);
  if (!($510)) {
   $511 = (($509) - ($nb$0))|0;
-  $512 = HEAP32[((32544 + 20|0))>>2]|0;
+  $512 = HEAP32[(32696)>>2]|0;
   $513 = ($511>>>0)>(15);
   if ($513) {
    $514 = (($512) + ($nb$0)|0);
-   HEAP32[((32544 + 20|0))>>2] = $514;
-   HEAP32[((32544 + 8|0))>>2] = $511;
+   HEAP32[(32696)>>2] = $514;
+   HEAP32[(32684)>>2] = $511;
    $515 = $511 | 1;
    $$sum2 = (($nb$0) + 4)|0;
    $516 = (($512) + ($$sum2)|0);
@@ -20664,13 +21825,13 @@ function _malloc($bytes) {
    $517 = (($512) + ($509)|0);
    HEAP32[$517>>2] = $511;
    $518 = $nb$0 | 3;
-   $519 = (($512) + 4|0);
+   $519 = ((($512)) + 4|0);
    HEAP32[$519>>2] = $518;
   } else {
-   HEAP32[((32544 + 8|0))>>2] = 0;
-   HEAP32[((32544 + 20|0))>>2] = 0;
+   HEAP32[(32684)>>2] = 0;
+   HEAP32[(32696)>>2] = 0;
    $520 = $509 | 3;
-   $521 = (($512) + 4|0);
+   $521 = ((($512)) + 4|0);
    HEAP32[$521>>2] = $520;
    $$sum1 = (($509) + 4)|0;
    $522 = (($512) + ($$sum1)|0);
@@ -20678,30 +21839,30 @@ function _malloc($bytes) {
    $524 = $523 | 1;
    HEAP32[$522>>2] = $524;
   }
-  $525 = (($512) + 8|0);
+  $525 = ((($512)) + 8|0);
   $mem$0 = $525;
-  STACKTOP = sp;return ($mem$0|0);
+  return ($mem$0|0);
  }
- $526 = HEAP32[((32544 + 12|0))>>2]|0;
+ $526 = HEAP32[(32688)>>2]|0;
  $527 = ($526>>>0)>($nb$0>>>0);
  if ($527) {
   $528 = (($526) - ($nb$0))|0;
-  HEAP32[((32544 + 12|0))>>2] = $528;
-  $529 = HEAP32[((32544 + 24|0))>>2]|0;
+  HEAP32[(32688)>>2] = $528;
+  $529 = HEAP32[(32700)>>2]|0;
   $530 = (($529) + ($nb$0)|0);
-  HEAP32[((32544 + 24|0))>>2] = $530;
+  HEAP32[(32700)>>2] = $530;
   $531 = $528 | 1;
   $$sum = (($nb$0) + 4)|0;
   $532 = (($529) + ($$sum)|0);
   HEAP32[$532>>2] = $531;
   $533 = $nb$0 | 3;
-  $534 = (($529) + 4|0);
+  $534 = ((($529)) + 4|0);
   HEAP32[$534>>2] = $533;
-  $535 = (($529) + 8|0);
+  $535 = ((($529)) + 8|0);
   $mem$0 = $535;
-  STACKTOP = sp;return ($mem$0|0);
+  return ($mem$0|0);
  }
- $536 = HEAP32[33016>>2]|0;
+ $536 = HEAP32[33148>>2]|0;
  $537 = ($536|0)==(0);
  do {
   if ($537) {
@@ -20710,16 +21871,16 @@ function _malloc($bytes) {
    $540 = $539 & $538;
    $541 = ($540|0)==(0);
    if ($541) {
-    HEAP32[((33016 + 8|0))>>2] = $538;
-    HEAP32[((33016 + 4|0))>>2] = $538;
-    HEAP32[((33016 + 12|0))>>2] = -1;
-    HEAP32[((33016 + 16|0))>>2] = -1;
-    HEAP32[((33016 + 20|0))>>2] = 0;
-    HEAP32[((32544 + 444|0))>>2] = 0;
+    HEAP32[(33156)>>2] = $538;
+    HEAP32[(33152)>>2] = $538;
+    HEAP32[(33160)>>2] = -1;
+    HEAP32[(33164)>>2] = -1;
+    HEAP32[(33168)>>2] = 0;
+    HEAP32[(33120)>>2] = 0;
     $542 = (_time((0|0))|0);
     $543 = $542 & -16;
     $544 = $543 ^ 1431655768;
-    HEAP32[33016>>2] = $544;
+    HEAP32[33148>>2] = $544;
     break;
    } else {
     _abort();
@@ -20728,7 +21889,7 @@ function _malloc($bytes) {
   }
  } while(0);
  $545 = (($nb$0) + 48)|0;
- $546 = HEAP32[((33016 + 8|0))>>2]|0;
+ $546 = HEAP32[(33156)>>2]|0;
  $547 = (($nb$0) + 47)|0;
  $548 = (($546) + ($547))|0;
  $549 = (0 - ($546))|0;
@@ -20736,613 +21897,596 @@ function _malloc($bytes) {
  $551 = ($550>>>0)>($nb$0>>>0);
  if (!($551)) {
   $mem$0 = 0;
-  STACKTOP = sp;return ($mem$0|0);
+  return ($mem$0|0);
  }
- $552 = HEAP32[((32544 + 440|0))>>2]|0;
+ $552 = HEAP32[(33116)>>2]|0;
  $553 = ($552|0)==(0);
  if (!($553)) {
-  $554 = HEAP32[((32544 + 432|0))>>2]|0;
+  $554 = HEAP32[(33108)>>2]|0;
   $555 = (($554) + ($550))|0;
   $556 = ($555>>>0)<=($554>>>0);
   $557 = ($555>>>0)>($552>>>0);
   $or$cond1$i = $556 | $557;
   if ($or$cond1$i) {
    $mem$0 = 0;
-   STACKTOP = sp;return ($mem$0|0);
+   return ($mem$0|0);
   }
  }
- $558 = HEAP32[((32544 + 444|0))>>2]|0;
+ $558 = HEAP32[(33120)>>2]|0;
  $559 = $558 & 4;
  $560 = ($559|0)==(0);
- L266: do {
+ L258: do {
   if ($560) {
-   $561 = HEAP32[((32544 + 24|0))>>2]|0;
+   $561 = HEAP32[(32700)>>2]|0;
    $562 = ($561|0)==(0|0);
-   L268: do {
+   L260: do {
     if ($562) {
-     label = 181;
+     label = 174;
     } else {
-     $sp$0$i$i = ((32544 + 448|0));
+     $sp$0$i$i = (33124);
      while(1) {
       $563 = HEAP32[$sp$0$i$i>>2]|0;
       $564 = ($563>>>0)>($561>>>0);
       if (!($564)) {
-       $565 = (($sp$0$i$i) + 4|0);
+       $565 = ((($sp$0$i$i)) + 4|0);
        $566 = HEAP32[$565>>2]|0;
        $567 = (($563) + ($566)|0);
        $568 = ($567>>>0)>($561>>>0);
        if ($568) {
+        $$lcssa228 = $sp$0$i$i;$$lcssa230 = $565;
         break;
        }
       }
-      $569 = (($sp$0$i$i) + 8|0);
+      $569 = ((($sp$0$i$i)) + 8|0);
       $570 = HEAP32[$569>>2]|0;
       $571 = ($570|0)==(0|0);
       if ($571) {
-       label = 181;
-       break L268;
+       label = 174;
+       break L260;
       } else {
        $sp$0$i$i = $570;
       }
      }
-     $572 = ($sp$0$i$i|0)==(0|0);
-     if ($572) {
-      label = 181;
-     } else {
-      $595 = HEAP32[((32544 + 12|0))>>2]|0;
-      $596 = (($548) - ($595))|0;
-      $597 = $596 & $549;
-      $598 = ($597>>>0)<(2147483647);
-      if ($598) {
-       $599 = (_sbrk(($597|0))|0);
-       $600 = HEAP32[$sp$0$i$i>>2]|0;
-       $601 = HEAP32[$565>>2]|0;
-       $602 = (($600) + ($601)|0);
-       $603 = ($599|0)==($602|0);
+     $594 = HEAP32[(32688)>>2]|0;
+     $595 = (($548) - ($594))|0;
+     $596 = $595 & $549;
+     $597 = ($596>>>0)<(2147483647);
+     if ($597) {
+      $598 = (_sbrk(($596|0))|0);
+      $599 = HEAP32[$$lcssa228>>2]|0;
+      $600 = HEAP32[$$lcssa230>>2]|0;
+      $601 = (($599) + ($600)|0);
+      $602 = ($598|0)==($601|0);
+      $$3$i = $602 ? $596 : 0;
+      if ($602) {
+       $603 = ($598|0)==((-1)|0);
        if ($603) {
-        $br$0$i = $599;$ssize$1$i = $597;
-        label = 190;
+        $tsize$0323944$i = $$3$i;
        } else {
-        $br$030$i = $599;$ssize$129$i = $597;
-        label = 191;
+        $tbase$255$i = $598;$tsize$254$i = $$3$i;
+        label = 194;
+        break L258;
        }
       } else {
-       $tsize$03141$i = 0;
+       $br$0$ph$i = $598;$ssize$1$ph$i = $596;$tsize$0$ph$i = $$3$i;
+       label = 184;
       }
+     } else {
+      $tsize$0323944$i = 0;
      }
     }
    } while(0);
    do {
-    if ((label|0) == 181) {
-     $573 = (_sbrk(0)|0);
-     $574 = ($573|0)==((-1)|0);
-     if ($574) {
-      $tsize$03141$i = 0;
+    if ((label|0) == 174) {
+     $572 = (_sbrk(0)|0);
+     $573 = ($572|0)==((-1)|0);
+     if ($573) {
+      $tsize$0323944$i = 0;
      } else {
-      $575 = $573;
-      $576 = HEAP32[((33016 + 4|0))>>2]|0;
-      $577 = (($576) + -1)|0;
-      $578 = $577 & $575;
-      $579 = ($578|0)==(0);
-      if ($579) {
+      $574 = $572;
+      $575 = HEAP32[(33152)>>2]|0;
+      $576 = (($575) + -1)|0;
+      $577 = $576 & $574;
+      $578 = ($577|0)==(0);
+      if ($578) {
        $ssize$0$i = $550;
       } else {
-       $580 = (($577) + ($575))|0;
-       $581 = (0 - ($576))|0;
-       $582 = $580 & $581;
-       $583 = (($550) - ($575))|0;
-       $584 = (($583) + ($582))|0;
-       $ssize$0$i = $584;
+       $579 = (($576) + ($574))|0;
+       $580 = (0 - ($575))|0;
+       $581 = $579 & $580;
+       $582 = (($550) - ($574))|0;
+       $583 = (($582) + ($581))|0;
+       $ssize$0$i = $583;
       }
-      $585 = HEAP32[((32544 + 432|0))>>2]|0;
-      $586 = (($585) + ($ssize$0$i))|0;
-      $587 = ($ssize$0$i>>>0)>($nb$0>>>0);
-      $588 = ($ssize$0$i>>>0)<(2147483647);
-      $or$cond$i29 = $587 & $588;
-      if ($or$cond$i29) {
-       $589 = HEAP32[((32544 + 440|0))>>2]|0;
-       $590 = ($589|0)==(0);
-       if (!($590)) {
-        $591 = ($586>>>0)<=($585>>>0);
-        $592 = ($586>>>0)>($589>>>0);
-        $or$cond2$i = $591 | $592;
+      $584 = HEAP32[(33108)>>2]|0;
+      $585 = (($584) + ($ssize$0$i))|0;
+      $586 = ($ssize$0$i>>>0)>($nb$0>>>0);
+      $587 = ($ssize$0$i>>>0)<(2147483647);
+      $or$cond$i30 = $586 & $587;
+      if ($or$cond$i30) {
+       $588 = HEAP32[(33116)>>2]|0;
+       $589 = ($588|0)==(0);
+       if (!($589)) {
+        $590 = ($585>>>0)<=($584>>>0);
+        $591 = ($585>>>0)>($588>>>0);
+        $or$cond2$i = $590 | $591;
         if ($or$cond2$i) {
-         $tsize$03141$i = 0;
+         $tsize$0323944$i = 0;
          break;
         }
        }
-       $593 = (_sbrk(($ssize$0$i|0))|0);
-       $594 = ($593|0)==($573|0);
-       if ($594) {
-        $br$0$i = $573;$ssize$1$i = $ssize$0$i;
-        label = 190;
+       $592 = (_sbrk(($ssize$0$i|0))|0);
+       $593 = ($592|0)==($572|0);
+       $ssize$0$$i = $593 ? $ssize$0$i : 0;
+       if ($593) {
+        $tbase$255$i = $572;$tsize$254$i = $ssize$0$$i;
+        label = 194;
+        break L258;
        } else {
-        $br$030$i = $593;$ssize$129$i = $ssize$0$i;
-        label = 191;
+        $br$0$ph$i = $592;$ssize$1$ph$i = $ssize$0$i;$tsize$0$ph$i = $ssize$0$$i;
+        label = 184;
        }
       } else {
-       $tsize$03141$i = 0;
+       $tsize$0323944$i = 0;
       }
      }
     }
    } while(0);
-   L288: do {
-    if ((label|0) == 190) {
-     $604 = ($br$0$i|0)==((-1)|0);
-     if ($604) {
-      $tsize$03141$i = $ssize$1$i;
-     } else {
-      $tbase$245$i = $br$0$i;$tsize$244$i = $ssize$1$i;
-      label = 201;
-      break L266;
-     }
-    }
-    else if ((label|0) == 191) {
-     $605 = (0 - ($ssize$129$i))|0;
-     $606 = ($br$030$i|0)!=((-1)|0);
-     $607 = ($ssize$129$i>>>0)<(2147483647);
-     $or$cond5$i = $606 & $607;
-     $608 = ($545>>>0)>($ssize$129$i>>>0);
-     $or$cond4$i = $or$cond5$i & $608;
+   L280: do {
+    if ((label|0) == 184) {
+     $604 = (0 - ($ssize$1$ph$i))|0;
+     $605 = ($br$0$ph$i|0)!=((-1)|0);
+     $606 = ($ssize$1$ph$i>>>0)<(2147483647);
+     $or$cond5$i = $606 & $605;
+     $607 = ($545>>>0)>($ssize$1$ph$i>>>0);
+     $or$cond6$i = $607 & $or$cond5$i;
      do {
-      if ($or$cond4$i) {
-       $609 = HEAP32[((33016 + 8|0))>>2]|0;
-       $610 = (($547) - ($ssize$129$i))|0;
-       $611 = (($610) + ($609))|0;
-       $612 = (0 - ($609))|0;
-       $613 = $611 & $612;
-       $614 = ($613>>>0)<(2147483647);
-       if ($614) {
-        $615 = (_sbrk(($613|0))|0);
-        $616 = ($615|0)==((-1)|0);
-        if ($616) {
-         (_sbrk(($605|0))|0);
-         $tsize$03141$i = 0;
-         break L288;
+      if ($or$cond6$i) {
+       $608 = HEAP32[(33156)>>2]|0;
+       $609 = (($547) - ($ssize$1$ph$i))|0;
+       $610 = (($609) + ($608))|0;
+       $611 = (0 - ($608))|0;
+       $612 = $610 & $611;
+       $613 = ($612>>>0)<(2147483647);
+       if ($613) {
+        $614 = (_sbrk(($612|0))|0);
+        $615 = ($614|0)==((-1)|0);
+        if ($615) {
+         (_sbrk(($604|0))|0);
+         $tsize$0323944$i = $tsize$0$ph$i;
+         break L280;
         } else {
-         $617 = (($613) + ($ssize$129$i))|0;
-         $ssize$2$i = $617;
+         $616 = (($612) + ($ssize$1$ph$i))|0;
+         $ssize$2$i = $616;
          break;
         }
        } else {
-        $ssize$2$i = $ssize$129$i;
+        $ssize$2$i = $ssize$1$ph$i;
        }
       } else {
-       $ssize$2$i = $ssize$129$i;
+       $ssize$2$i = $ssize$1$ph$i;
       }
      } while(0);
-     $618 = ($br$030$i|0)==((-1)|0);
-     if ($618) {
-      $tsize$03141$i = 0;
+     $617 = ($br$0$ph$i|0)==((-1)|0);
+     if ($617) {
+      $tsize$0323944$i = $tsize$0$ph$i;
      } else {
-      $tbase$245$i = $br$030$i;$tsize$244$i = $ssize$2$i;
-      label = 201;
-      break L266;
+      $tbase$255$i = $br$0$ph$i;$tsize$254$i = $ssize$2$i;
+      label = 194;
+      break L258;
      }
     }
    } while(0);
-   $619 = HEAP32[((32544 + 444|0))>>2]|0;
-   $620 = $619 | 4;
-   HEAP32[((32544 + 444|0))>>2] = $620;
-   $tsize$1$i = $tsize$03141$i;
-   label = 198;
+   $618 = HEAP32[(33120)>>2]|0;
+   $619 = $618 | 4;
+   HEAP32[(33120)>>2] = $619;
+   $tsize$1$i = $tsize$0323944$i;
+   label = 191;
   } else {
    $tsize$1$i = 0;
-   label = 198;
+   label = 191;
   }
  } while(0);
- if ((label|0) == 198) {
-  $621 = ($550>>>0)<(2147483647);
-  if ($621) {
-   $622 = (_sbrk(($550|0))|0);
-   $623 = (_sbrk(0)|0);
+ if ((label|0) == 191) {
+  $620 = ($550>>>0)<(2147483647);
+  if ($620) {
+   $621 = (_sbrk(($550|0))|0);
+   $622 = (_sbrk(0)|0);
+   $623 = ($621|0)!=((-1)|0);
    $624 = ($622|0)!=((-1)|0);
-   $625 = ($623|0)!=((-1)|0);
-   $or$cond3$i = $624 & $625;
-   $626 = ($622>>>0)<($623>>>0);
-   $or$cond6$i = $or$cond3$i & $626;
-   if ($or$cond6$i) {
-    $627 = $623;
-    $628 = $622;
-    $629 = (($627) - ($628))|0;
-    $630 = (($nb$0) + 40)|0;
-    $631 = ($629>>>0)>($630>>>0);
-    $$tsize$1$i = $631 ? $629 : $tsize$1$i;
-    if ($631) {
-     $tbase$245$i = $622;$tsize$244$i = $$tsize$1$i;
-     label = 201;
+   $or$cond3$i = $623 & $624;
+   $625 = ($621>>>0)<($622>>>0);
+   $or$cond8$i = $625 & $or$cond3$i;
+   if ($or$cond8$i) {
+    $626 = $622;
+    $627 = $621;
+    $628 = (($626) - ($627))|0;
+    $629 = (($nb$0) + 40)|0;
+    $630 = ($628>>>0)>($629>>>0);
+    $$tsize$1$i = $630 ? $628 : $tsize$1$i;
+    if ($630) {
+     $tbase$255$i = $621;$tsize$254$i = $$tsize$1$i;
+     label = 194;
     }
    }
   }
  }
- if ((label|0) == 201) {
-  $632 = HEAP32[((32544 + 432|0))>>2]|0;
-  $633 = (($632) + ($tsize$244$i))|0;
-  HEAP32[((32544 + 432|0))>>2] = $633;
-  $634 = HEAP32[((32544 + 436|0))>>2]|0;
-  $635 = ($633>>>0)>($634>>>0);
-  if ($635) {
-   HEAP32[((32544 + 436|0))>>2] = $633;
+ if ((label|0) == 194) {
+  $631 = HEAP32[(33108)>>2]|0;
+  $632 = (($631) + ($tsize$254$i))|0;
+  HEAP32[(33108)>>2] = $632;
+  $633 = HEAP32[(33112)>>2]|0;
+  $634 = ($632>>>0)>($633>>>0);
+  if ($634) {
+   HEAP32[(33112)>>2] = $632;
   }
-  $636 = HEAP32[((32544 + 24|0))>>2]|0;
-  $637 = ($636|0)==(0|0);
-  L308: do {
-   if ($637) {
-    $638 = HEAP32[((32544 + 16|0))>>2]|0;
-    $639 = ($638|0)==(0|0);
-    $640 = ($tbase$245$i>>>0)<($638>>>0);
-    $or$cond8$i = $639 | $640;
-    if ($or$cond8$i) {
-     HEAP32[((32544 + 16|0))>>2] = $tbase$245$i;
+  $635 = HEAP32[(32700)>>2]|0;
+  $636 = ($635|0)==(0|0);
+  L299: do {
+   if ($636) {
+    $637 = HEAP32[(32692)>>2]|0;
+    $638 = ($637|0)==(0|0);
+    $639 = ($tbase$255$i>>>0)<($637>>>0);
+    $or$cond9$i = $638 | $639;
+    if ($or$cond9$i) {
+     HEAP32[(32692)>>2] = $tbase$255$i;
     }
-    HEAP32[((32544 + 448|0))>>2] = $tbase$245$i;
-    HEAP32[((32544 + 452|0))>>2] = $tsize$244$i;
-    HEAP32[((32544 + 460|0))>>2] = 0;
-    $641 = HEAP32[33016>>2]|0;
-    HEAP32[((32544 + 36|0))>>2] = $641;
-    HEAP32[((32544 + 32|0))>>2] = -1;
+    HEAP32[(33124)>>2] = $tbase$255$i;
+    HEAP32[(33128)>>2] = $tsize$254$i;
+    HEAP32[(33136)>>2] = 0;
+    $640 = HEAP32[33148>>2]|0;
+    HEAP32[(32712)>>2] = $640;
+    HEAP32[(32708)>>2] = -1;
     $i$02$i$i = 0;
     while(1) {
-     $642 = $i$02$i$i << 1;
-     $643 = ((32544 + ($642<<2)|0) + 40|0);
-     $$sum$i$i = (($642) + 3)|0;
-     $644 = ((32544 + ($$sum$i$i<<2)|0) + 40|0);
-     HEAP32[$644>>2] = $643;
-     $$sum1$i$i = (($642) + 2)|0;
-     $645 = ((32544 + ($$sum1$i$i<<2)|0) + 40|0);
-     HEAP32[$645>>2] = $643;
-     $646 = (($i$02$i$i) + 1)|0;
-     $exitcond$i$i = ($646|0)==(32);
+     $641 = $i$02$i$i << 1;
+     $642 = (32716 + ($641<<2)|0);
+     $$sum$i$i = (($641) + 3)|0;
+     $643 = (32716 + ($$sum$i$i<<2)|0);
+     HEAP32[$643>>2] = $642;
+     $$sum1$i$i = (($641) + 2)|0;
+     $644 = (32716 + ($$sum1$i$i<<2)|0);
+     HEAP32[$644>>2] = $642;
+     $645 = (($i$02$i$i) + 1)|0;
+     $exitcond$i$i = ($645|0)==(32);
      if ($exitcond$i$i) {
       break;
      } else {
-      $i$02$i$i = $646;
+      $i$02$i$i = $645;
      }
     }
-    $647 = (($tsize$244$i) + -40)|0;
-    $648 = (($tbase$245$i) + 8|0);
-    $649 = $648;
-    $650 = $649 & 7;
-    $651 = ($650|0)==(0);
-    if ($651) {
-     $655 = 0;
-    } else {
-     $652 = (0 - ($649))|0;
-     $653 = $652 & 7;
-     $655 = $653;
-    }
-    $654 = (($tbase$245$i) + ($655)|0);
-    $656 = (($647) - ($655))|0;
-    HEAP32[((32544 + 24|0))>>2] = $654;
-    HEAP32[((32544 + 12|0))>>2] = $656;
-    $657 = $656 | 1;
-    $$sum$i12$i = (($655) + 4)|0;
-    $658 = (($tbase$245$i) + ($$sum$i12$i)|0);
-    HEAP32[$658>>2] = $657;
-    $$sum2$i$i = (($tsize$244$i) + -36)|0;
-    $659 = (($tbase$245$i) + ($$sum2$i$i)|0);
-    HEAP32[$659>>2] = 40;
-    $660 = HEAP32[((33016 + 16|0))>>2]|0;
-    HEAP32[((32544 + 28|0))>>2] = $660;
+    $646 = (($tsize$254$i) + -40)|0;
+    $647 = ((($tbase$255$i)) + 8|0);
+    $648 = $647;
+    $649 = $648 & 7;
+    $650 = ($649|0)==(0);
+    $651 = (0 - ($648))|0;
+    $652 = $651 & 7;
+    $653 = $650 ? 0 : $652;
+    $654 = (($tbase$255$i) + ($653)|0);
+    $655 = (($646) - ($653))|0;
+    HEAP32[(32700)>>2] = $654;
+    HEAP32[(32688)>>2] = $655;
+    $656 = $655 | 1;
+    $$sum$i13$i = (($653) + 4)|0;
+    $657 = (($tbase$255$i) + ($$sum$i13$i)|0);
+    HEAP32[$657>>2] = $656;
+    $$sum2$i$i = (($tsize$254$i) + -36)|0;
+    $658 = (($tbase$255$i) + ($$sum2$i$i)|0);
+    HEAP32[$658>>2] = 40;
+    $659 = HEAP32[(33164)>>2]|0;
+    HEAP32[(32704)>>2] = $659;
    } else {
-    $sp$073$i = ((32544 + 448|0));
+    $sp$084$i = (33124);
     while(1) {
-     $661 = HEAP32[$sp$073$i>>2]|0;
-     $662 = (($sp$073$i) + 4|0);
-     $663 = HEAP32[$662>>2]|0;
-     $664 = (($661) + ($663)|0);
-     $665 = ($tbase$245$i|0)==($664|0);
-     if ($665) {
-      label = 213;
+     $660 = HEAP32[$sp$084$i>>2]|0;
+     $661 = ((($sp$084$i)) + 4|0);
+     $662 = HEAP32[$661>>2]|0;
+     $663 = (($660) + ($662)|0);
+     $664 = ($tbase$255$i|0)==($663|0);
+     if ($664) {
+      $$lcssa222 = $660;$$lcssa224 = $661;$$lcssa226 = $662;$sp$084$i$lcssa = $sp$084$i;
+      label = 204;
       break;
      }
-     $666 = (($sp$073$i) + 8|0);
-     $667 = HEAP32[$666>>2]|0;
-     $668 = ($667|0)==(0|0);
-     if ($668) {
+     $665 = ((($sp$084$i)) + 8|0);
+     $666 = HEAP32[$665>>2]|0;
+     $667 = ($666|0)==(0|0);
+     if ($667) {
       break;
      } else {
-      $sp$073$i = $667;
+      $sp$084$i = $666;
      }
     }
-    if ((label|0) == 213) {
-     $669 = (($sp$073$i) + 12|0);
-     $670 = HEAP32[$669>>2]|0;
-     $671 = $670 & 8;
-     $672 = ($671|0)==(0);
-     if ($672) {
-      $673 = ($636>>>0)>=($661>>>0);
-      $674 = ($636>>>0)<($tbase$245$i>>>0);
-      $or$cond47$i = $673 & $674;
-      if ($or$cond47$i) {
-       $675 = (($663) + ($tsize$244$i))|0;
-       HEAP32[$662>>2] = $675;
-       $676 = HEAP32[((32544 + 12|0))>>2]|0;
-       $677 = (($676) + ($tsize$244$i))|0;
-       $678 = (($636) + 8|0);
-       $679 = $678;
-       $680 = $679 & 7;
-       $681 = ($680|0)==(0);
-       if ($681) {
-        $685 = 0;
-       } else {
-        $682 = (0 - ($679))|0;
-        $683 = $682 & 7;
-        $685 = $683;
-       }
-       $684 = (($636) + ($685)|0);
-       $686 = (($677) - ($685))|0;
-       HEAP32[((32544 + 24|0))>>2] = $684;
-       HEAP32[((32544 + 12|0))>>2] = $686;
-       $687 = $686 | 1;
-       $$sum$i16$i = (($685) + 4)|0;
-       $688 = (($636) + ($$sum$i16$i)|0);
-       HEAP32[$688>>2] = $687;
-       $$sum2$i17$i = (($677) + 4)|0;
-       $689 = (($636) + ($$sum2$i17$i)|0);
-       HEAP32[$689>>2] = 40;
-       $690 = HEAP32[((33016 + 16|0))>>2]|0;
-       HEAP32[((32544 + 28|0))>>2] = $690;
+    if ((label|0) == 204) {
+     $668 = ((($sp$084$i$lcssa)) + 12|0);
+     $669 = HEAP32[$668>>2]|0;
+     $670 = $669 & 8;
+     $671 = ($670|0)==(0);
+     if ($671) {
+      $672 = ($635>>>0)>=($$lcssa222>>>0);
+      $673 = ($635>>>0)<($tbase$255$i>>>0);
+      $or$cond57$i = $673 & $672;
+      if ($or$cond57$i) {
+       $674 = (($$lcssa226) + ($tsize$254$i))|0;
+       HEAP32[$$lcssa224>>2] = $674;
+       $675 = HEAP32[(32688)>>2]|0;
+       $676 = (($675) + ($tsize$254$i))|0;
+       $677 = ((($635)) + 8|0);
+       $678 = $677;
+       $679 = $678 & 7;
+       $680 = ($679|0)==(0);
+       $681 = (0 - ($678))|0;
+       $682 = $681 & 7;
+       $683 = $680 ? 0 : $682;
+       $684 = (($635) + ($683)|0);
+       $685 = (($676) - ($683))|0;
+       HEAP32[(32700)>>2] = $684;
+       HEAP32[(32688)>>2] = $685;
+       $686 = $685 | 1;
+       $$sum$i17$i = (($683) + 4)|0;
+       $687 = (($635) + ($$sum$i17$i)|0);
+       HEAP32[$687>>2] = $686;
+       $$sum2$i18$i = (($676) + 4)|0;
+       $688 = (($635) + ($$sum2$i18$i)|0);
+       HEAP32[$688>>2] = 40;
+       $689 = HEAP32[(33164)>>2]|0;
+       HEAP32[(32704)>>2] = $689;
        break;
       }
      }
     }
-    $691 = HEAP32[((32544 + 16|0))>>2]|0;
-    $692 = ($tbase$245$i>>>0)<($691>>>0);
-    if ($692) {
-     HEAP32[((32544 + 16|0))>>2] = $tbase$245$i;
-     $756 = $tbase$245$i;
+    $690 = HEAP32[(32692)>>2]|0;
+    $691 = ($tbase$255$i>>>0)<($690>>>0);
+    if ($691) {
+     HEAP32[(32692)>>2] = $tbase$255$i;
+     $755 = $tbase$255$i;
     } else {
-     $756 = $691;
+     $755 = $690;
     }
-    $693 = (($tbase$245$i) + ($tsize$244$i)|0);
-    $sp$166$i = ((32544 + 448|0));
+    $692 = (($tbase$255$i) + ($tsize$254$i)|0);
+    $sp$183$i = (33124);
     while(1) {
-     $694 = HEAP32[$sp$166$i>>2]|0;
-     $695 = ($694|0)==($693|0);
-     if ($695) {
-      label = 223;
+     $693 = HEAP32[$sp$183$i>>2]|0;
+     $694 = ($693|0)==($692|0);
+     if ($694) {
+      $$lcssa219 = $sp$183$i;$sp$183$i$lcssa = $sp$183$i;
+      label = 212;
       break;
      }
-     $696 = (($sp$166$i) + 8|0);
-     $697 = HEAP32[$696>>2]|0;
-     $698 = ($697|0)==(0|0);
-     if ($698) {
+     $695 = ((($sp$183$i)) + 8|0);
+     $696 = HEAP32[$695>>2]|0;
+     $697 = ($696|0)==(0|0);
+     if ($697) {
+      $sp$0$i$i$i = (33124);
       break;
      } else {
-      $sp$166$i = $697;
+      $sp$183$i = $696;
      }
     }
-    if ((label|0) == 223) {
-     $699 = (($sp$166$i) + 12|0);
-     $700 = HEAP32[$699>>2]|0;
-     $701 = $700 & 8;
-     $702 = ($701|0)==(0);
-     if ($702) {
-      HEAP32[$sp$166$i>>2] = $tbase$245$i;
-      $703 = (($sp$166$i) + 4|0);
-      $704 = HEAP32[$703>>2]|0;
-      $705 = (($704) + ($tsize$244$i))|0;
-      HEAP32[$703>>2] = $705;
-      $706 = (($tbase$245$i) + 8|0);
-      $707 = $706;
-      $708 = $707 & 7;
-      $709 = ($708|0)==(0);
-      if ($709) {
-       $713 = 0;
-      } else {
-       $710 = (0 - ($707))|0;
-       $711 = $710 & 7;
-       $713 = $711;
-      }
-      $712 = (($tbase$245$i) + ($713)|0);
-      $$sum102$i = (($tsize$244$i) + 8)|0;
-      $714 = (($tbase$245$i) + ($$sum102$i)|0);
-      $715 = $714;
-      $716 = $715 & 7;
-      $717 = ($716|0)==(0);
-      if ($717) {
-       $720 = 0;
-      } else {
-       $718 = (0 - ($715))|0;
-       $719 = $718 & 7;
-       $720 = $719;
-      }
-      $$sum103$i = (($720) + ($tsize$244$i))|0;
-      $721 = (($tbase$245$i) + ($$sum103$i)|0);
-      $722 = $721;
-      $723 = $712;
-      $724 = (($722) - ($723))|0;
-      $$sum$i19$i = (($713) + ($nb$0))|0;
-      $725 = (($tbase$245$i) + ($$sum$i19$i)|0);
-      $726 = (($724) - ($nb$0))|0;
-      $727 = $nb$0 | 3;
-      $$sum1$i20$i = (($713) + 4)|0;
-      $728 = (($tbase$245$i) + ($$sum1$i20$i)|0);
-      HEAP32[$728>>2] = $727;
-      $729 = ($721|0)==($636|0);
-      L345: do {
-       if ($729) {
-        $730 = HEAP32[((32544 + 12|0))>>2]|0;
-        $731 = (($730) + ($726))|0;
-        HEAP32[((32544 + 12|0))>>2] = $731;
-        HEAP32[((32544 + 24|0))>>2] = $725;
-        $732 = $731 | 1;
+    if ((label|0) == 212) {
+     $698 = ((($sp$183$i$lcssa)) + 12|0);
+     $699 = HEAP32[$698>>2]|0;
+     $700 = $699 & 8;
+     $701 = ($700|0)==(0);
+     if ($701) {
+      HEAP32[$$lcssa219>>2] = $tbase$255$i;
+      $702 = ((($sp$183$i$lcssa)) + 4|0);
+      $703 = HEAP32[$702>>2]|0;
+      $704 = (($703) + ($tsize$254$i))|0;
+      HEAP32[$702>>2] = $704;
+      $705 = ((($tbase$255$i)) + 8|0);
+      $706 = $705;
+      $707 = $706 & 7;
+      $708 = ($707|0)==(0);
+      $709 = (0 - ($706))|0;
+      $710 = $709 & 7;
+      $711 = $708 ? 0 : $710;
+      $712 = (($tbase$255$i) + ($711)|0);
+      $$sum112$i = (($tsize$254$i) + 8)|0;
+      $713 = (($tbase$255$i) + ($$sum112$i)|0);
+      $714 = $713;
+      $715 = $714 & 7;
+      $716 = ($715|0)==(0);
+      $717 = (0 - ($714))|0;
+      $718 = $717 & 7;
+      $719 = $716 ? 0 : $718;
+      $$sum113$i = (($719) + ($tsize$254$i))|0;
+      $720 = (($tbase$255$i) + ($$sum113$i)|0);
+      $721 = $720;
+      $722 = $712;
+      $723 = (($721) - ($722))|0;
+      $$sum$i19$i = (($711) + ($nb$0))|0;
+      $724 = (($tbase$255$i) + ($$sum$i19$i)|0);
+      $725 = (($723) - ($nb$0))|0;
+      $726 = $nb$0 | 3;
+      $$sum1$i20$i = (($711) + 4)|0;
+      $727 = (($tbase$255$i) + ($$sum1$i20$i)|0);
+      HEAP32[$727>>2] = $726;
+      $728 = ($720|0)==($635|0);
+      L324: do {
+       if ($728) {
+        $729 = HEAP32[(32688)>>2]|0;
+        $730 = (($729) + ($725))|0;
+        HEAP32[(32688)>>2] = $730;
+        HEAP32[(32700)>>2] = $724;
+        $731 = $730 | 1;
         $$sum42$i$i = (($$sum$i19$i) + 4)|0;
-        $733 = (($tbase$245$i) + ($$sum42$i$i)|0);
-        HEAP32[$733>>2] = $732;
+        $732 = (($tbase$255$i) + ($$sum42$i$i)|0);
+        HEAP32[$732>>2] = $731;
        } else {
-        $734 = HEAP32[((32544 + 20|0))>>2]|0;
-        $735 = ($721|0)==($734|0);
-        if ($735) {
-         $736 = HEAP32[((32544 + 8|0))>>2]|0;
-         $737 = (($736) + ($726))|0;
-         HEAP32[((32544 + 8|0))>>2] = $737;
-         HEAP32[((32544 + 20|0))>>2] = $725;
-         $738 = $737 | 1;
+        $733 = HEAP32[(32696)>>2]|0;
+        $734 = ($720|0)==($733|0);
+        if ($734) {
+         $735 = HEAP32[(32684)>>2]|0;
+         $736 = (($735) + ($725))|0;
+         HEAP32[(32684)>>2] = $736;
+         HEAP32[(32696)>>2] = $724;
+         $737 = $736 | 1;
          $$sum40$i$i = (($$sum$i19$i) + 4)|0;
-         $739 = (($tbase$245$i) + ($$sum40$i$i)|0);
-         HEAP32[$739>>2] = $738;
-         $$sum41$i$i = (($737) + ($$sum$i19$i))|0;
-         $740 = (($tbase$245$i) + ($$sum41$i$i)|0);
-         HEAP32[$740>>2] = $737;
+         $738 = (($tbase$255$i) + ($$sum40$i$i)|0);
+         HEAP32[$738>>2] = $737;
+         $$sum41$i$i = (($736) + ($$sum$i19$i))|0;
+         $739 = (($tbase$255$i) + ($$sum41$i$i)|0);
+         HEAP32[$739>>2] = $736;
          break;
         }
-        $$sum2$i21$i = (($tsize$244$i) + 4)|0;
-        $$sum104$i = (($$sum2$i21$i) + ($720))|0;
-        $741 = (($tbase$245$i) + ($$sum104$i)|0);
-        $742 = HEAP32[$741>>2]|0;
-        $743 = $742 & 3;
-        $744 = ($743|0)==(1);
-        if ($744) {
-         $745 = $742 & -8;
-         $746 = $742 >>> 3;
-         $747 = ($742>>>0)<(256);
-         L353: do {
-          if ($747) {
-           $$sum3738$i$i = $720 | 8;
-           $$sum114$i = (($$sum3738$i$i) + ($tsize$244$i))|0;
-           $748 = (($tbase$245$i) + ($$sum114$i)|0);
-           $749 = HEAP32[$748>>2]|0;
-           $$sum39$i$i = (($tsize$244$i) + 12)|0;
-           $$sum115$i = (($$sum39$i$i) + ($720))|0;
-           $750 = (($tbase$245$i) + ($$sum115$i)|0);
-           $751 = HEAP32[$750>>2]|0;
-           $752 = $746 << 1;
-           $753 = ((32544 + ($752<<2)|0) + 40|0);
-           $754 = ($749|0)==($753|0);
+        $$sum2$i21$i = (($tsize$254$i) + 4)|0;
+        $$sum114$i = (($$sum2$i21$i) + ($719))|0;
+        $740 = (($tbase$255$i) + ($$sum114$i)|0);
+        $741 = HEAP32[$740>>2]|0;
+        $742 = $741 & 3;
+        $743 = ($742|0)==(1);
+        if ($743) {
+         $744 = $741 & -8;
+         $745 = $741 >>> 3;
+         $746 = ($741>>>0)<(256);
+         L332: do {
+          if ($746) {
+           $$sum3738$i$i = $719 | 8;
+           $$sum124$i = (($$sum3738$i$i) + ($tsize$254$i))|0;
+           $747 = (($tbase$255$i) + ($$sum124$i)|0);
+           $748 = HEAP32[$747>>2]|0;
+           $$sum39$i$i = (($tsize$254$i) + 12)|0;
+           $$sum125$i = (($$sum39$i$i) + ($719))|0;
+           $749 = (($tbase$255$i) + ($$sum125$i)|0);
+           $750 = HEAP32[$749>>2]|0;
+           $751 = $745 << 1;
+           $752 = (32716 + ($751<<2)|0);
+           $753 = ($748|0)==($752|0);
            do {
-            if (!($754)) {
-             $755 = ($749>>>0)<($756>>>0);
-             if ($755) {
+            if (!($753)) {
+             $754 = ($748>>>0)<($755>>>0);
+             if ($754) {
               _abort();
               // unreachable;
              }
-             $757 = (($749) + 12|0);
-             $758 = HEAP32[$757>>2]|0;
-             $759 = ($758|0)==($721|0);
-             if ($759) {
+             $756 = ((($748)) + 12|0);
+             $757 = HEAP32[$756>>2]|0;
+             $758 = ($757|0)==($720|0);
+             if ($758) {
               break;
              }
              _abort();
              // unreachable;
             }
            } while(0);
-           $760 = ($751|0)==($749|0);
-           if ($760) {
-            $761 = 1 << $746;
-            $762 = $761 ^ -1;
-            $763 = HEAP32[32544>>2]|0;
-            $764 = $763 & $762;
-            HEAP32[32544>>2] = $764;
+           $759 = ($750|0)==($748|0);
+           if ($759) {
+            $760 = 1 << $745;
+            $761 = $760 ^ -1;
+            $762 = HEAP32[32676>>2]|0;
+            $763 = $762 & $761;
+            HEAP32[32676>>2] = $763;
             break;
            }
-           $765 = ($751|0)==($753|0);
+           $764 = ($750|0)==($752|0);
            do {
-            if ($765) {
-             $$pre58$i$i = (($751) + 8|0);
-             $$pre$phi59$i$iZ2D = $$pre58$i$i;
+            if ($764) {
+             $$pre57$i$i = ((($750)) + 8|0);
+             $$pre$phi58$i$iZ2D = $$pre57$i$i;
             } else {
-             $766 = ($751>>>0)<($756>>>0);
-             if ($766) {
+             $765 = ($750>>>0)<($755>>>0);
+             if ($765) {
               _abort();
               // unreachable;
              }
-             $767 = (($751) + 8|0);
-             $768 = HEAP32[$767>>2]|0;
-             $769 = ($768|0)==($721|0);
-             if ($769) {
-              $$pre$phi59$i$iZ2D = $767;
+             $766 = ((($750)) + 8|0);
+             $767 = HEAP32[$766>>2]|0;
+             $768 = ($767|0)==($720|0);
+             if ($768) {
+              $$pre$phi58$i$iZ2D = $766;
               break;
              }
              _abort();
              // unreachable;
             }
            } while(0);
-           $770 = (($749) + 12|0);
-           HEAP32[$770>>2] = $751;
-           HEAP32[$$pre$phi59$i$iZ2D>>2] = $749;
+           $769 = ((($748)) + 12|0);
+           HEAP32[$769>>2] = $750;
+           HEAP32[$$pre$phi58$i$iZ2D>>2] = $748;
           } else {
-           $$sum34$i$i = $720 | 24;
-           $$sum105$i = (($$sum34$i$i) + ($tsize$244$i))|0;
-           $771 = (($tbase$245$i) + ($$sum105$i)|0);
-           $772 = HEAP32[$771>>2]|0;
-           $$sum5$i$i = (($tsize$244$i) + 12)|0;
-           $$sum106$i = (($$sum5$i$i) + ($720))|0;
-           $773 = (($tbase$245$i) + ($$sum106$i)|0);
-           $774 = HEAP32[$773>>2]|0;
-           $775 = ($774|0)==($721|0);
+           $$sum34$i$i = $719 | 24;
+           $$sum115$i = (($$sum34$i$i) + ($tsize$254$i))|0;
+           $770 = (($tbase$255$i) + ($$sum115$i)|0);
+           $771 = HEAP32[$770>>2]|0;
+           $$sum5$i$i = (($tsize$254$i) + 12)|0;
+           $$sum116$i = (($$sum5$i$i) + ($719))|0;
+           $772 = (($tbase$255$i) + ($$sum116$i)|0);
+           $773 = HEAP32[$772>>2]|0;
+           $774 = ($773|0)==($720|0);
            do {
-            if ($775) {
-             $$sum67$i$i = $720 | 16;
-             $$sum112$i = (($$sum2$i21$i) + ($$sum67$i$i))|0;
-             $785 = (($tbase$245$i) + ($$sum112$i)|0);
-             $786 = HEAP32[$785>>2]|0;
-             $787 = ($786|0)==(0|0);
-             if ($787) {
-              $$sum113$i = (($$sum67$i$i) + ($tsize$244$i))|0;
-              $788 = (($tbase$245$i) + ($$sum113$i)|0);
-              $789 = HEAP32[$788>>2]|0;
-              $790 = ($789|0)==(0|0);
-              if ($790) {
+            if ($774) {
+             $$sum67$i$i = $719 | 16;
+             $$sum122$i = (($$sum2$i21$i) + ($$sum67$i$i))|0;
+             $784 = (($tbase$255$i) + ($$sum122$i)|0);
+             $785 = HEAP32[$784>>2]|0;
+             $786 = ($785|0)==(0|0);
+             if ($786) {
+              $$sum123$i = (($$sum67$i$i) + ($tsize$254$i))|0;
+              $787 = (($tbase$255$i) + ($$sum123$i)|0);
+              $788 = HEAP32[$787>>2]|0;
+              $789 = ($788|0)==(0|0);
+              if ($789) {
                $R$1$i$i = 0;
                break;
               } else {
-               $R$0$i$i = $789;$RP$0$i$i = $788;
+               $R$0$i$i = $788;$RP$0$i$i = $787;
               }
              } else {
-              $R$0$i$i = $786;$RP$0$i$i = $785;
+              $R$0$i$i = $785;$RP$0$i$i = $784;
              }
              while(1) {
-              $791 = (($R$0$i$i) + 20|0);
-              $792 = HEAP32[$791>>2]|0;
-              $793 = ($792|0)==(0|0);
-              if (!($793)) {
-               $R$0$i$i = $792;$RP$0$i$i = $791;
+              $790 = ((($R$0$i$i)) + 20|0);
+              $791 = HEAP32[$790>>2]|0;
+              $792 = ($791|0)==(0|0);
+              if (!($792)) {
+               $R$0$i$i = $791;$RP$0$i$i = $790;
                continue;
               }
-              $794 = (($R$0$i$i) + 16|0);
-              $795 = HEAP32[$794>>2]|0;
-              $796 = ($795|0)==(0|0);
-              if ($796) {
+              $793 = ((($R$0$i$i)) + 16|0);
+              $794 = HEAP32[$793>>2]|0;
+              $795 = ($794|0)==(0|0);
+              if ($795) {
+               $R$0$i$i$lcssa = $R$0$i$i;$RP$0$i$i$lcssa = $RP$0$i$i;
                break;
               } else {
-               $R$0$i$i = $795;$RP$0$i$i = $794;
+               $R$0$i$i = $794;$RP$0$i$i = $793;
               }
              }
-             $797 = ($RP$0$i$i>>>0)<($756>>>0);
-             if ($797) {
+             $796 = ($RP$0$i$i$lcssa>>>0)<($755>>>0);
+             if ($796) {
               _abort();
               // unreachable;
              } else {
-              HEAP32[$RP$0$i$i>>2] = 0;
-              $R$1$i$i = $R$0$i$i;
+              HEAP32[$RP$0$i$i$lcssa>>2] = 0;
+              $R$1$i$i = $R$0$i$i$lcssa;
               break;
              }
             } else {
-             $$sum3536$i$i = $720 | 8;
-             $$sum107$i = (($$sum3536$i$i) + ($tsize$244$i))|0;
-             $776 = (($tbase$245$i) + ($$sum107$i)|0);
-             $777 = HEAP32[$776>>2]|0;
-             $778 = ($777>>>0)<($756>>>0);
-             if ($778) {
+             $$sum3536$i$i = $719 | 8;
+             $$sum117$i = (($$sum3536$i$i) + ($tsize$254$i))|0;
+             $775 = (($tbase$255$i) + ($$sum117$i)|0);
+             $776 = HEAP32[$775>>2]|0;
+             $777 = ($776>>>0)<($755>>>0);
+             if ($777) {
               _abort();
               // unreachable;
              }
-             $779 = (($777) + 12|0);
-             $780 = HEAP32[$779>>2]|0;
-             $781 = ($780|0)==($721|0);
-             if (!($781)) {
+             $778 = ((($776)) + 12|0);
+             $779 = HEAP32[$778>>2]|0;
+             $780 = ($779|0)==($720|0);
+             if (!($780)) {
               _abort();
               // unreachable;
              }
-             $782 = (($774) + 8|0);
-             $783 = HEAP32[$782>>2]|0;
-             $784 = ($783|0)==($721|0);
-             if ($784) {
-              HEAP32[$779>>2] = $774;
-              HEAP32[$782>>2] = $777;
-              $R$1$i$i = $774;
+             $781 = ((($773)) + 8|0);
+             $782 = HEAP32[$781>>2]|0;
+             $783 = ($782|0)==($720|0);
+             if ($783) {
+              HEAP32[$778>>2] = $773;
+              HEAP32[$781>>2] = $776;
+              $R$1$i$i = $773;
               break;
              } else {
               _abort();
@@ -21350,304 +22494,301 @@ function _malloc($bytes) {
              }
             }
            } while(0);
-           $798 = ($772|0)==(0|0);
-           if ($798) {
+           $797 = ($771|0)==(0|0);
+           if ($797) {
             break;
            }
-           $$sum30$i$i = (($tsize$244$i) + 28)|0;
-           $$sum108$i = (($$sum30$i$i) + ($720))|0;
-           $799 = (($tbase$245$i) + ($$sum108$i)|0);
-           $800 = HEAP32[$799>>2]|0;
-           $801 = ((32544 + ($800<<2)|0) + 304|0);
-           $802 = HEAP32[$801>>2]|0;
-           $803 = ($721|0)==($802|0);
+           $$sum30$i$i = (($tsize$254$i) + 28)|0;
+           $$sum118$i = (($$sum30$i$i) + ($719))|0;
+           $798 = (($tbase$255$i) + ($$sum118$i)|0);
+           $799 = HEAP32[$798>>2]|0;
+           $800 = (32980 + ($799<<2)|0);
+           $801 = HEAP32[$800>>2]|0;
+           $802 = ($720|0)==($801|0);
            do {
-            if ($803) {
-             HEAP32[$801>>2] = $R$1$i$i;
+            if ($802) {
+             HEAP32[$800>>2] = $R$1$i$i;
              $cond$i$i = ($R$1$i$i|0)==(0|0);
              if (!($cond$i$i)) {
               break;
              }
-             $804 = 1 << $800;
-             $805 = $804 ^ -1;
-             $806 = HEAP32[((32544 + 4|0))>>2]|0;
-             $807 = $806 & $805;
-             HEAP32[((32544 + 4|0))>>2] = $807;
-             break L353;
+             $803 = 1 << $799;
+             $804 = $803 ^ -1;
+             $805 = HEAP32[(32680)>>2]|0;
+             $806 = $805 & $804;
+             HEAP32[(32680)>>2] = $806;
+             break L332;
             } else {
-             $808 = HEAP32[((32544 + 16|0))>>2]|0;
-             $809 = ($772>>>0)<($808>>>0);
-             if ($809) {
+             $807 = HEAP32[(32692)>>2]|0;
+             $808 = ($771>>>0)<($807>>>0);
+             if ($808) {
               _abort();
               // unreachable;
              }
-             $810 = (($772) + 16|0);
-             $811 = HEAP32[$810>>2]|0;
-             $812 = ($811|0)==($721|0);
-             if ($812) {
-              HEAP32[$810>>2] = $R$1$i$i;
+             $809 = ((($771)) + 16|0);
+             $810 = HEAP32[$809>>2]|0;
+             $811 = ($810|0)==($720|0);
+             if ($811) {
+              HEAP32[$809>>2] = $R$1$i$i;
              } else {
-              $813 = (($772) + 20|0);
-              HEAP32[$813>>2] = $R$1$i$i;
+              $812 = ((($771)) + 20|0);
+              HEAP32[$812>>2] = $R$1$i$i;
              }
-             $814 = ($R$1$i$i|0)==(0|0);
-             if ($814) {
-              break L353;
+             $813 = ($R$1$i$i|0)==(0|0);
+             if ($813) {
+              break L332;
              }
             }
            } while(0);
-           $815 = HEAP32[((32544 + 16|0))>>2]|0;
-           $816 = ($R$1$i$i>>>0)<($815>>>0);
-           if ($816) {
+           $814 = HEAP32[(32692)>>2]|0;
+           $815 = ($R$1$i$i>>>0)<($814>>>0);
+           if ($815) {
             _abort();
             // unreachable;
            }
-           $817 = (($R$1$i$i) + 24|0);
-           HEAP32[$817>>2] = $772;
-           $$sum3132$i$i = $720 | 16;
-           $$sum109$i = (($$sum3132$i$i) + ($tsize$244$i))|0;
-           $818 = (($tbase$245$i) + ($$sum109$i)|0);
-           $819 = HEAP32[$818>>2]|0;
-           $820 = ($819|0)==(0|0);
+           $816 = ((($R$1$i$i)) + 24|0);
+           HEAP32[$816>>2] = $771;
+           $$sum3132$i$i = $719 | 16;
+           $$sum119$i = (($$sum3132$i$i) + ($tsize$254$i))|0;
+           $817 = (($tbase$255$i) + ($$sum119$i)|0);
+           $818 = HEAP32[$817>>2]|0;
+           $819 = ($818|0)==(0|0);
            do {
-            if (!($820)) {
-             $821 = ($819>>>0)<($815>>>0);
-             if ($821) {
+            if (!($819)) {
+             $820 = ($818>>>0)<($814>>>0);
+             if ($820) {
               _abort();
               // unreachable;
              } else {
-              $822 = (($R$1$i$i) + 16|0);
-              HEAP32[$822>>2] = $819;
-              $823 = (($819) + 24|0);
-              HEAP32[$823>>2] = $R$1$i$i;
+              $821 = ((($R$1$i$i)) + 16|0);
+              HEAP32[$821>>2] = $818;
+              $822 = ((($818)) + 24|0);
+              HEAP32[$822>>2] = $R$1$i$i;
               break;
              }
             }
            } while(0);
-           $$sum110$i = (($$sum2$i21$i) + ($$sum3132$i$i))|0;
-           $824 = (($tbase$245$i) + ($$sum110$i)|0);
-           $825 = HEAP32[$824>>2]|0;
-           $826 = ($825|0)==(0|0);
-           if ($826) {
+           $$sum120$i = (($$sum2$i21$i) + ($$sum3132$i$i))|0;
+           $823 = (($tbase$255$i) + ($$sum120$i)|0);
+           $824 = HEAP32[$823>>2]|0;
+           $825 = ($824|0)==(0|0);
+           if ($825) {
             break;
            }
-           $827 = HEAP32[((32544 + 16|0))>>2]|0;
-           $828 = ($825>>>0)<($827>>>0);
-           if ($828) {
+           $826 = HEAP32[(32692)>>2]|0;
+           $827 = ($824>>>0)<($826>>>0);
+           if ($827) {
             _abort();
             // unreachable;
            } else {
-            $829 = (($R$1$i$i) + 20|0);
-            HEAP32[$829>>2] = $825;
-            $830 = (($825) + 24|0);
-            HEAP32[$830>>2] = $R$1$i$i;
+            $828 = ((($R$1$i$i)) + 20|0);
+            HEAP32[$828>>2] = $824;
+            $829 = ((($824)) + 24|0);
+            HEAP32[$829>>2] = $R$1$i$i;
             break;
            }
           }
          } while(0);
-         $$sum9$i$i = $745 | $720;
-         $$sum111$i = (($$sum9$i$i) + ($tsize$244$i))|0;
-         $831 = (($tbase$245$i) + ($$sum111$i)|0);
-         $832 = (($745) + ($726))|0;
-         $oldfirst$0$i$i = $831;$qsize$0$i$i = $832;
+         $$sum9$i$i = $744 | $719;
+         $$sum121$i = (($$sum9$i$i) + ($tsize$254$i))|0;
+         $830 = (($tbase$255$i) + ($$sum121$i)|0);
+         $831 = (($744) + ($725))|0;
+         $oldfirst$0$i$i = $830;$qsize$0$i$i = $831;
         } else {
-         $oldfirst$0$i$i = $721;$qsize$0$i$i = $726;
+         $oldfirst$0$i$i = $720;$qsize$0$i$i = $725;
         }
-        $833 = (($oldfirst$0$i$i) + 4|0);
-        $834 = HEAP32[$833>>2]|0;
-        $835 = $834 & -2;
-        HEAP32[$833>>2] = $835;
-        $836 = $qsize$0$i$i | 1;
+        $832 = ((($oldfirst$0$i$i)) + 4|0);
+        $833 = HEAP32[$832>>2]|0;
+        $834 = $833 & -2;
+        HEAP32[$832>>2] = $834;
+        $835 = $qsize$0$i$i | 1;
         $$sum10$i$i = (($$sum$i19$i) + 4)|0;
-        $837 = (($tbase$245$i) + ($$sum10$i$i)|0);
-        HEAP32[$837>>2] = $836;
-        $$sum11$i22$i = (($qsize$0$i$i) + ($$sum$i19$i))|0;
-        $838 = (($tbase$245$i) + ($$sum11$i22$i)|0);
-        HEAP32[$838>>2] = $qsize$0$i$i;
-        $839 = $qsize$0$i$i >>> 3;
-        $840 = ($qsize$0$i$i>>>0)<(256);
-        if ($840) {
-         $841 = $839 << 1;
-         $842 = ((32544 + ($841<<2)|0) + 40|0);
-         $843 = HEAP32[32544>>2]|0;
-         $844 = 1 << $839;
-         $845 = $843 & $844;
-         $846 = ($845|0)==(0);
+        $836 = (($tbase$255$i) + ($$sum10$i$i)|0);
+        HEAP32[$836>>2] = $835;
+        $$sum11$i$i = (($qsize$0$i$i) + ($$sum$i19$i))|0;
+        $837 = (($tbase$255$i) + ($$sum11$i$i)|0);
+        HEAP32[$837>>2] = $qsize$0$i$i;
+        $838 = $qsize$0$i$i >>> 3;
+        $839 = ($qsize$0$i$i>>>0)<(256);
+        if ($839) {
+         $840 = $838 << 1;
+         $841 = (32716 + ($840<<2)|0);
+         $842 = HEAP32[32676>>2]|0;
+         $843 = 1 << $838;
+         $844 = $842 & $843;
+         $845 = ($844|0)==(0);
          do {
-          if ($846) {
-           $847 = $843 | $844;
-           HEAP32[32544>>2] = $847;
-           $$sum26$pre$i$i = (($841) + 2)|0;
-           $$pre$i23$i = ((32544 + ($$sum26$pre$i$i<<2)|0) + 40|0);
-           $$pre$phi$i24$iZ2D = $$pre$i23$i;$F4$0$i$i = $842;
+          if ($845) {
+           $846 = $842 | $843;
+           HEAP32[32676>>2] = $846;
+           $$pre$i22$i = (($840) + 2)|0;
+           $$pre56$i$i = (32716 + ($$pre$i22$i<<2)|0);
+           $$pre$phi$i23$iZ2D = $$pre56$i$i;$F4$0$i$i = $841;
           } else {
-           $$sum29$i$i = (($841) + 2)|0;
-           $848 = ((32544 + ($$sum29$i$i<<2)|0) + 40|0);
-           $849 = HEAP32[$848>>2]|0;
-           $850 = HEAP32[((32544 + 16|0))>>2]|0;
-           $851 = ($849>>>0)<($850>>>0);
-           if (!($851)) {
-            $$pre$phi$i24$iZ2D = $848;$F4$0$i$i = $849;
+           $$sum29$i$i = (($840) + 2)|0;
+           $847 = (32716 + ($$sum29$i$i<<2)|0);
+           $848 = HEAP32[$847>>2]|0;
+           $849 = HEAP32[(32692)>>2]|0;
+           $850 = ($848>>>0)<($849>>>0);
+           if (!($850)) {
+            $$pre$phi$i23$iZ2D = $847;$F4$0$i$i = $848;
             break;
            }
            _abort();
            // unreachable;
           }
          } while(0);
-         HEAP32[$$pre$phi$i24$iZ2D>>2] = $725;
-         $852 = (($F4$0$i$i) + 12|0);
-         HEAP32[$852>>2] = $725;
+         HEAP32[$$pre$phi$i23$iZ2D>>2] = $724;
+         $851 = ((($F4$0$i$i)) + 12|0);
+         HEAP32[$851>>2] = $724;
          $$sum27$i$i = (($$sum$i19$i) + 8)|0;
-         $853 = (($tbase$245$i) + ($$sum27$i$i)|0);
-         HEAP32[$853>>2] = $F4$0$i$i;
+         $852 = (($tbase$255$i) + ($$sum27$i$i)|0);
+         HEAP32[$852>>2] = $F4$0$i$i;
          $$sum28$i$i = (($$sum$i19$i) + 12)|0;
-         $854 = (($tbase$245$i) + ($$sum28$i$i)|0);
-         HEAP32[$854>>2] = $842;
+         $853 = (($tbase$255$i) + ($$sum28$i$i)|0);
+         HEAP32[$853>>2] = $841;
          break;
         }
-        $855 = $qsize$0$i$i >>> 8;
-        $856 = ($855|0)==(0);
+        $854 = $qsize$0$i$i >>> 8;
+        $855 = ($854|0)==(0);
         do {
-         if ($856) {
+         if ($855) {
           $I7$0$i$i = 0;
          } else {
-          $857 = ($qsize$0$i$i>>>0)>(16777215);
-          if ($857) {
+          $856 = ($qsize$0$i$i>>>0)>(16777215);
+          if ($856) {
            $I7$0$i$i = 31;
            break;
           }
-          $858 = (($855) + 1048320)|0;
-          $859 = $858 >>> 16;
-          $860 = $859 & 8;
-          $861 = $855 << $860;
-          $862 = (($861) + 520192)|0;
-          $863 = $862 >>> 16;
-          $864 = $863 & 4;
-          $865 = $864 | $860;
-          $866 = $861 << $864;
-          $867 = (($866) + 245760)|0;
-          $868 = $867 >>> 16;
-          $869 = $868 & 2;
-          $870 = $865 | $869;
-          $871 = (14 - ($870))|0;
-          $872 = $866 << $869;
-          $873 = $872 >>> 15;
-          $874 = (($871) + ($873))|0;
-          $875 = $874 << 1;
-          $876 = (($874) + 7)|0;
-          $877 = $qsize$0$i$i >>> $876;
-          $878 = $877 & 1;
-          $879 = $878 | $875;
-          $I7$0$i$i = $879;
+          $857 = (($854) + 1048320)|0;
+          $858 = $857 >>> 16;
+          $859 = $858 & 8;
+          $860 = $854 << $859;
+          $861 = (($860) + 520192)|0;
+          $862 = $861 >>> 16;
+          $863 = $862 & 4;
+          $864 = $863 | $859;
+          $865 = $860 << $863;
+          $866 = (($865) + 245760)|0;
+          $867 = $866 >>> 16;
+          $868 = $867 & 2;
+          $869 = $864 | $868;
+          $870 = (14 - ($869))|0;
+          $871 = $865 << $868;
+          $872 = $871 >>> 15;
+          $873 = (($870) + ($872))|0;
+          $874 = $873 << 1;
+          $875 = (($873) + 7)|0;
+          $876 = $qsize$0$i$i >>> $875;
+          $877 = $876 & 1;
+          $878 = $877 | $874;
+          $I7$0$i$i = $878;
          }
         } while(0);
-        $880 = ((32544 + ($I7$0$i$i<<2)|0) + 304|0);
+        $879 = (32980 + ($I7$0$i$i<<2)|0);
         $$sum12$i$i = (($$sum$i19$i) + 28)|0;
-        $881 = (($tbase$245$i) + ($$sum12$i$i)|0);
-        HEAP32[$881>>2] = $I7$0$i$i;
+        $880 = (($tbase$255$i) + ($$sum12$i$i)|0);
+        HEAP32[$880>>2] = $I7$0$i$i;
         $$sum13$i$i = (($$sum$i19$i) + 16)|0;
-        $882 = (($tbase$245$i) + ($$sum13$i$i)|0);
+        $881 = (($tbase$255$i) + ($$sum13$i$i)|0);
         $$sum14$i$i = (($$sum$i19$i) + 20)|0;
-        $883 = (($tbase$245$i) + ($$sum14$i$i)|0);
-        HEAP32[$883>>2] = 0;
+        $882 = (($tbase$255$i) + ($$sum14$i$i)|0);
         HEAP32[$882>>2] = 0;
-        $884 = HEAP32[((32544 + 4|0))>>2]|0;
-        $885 = 1 << $I7$0$i$i;
-        $886 = $884 & $885;
-        $887 = ($886|0)==(0);
-        if ($887) {
-         $888 = $884 | $885;
-         HEAP32[((32544 + 4|0))>>2] = $888;
-         HEAP32[$880>>2] = $725;
+        HEAP32[$881>>2] = 0;
+        $883 = HEAP32[(32680)>>2]|0;
+        $884 = 1 << $I7$0$i$i;
+        $885 = $883 & $884;
+        $886 = ($885|0)==(0);
+        if ($886) {
+         $887 = $883 | $884;
+         HEAP32[(32680)>>2] = $887;
+         HEAP32[$879>>2] = $724;
          $$sum15$i$i = (($$sum$i19$i) + 24)|0;
-         $889 = (($tbase$245$i) + ($$sum15$i$i)|0);
-         HEAP32[$889>>2] = $880;
+         $888 = (($tbase$255$i) + ($$sum15$i$i)|0);
+         HEAP32[$888>>2] = $879;
          $$sum16$i$i = (($$sum$i19$i) + 12)|0;
-         $890 = (($tbase$245$i) + ($$sum16$i$i)|0);
-         HEAP32[$890>>2] = $725;
+         $889 = (($tbase$255$i) + ($$sum16$i$i)|0);
+         HEAP32[$889>>2] = $724;
          $$sum17$i$i = (($$sum$i19$i) + 8)|0;
-         $891 = (($tbase$245$i) + ($$sum17$i$i)|0);
-         HEAP32[$891>>2] = $725;
+         $890 = (($tbase$255$i) + ($$sum17$i$i)|0);
+         HEAP32[$890>>2] = $724;
          break;
         }
-        $892 = HEAP32[$880>>2]|0;
-        $893 = ($I7$0$i$i|0)==(31);
-        if ($893) {
-         $901 = 0;
-        } else {
-         $894 = $I7$0$i$i >>> 1;
-         $895 = (25 - ($894))|0;
-         $901 = $895;
-        }
-        $896 = (($892) + 4|0);
-        $897 = HEAP32[$896>>2]|0;
-        $898 = $897 & -8;
-        $899 = ($898|0)==($qsize$0$i$i|0);
-        L442: do {
-         if ($899) {
-          $T$0$lcssa$i26$i = $892;
+        $891 = HEAP32[$879>>2]|0;
+        $892 = ((($891)) + 4|0);
+        $893 = HEAP32[$892>>2]|0;
+        $894 = $893 & -8;
+        $895 = ($894|0)==($qsize$0$i$i|0);
+        L418: do {
+         if ($895) {
+          $T$0$lcssa$i25$i = $891;
          } else {
-          $900 = $qsize$0$i$i << $901;
-          $K8$053$i$i = $900;$T$052$i$i = $892;
+          $896 = ($I7$0$i$i|0)==(31);
+          $897 = $I7$0$i$i >>> 1;
+          $898 = (25 - ($897))|0;
+          $899 = $896 ? 0 : $898;
+          $900 = $qsize$0$i$i << $899;
+          $K8$051$i$i = $900;$T$050$i$i = $891;
           while(1) {
-           $908 = $K8$053$i$i >>> 31;
-           $909 = ((($T$052$i$i) + ($908<<2)|0) + 16|0);
-           $904 = HEAP32[$909>>2]|0;
-           $910 = ($904|0)==(0|0);
-           if ($910) {
+           $907 = $K8$051$i$i >>> 31;
+           $908 = (((($T$050$i$i)) + 16|0) + ($907<<2)|0);
+           $903 = HEAP32[$908>>2]|0;
+           $909 = ($903|0)==(0|0);
+           if ($909) {
+            $$lcssa = $908;$T$050$i$i$lcssa = $T$050$i$i;
             break;
            }
-           $902 = $K8$053$i$i << 1;
-           $903 = (($904) + 4|0);
-           $905 = HEAP32[$903>>2]|0;
-           $906 = $905 & -8;
-           $907 = ($906|0)==($qsize$0$i$i|0);
-           if ($907) {
-            $T$0$lcssa$i26$i = $904;
-            break L442;
+           $901 = $K8$051$i$i << 1;
+           $902 = ((($903)) + 4|0);
+           $904 = HEAP32[$902>>2]|0;
+           $905 = $904 & -8;
+           $906 = ($905|0)==($qsize$0$i$i|0);
+           if ($906) {
+            $T$0$lcssa$i25$i = $903;
+            break L418;
            } else {
-            $K8$053$i$i = $902;$T$052$i$i = $904;
+            $K8$051$i$i = $901;$T$050$i$i = $903;
            }
           }
-          $911 = HEAP32[((32544 + 16|0))>>2]|0;
-          $912 = ($909>>>0)<($911>>>0);
-          if ($912) {
+          $910 = HEAP32[(32692)>>2]|0;
+          $911 = ($$lcssa>>>0)<($910>>>0);
+          if ($911) {
            _abort();
            // unreachable;
           } else {
-           HEAP32[$909>>2] = $725;
+           HEAP32[$$lcssa>>2] = $724;
            $$sum23$i$i = (($$sum$i19$i) + 24)|0;
-           $913 = (($tbase$245$i) + ($$sum23$i$i)|0);
-           HEAP32[$913>>2] = $T$052$i$i;
+           $912 = (($tbase$255$i) + ($$sum23$i$i)|0);
+           HEAP32[$912>>2] = $T$050$i$i$lcssa;
            $$sum24$i$i = (($$sum$i19$i) + 12)|0;
-           $914 = (($tbase$245$i) + ($$sum24$i$i)|0);
-           HEAP32[$914>>2] = $725;
+           $913 = (($tbase$255$i) + ($$sum24$i$i)|0);
+           HEAP32[$913>>2] = $724;
            $$sum25$i$i = (($$sum$i19$i) + 8)|0;
-           $915 = (($tbase$245$i) + ($$sum25$i$i)|0);
-           HEAP32[$915>>2] = $725;
-           break L345;
+           $914 = (($tbase$255$i) + ($$sum25$i$i)|0);
+           HEAP32[$914>>2] = $724;
+           break L324;
           }
          }
         } while(0);
-        $916 = (($T$0$lcssa$i26$i) + 8|0);
-        $917 = HEAP32[$916>>2]|0;
-        $918 = HEAP32[((32544 + 16|0))>>2]|0;
-        $919 = ($T$0$lcssa$i26$i>>>0)>=($918>>>0);
-        $920 = ($917>>>0)>=($918>>>0);
-        $or$cond$i27$i = $919 & $920;
-        if ($or$cond$i27$i) {
-         $921 = (($917) + 12|0);
-         HEAP32[$921>>2] = $725;
-         HEAP32[$916>>2] = $725;
+        $915 = ((($T$0$lcssa$i25$i)) + 8|0);
+        $916 = HEAP32[$915>>2]|0;
+        $917 = HEAP32[(32692)>>2]|0;
+        $918 = ($916>>>0)>=($917>>>0);
+        $not$$i26$i = ($T$0$lcssa$i25$i>>>0)>=($917>>>0);
+        $919 = $918 & $not$$i26$i;
+        if ($919) {
+         $920 = ((($916)) + 12|0);
+         HEAP32[$920>>2] = $724;
+         HEAP32[$915>>2] = $724;
          $$sum20$i$i = (($$sum$i19$i) + 8)|0;
-         $922 = (($tbase$245$i) + ($$sum20$i$i)|0);
-         HEAP32[$922>>2] = $917;
+         $921 = (($tbase$255$i) + ($$sum20$i$i)|0);
+         HEAP32[$921>>2] = $916;
          $$sum21$i$i = (($$sum$i19$i) + 12)|0;
-         $923 = (($tbase$245$i) + ($$sum21$i$i)|0);
-         HEAP32[$923>>2] = $T$0$lcssa$i26$i;
+         $922 = (($tbase$255$i) + ($$sum21$i$i)|0);
+         HEAP32[$922>>2] = $T$0$lcssa$i25$i;
          $$sum22$i$i = (($$sum$i19$i) + 24)|0;
-         $924 = (($tbase$245$i) + ($$sum22$i$i)|0);
-         HEAP32[$924>>2] = 0;
+         $923 = (($tbase$255$i) + ($$sum22$i$i)|0);
+         HEAP32[$923>>2] = 0;
          break;
         } else {
          _abort();
@@ -21655,282 +22796,266 @@ function _malloc($bytes) {
         }
        }
       } while(0);
-      $$sum1819$i$i = $713 | 8;
-      $925 = (($tbase$245$i) + ($$sum1819$i$i)|0);
-      $mem$0 = $925;
-      STACKTOP = sp;return ($mem$0|0);
+      $$sum1819$i$i = $711 | 8;
+      $924 = (($tbase$255$i) + ($$sum1819$i$i)|0);
+      $mem$0 = $924;
+      return ($mem$0|0);
+     } else {
+      $sp$0$i$i$i = (33124);
      }
     }
-    $sp$0$i$i$i = ((32544 + 448|0));
     while(1) {
-     $926 = HEAP32[$sp$0$i$i$i>>2]|0;
-     $927 = ($926>>>0)>($636>>>0);
-     if (!($927)) {
-      $928 = (($sp$0$i$i$i) + 4|0);
-      $929 = HEAP32[$928>>2]|0;
-      $930 = (($926) + ($929)|0);
-      $931 = ($930>>>0)>($636>>>0);
-      if ($931) {
+     $925 = HEAP32[$sp$0$i$i$i>>2]|0;
+     $926 = ($925>>>0)>($635>>>0);
+     if (!($926)) {
+      $927 = ((($sp$0$i$i$i)) + 4|0);
+      $928 = HEAP32[$927>>2]|0;
+      $929 = (($925) + ($928)|0);
+      $930 = ($929>>>0)>($635>>>0);
+      if ($930) {
+       $$lcssa215 = $925;$$lcssa216 = $928;$$lcssa217 = $929;
        break;
       }
      }
-     $932 = (($sp$0$i$i$i) + 8|0);
-     $933 = HEAP32[$932>>2]|0;
-     $sp$0$i$i$i = $933;
+     $931 = ((($sp$0$i$i$i)) + 8|0);
+     $932 = HEAP32[$931>>2]|0;
+     $sp$0$i$i$i = $932;
     }
-    $$sum$i13$i = (($929) + -47)|0;
-    $$sum1$i14$i = (($929) + -39)|0;
-    $934 = (($926) + ($$sum1$i14$i)|0);
-    $935 = $934;
-    $936 = $935 & 7;
-    $937 = ($936|0)==(0);
-    if ($937) {
-     $940 = 0;
-    } else {
-     $938 = (0 - ($935))|0;
-     $939 = $938 & 7;
-     $940 = $939;
-    }
-    $$sum2$i15$i = (($$sum$i13$i) + ($940))|0;
-    $941 = (($926) + ($$sum2$i15$i)|0);
-    $942 = (($636) + 16|0);
-    $943 = ($941>>>0)<($942>>>0);
-    $944 = $943 ? $636 : $941;
-    $945 = (($944) + 8|0);
-    $946 = (($tsize$244$i) + -40)|0;
-    $947 = (($tbase$245$i) + 8|0);
-    $948 = $947;
-    $949 = $948 & 7;
-    $950 = ($949|0)==(0);
-    if ($950) {
-     $954 = 0;
-    } else {
-     $951 = (0 - ($948))|0;
-     $952 = $951 & 7;
-     $954 = $952;
-    }
-    $953 = (($tbase$245$i) + ($954)|0);
-    $955 = (($946) - ($954))|0;
-    HEAP32[((32544 + 24|0))>>2] = $953;
-    HEAP32[((32544 + 12|0))>>2] = $955;
-    $956 = $955 | 1;
-    $$sum$i$i$i = (($954) + 4)|0;
-    $957 = (($tbase$245$i) + ($$sum$i$i$i)|0);
-    HEAP32[$957>>2] = $956;
-    $$sum2$i$i$i = (($tsize$244$i) + -36)|0;
-    $958 = (($tbase$245$i) + ($$sum2$i$i$i)|0);
-    HEAP32[$958>>2] = 40;
-    $959 = HEAP32[((33016 + 16|0))>>2]|0;
-    HEAP32[((32544 + 28|0))>>2] = $959;
-    $960 = (($944) + 4|0);
-    HEAP32[$960>>2] = 27;
-    ;HEAP32[$945+0>>2]=HEAP32[((32544 + 448|0))+0>>2]|0;HEAP32[$945+4>>2]=HEAP32[((32544 + 448|0))+4>>2]|0;HEAP32[$945+8>>2]=HEAP32[((32544 + 448|0))+8>>2]|0;HEAP32[$945+12>>2]=HEAP32[((32544 + 448|0))+12>>2]|0;
-    HEAP32[((32544 + 448|0))>>2] = $tbase$245$i;
-    HEAP32[((32544 + 452|0))>>2] = $tsize$244$i;
-    HEAP32[((32544 + 460|0))>>2] = 0;
-    HEAP32[((32544 + 456|0))>>2] = $945;
-    $961 = (($944) + 28|0);
-    HEAP32[$961>>2] = 7;
-    $962 = (($944) + 32|0);
-    $963 = ($962>>>0)<($930>>>0);
-    if ($963) {
-     $965 = $961;
+    $$sum$i14$i = (($$lcssa216) + -47)|0;
+    $$sum1$i15$i = (($$lcssa216) + -39)|0;
+    $933 = (($$lcssa215) + ($$sum1$i15$i)|0);
+    $934 = $933;
+    $935 = $934 & 7;
+    $936 = ($935|0)==(0);
+    $937 = (0 - ($934))|0;
+    $938 = $937 & 7;
+    $939 = $936 ? 0 : $938;
+    $$sum2$i16$i = (($$sum$i14$i) + ($939))|0;
+    $940 = (($$lcssa215) + ($$sum2$i16$i)|0);
+    $941 = ((($635)) + 16|0);
+    $942 = ($940>>>0)<($941>>>0);
+    $943 = $942 ? $635 : $940;
+    $944 = ((($943)) + 8|0);
+    $945 = (($tsize$254$i) + -40)|0;
+    $946 = ((($tbase$255$i)) + 8|0);
+    $947 = $946;
+    $948 = $947 & 7;
+    $949 = ($948|0)==(0);
+    $950 = (0 - ($947))|0;
+    $951 = $950 & 7;
+    $952 = $949 ? 0 : $951;
+    $953 = (($tbase$255$i) + ($952)|0);
+    $954 = (($945) - ($952))|0;
+    HEAP32[(32700)>>2] = $953;
+    HEAP32[(32688)>>2] = $954;
+    $955 = $954 | 1;
+    $$sum$i$i$i = (($952) + 4)|0;
+    $956 = (($tbase$255$i) + ($$sum$i$i$i)|0);
+    HEAP32[$956>>2] = $955;
+    $$sum2$i$i$i = (($tsize$254$i) + -36)|0;
+    $957 = (($tbase$255$i) + ($$sum2$i$i$i)|0);
+    HEAP32[$957>>2] = 40;
+    $958 = HEAP32[(33164)>>2]|0;
+    HEAP32[(32704)>>2] = $958;
+    $959 = ((($943)) + 4|0);
+    HEAP32[$959>>2] = 27;
+    ;HEAP32[$944>>2]=HEAP32[(33124)>>2]|0;HEAP32[$944+4>>2]=HEAP32[(33124)+4>>2]|0;HEAP32[$944+8>>2]=HEAP32[(33124)+8>>2]|0;HEAP32[$944+12>>2]=HEAP32[(33124)+12>>2]|0;
+    HEAP32[(33124)>>2] = $tbase$255$i;
+    HEAP32[(33128)>>2] = $tsize$254$i;
+    HEAP32[(33136)>>2] = 0;
+    HEAP32[(33132)>>2] = $944;
+    $960 = ((($943)) + 28|0);
+    HEAP32[$960>>2] = 7;
+    $961 = ((($943)) + 32|0);
+    $962 = ($961>>>0)<($$lcssa217>>>0);
+    if ($962) {
+     $964 = $960;
      while(1) {
-      $964 = (($965) + 4|0);
-      HEAP32[$964>>2] = 7;
-      $966 = (($965) + 8|0);
-      $967 = ($966>>>0)<($930>>>0);
-      if ($967) {
-       $965 = $964;
+      $963 = ((($964)) + 4|0);
+      HEAP32[$963>>2] = 7;
+      $965 = ((($964)) + 8|0);
+      $966 = ($965>>>0)<($$lcssa217>>>0);
+      if ($966) {
+       $964 = $963;
       } else {
        break;
       }
      }
     }
-    $968 = ($944|0)==($636|0);
-    if (!($968)) {
-     $969 = $944;
-     $970 = $636;
-     $971 = (($969) - ($970))|0;
-     $972 = (($636) + ($971)|0);
-     $$sum3$i$i = (($971) + 4)|0;
-     $973 = (($636) + ($$sum3$i$i)|0);
-     $974 = HEAP32[$973>>2]|0;
-     $975 = $974 & -2;
-     HEAP32[$973>>2] = $975;
-     $976 = $971 | 1;
-     $977 = (($636) + 4|0);
-     HEAP32[$977>>2] = $976;
-     HEAP32[$972>>2] = $971;
-     $978 = $971 >>> 3;
-     $979 = ($971>>>0)<(256);
-     if ($979) {
-      $980 = $978 << 1;
-      $981 = ((32544 + ($980<<2)|0) + 40|0);
-      $982 = HEAP32[32544>>2]|0;
-      $983 = 1 << $978;
-      $984 = $982 & $983;
-      $985 = ($984|0)==(0);
-      do {
-       if ($985) {
-        $986 = $982 | $983;
-        HEAP32[32544>>2] = $986;
-        $$sum10$pre$i$i = (($980) + 2)|0;
-        $$pre$i$i = ((32544 + ($$sum10$pre$i$i<<2)|0) + 40|0);
-        $$pre$phi$i$iZ2D = $$pre$i$i;$F$0$i$i = $981;
-       } else {
-        $$sum11$i$i = (($980) + 2)|0;
-        $987 = ((32544 + ($$sum11$i$i<<2)|0) + 40|0);
-        $988 = HEAP32[$987>>2]|0;
-        $989 = HEAP32[((32544 + 16|0))>>2]|0;
-        $990 = ($988>>>0)<($989>>>0);
-        if (!($990)) {
-         $$pre$phi$i$iZ2D = $987;$F$0$i$i = $988;
-         break;
-        }
+    $967 = ($943|0)==($635|0);
+    if (!($967)) {
+     $968 = $943;
+     $969 = $635;
+     $970 = (($968) - ($969))|0;
+     $971 = HEAP32[$959>>2]|0;
+     $972 = $971 & -2;
+     HEAP32[$959>>2] = $972;
+     $973 = $970 | 1;
+     $974 = ((($635)) + 4|0);
+     HEAP32[$974>>2] = $973;
+     HEAP32[$943>>2] = $970;
+     $975 = $970 >>> 3;
+     $976 = ($970>>>0)<(256);
+     if ($976) {
+      $977 = $975 << 1;
+      $978 = (32716 + ($977<<2)|0);
+      $979 = HEAP32[32676>>2]|0;
+      $980 = 1 << $975;
+      $981 = $979 & $980;
+      $982 = ($981|0)==(0);
+      if ($982) {
+       $983 = $979 | $980;
+       HEAP32[32676>>2] = $983;
+       $$pre$i$i = (($977) + 2)|0;
+       $$pre14$i$i = (32716 + ($$pre$i$i<<2)|0);
+       $$pre$phi$i$iZ2D = $$pre14$i$i;$F$0$i$i = $978;
+      } else {
+       $$sum4$i$i = (($977) + 2)|0;
+       $984 = (32716 + ($$sum4$i$i<<2)|0);
+       $985 = HEAP32[$984>>2]|0;
+       $986 = HEAP32[(32692)>>2]|0;
+       $987 = ($985>>>0)<($986>>>0);
+       if ($987) {
         _abort();
         // unreachable;
+       } else {
+        $$pre$phi$i$iZ2D = $984;$F$0$i$i = $985;
        }
-      } while(0);
-      HEAP32[$$pre$phi$i$iZ2D>>2] = $636;
-      $991 = (($F$0$i$i) + 12|0);
-      HEAP32[$991>>2] = $636;
-      $992 = (($636) + 8|0);
-      HEAP32[$992>>2] = $F$0$i$i;
-      $993 = (($636) + 12|0);
-      HEAP32[$993>>2] = $981;
+      }
+      HEAP32[$$pre$phi$i$iZ2D>>2] = $635;
+      $988 = ((($F$0$i$i)) + 12|0);
+      HEAP32[$988>>2] = $635;
+      $989 = ((($635)) + 8|0);
+      HEAP32[$989>>2] = $F$0$i$i;
+      $990 = ((($635)) + 12|0);
+      HEAP32[$990>>2] = $978;
       break;
      }
-     $994 = $971 >>> 8;
-     $995 = ($994|0)==(0);
-     if ($995) {
+     $991 = $970 >>> 8;
+     $992 = ($991|0)==(0);
+     if ($992) {
       $I1$0$i$i = 0;
      } else {
-      $996 = ($971>>>0)>(16777215);
-      if ($996) {
+      $993 = ($970>>>0)>(16777215);
+      if ($993) {
        $I1$0$i$i = 31;
       } else {
-       $997 = (($994) + 1048320)|0;
-       $998 = $997 >>> 16;
-       $999 = $998 & 8;
-       $1000 = $994 << $999;
-       $1001 = (($1000) + 520192)|0;
-       $1002 = $1001 >>> 16;
-       $1003 = $1002 & 4;
-       $1004 = $1003 | $999;
-       $1005 = $1000 << $1003;
-       $1006 = (($1005) + 245760)|0;
-       $1007 = $1006 >>> 16;
-       $1008 = $1007 & 2;
-       $1009 = $1004 | $1008;
-       $1010 = (14 - ($1009))|0;
-       $1011 = $1005 << $1008;
-       $1012 = $1011 >>> 15;
-       $1013 = (($1010) + ($1012))|0;
-       $1014 = $1013 << 1;
-       $1015 = (($1013) + 7)|0;
-       $1016 = $971 >>> $1015;
-       $1017 = $1016 & 1;
-       $1018 = $1017 | $1014;
-       $I1$0$i$i = $1018;
+       $994 = (($991) + 1048320)|0;
+       $995 = $994 >>> 16;
+       $996 = $995 & 8;
+       $997 = $991 << $996;
+       $998 = (($997) + 520192)|0;
+       $999 = $998 >>> 16;
+       $1000 = $999 & 4;
+       $1001 = $1000 | $996;
+       $1002 = $997 << $1000;
+       $1003 = (($1002) + 245760)|0;
+       $1004 = $1003 >>> 16;
+       $1005 = $1004 & 2;
+       $1006 = $1001 | $1005;
+       $1007 = (14 - ($1006))|0;
+       $1008 = $1002 << $1005;
+       $1009 = $1008 >>> 15;
+       $1010 = (($1007) + ($1009))|0;
+       $1011 = $1010 << 1;
+       $1012 = (($1010) + 7)|0;
+       $1013 = $970 >>> $1012;
+       $1014 = $1013 & 1;
+       $1015 = $1014 | $1011;
+       $I1$0$i$i = $1015;
       }
      }
-     $1019 = ((32544 + ($I1$0$i$i<<2)|0) + 304|0);
-     $1020 = (($636) + 28|0);
-     $I1$0$c$i$i = $I1$0$i$i;
-     HEAP32[$1020>>2] = $I1$0$c$i$i;
-     $1021 = (($636) + 20|0);
-     HEAP32[$1021>>2] = 0;
-     $1022 = (($636) + 16|0);
-     HEAP32[$1022>>2] = 0;
-     $1023 = HEAP32[((32544 + 4|0))>>2]|0;
-     $1024 = 1 << $I1$0$i$i;
-     $1025 = $1023 & $1024;
-     $1026 = ($1025|0)==(0);
-     if ($1026) {
-      $1027 = $1023 | $1024;
-      HEAP32[((32544 + 4|0))>>2] = $1027;
-      HEAP32[$1019>>2] = $636;
-      $1028 = (($636) + 24|0);
-      HEAP32[$1028>>2] = $1019;
-      $1029 = (($636) + 12|0);
-      HEAP32[$1029>>2] = $636;
-      $1030 = (($636) + 8|0);
-      HEAP32[$1030>>2] = $636;
+     $1016 = (32980 + ($I1$0$i$i<<2)|0);
+     $1017 = ((($635)) + 28|0);
+     HEAP32[$1017>>2] = $I1$0$i$i;
+     $1018 = ((($635)) + 20|0);
+     HEAP32[$1018>>2] = 0;
+     HEAP32[$941>>2] = 0;
+     $1019 = HEAP32[(32680)>>2]|0;
+     $1020 = 1 << $I1$0$i$i;
+     $1021 = $1019 & $1020;
+     $1022 = ($1021|0)==(0);
+     if ($1022) {
+      $1023 = $1019 | $1020;
+      HEAP32[(32680)>>2] = $1023;
+      HEAP32[$1016>>2] = $635;
+      $1024 = ((($635)) + 24|0);
+      HEAP32[$1024>>2] = $1016;
+      $1025 = ((($635)) + 12|0);
+      HEAP32[$1025>>2] = $635;
+      $1026 = ((($635)) + 8|0);
+      HEAP32[$1026>>2] = $635;
       break;
      }
-     $1031 = HEAP32[$1019>>2]|0;
-     $1032 = ($I1$0$i$i|0)==(31);
-     if ($1032) {
-      $1040 = 0;
-     } else {
-      $1033 = $I1$0$i$i >>> 1;
-      $1034 = (25 - ($1033))|0;
-      $1040 = $1034;
-     }
-     $1035 = (($1031) + 4|0);
-     $1036 = HEAP32[$1035>>2]|0;
-     $1037 = $1036 & -8;
-     $1038 = ($1037|0)==($971|0);
-     L493: do {
-      if ($1038) {
-       $T$0$lcssa$i$i = $1031;
+     $1027 = HEAP32[$1016>>2]|0;
+     $1028 = ((($1027)) + 4|0);
+     $1029 = HEAP32[$1028>>2]|0;
+     $1030 = $1029 & -8;
+     $1031 = ($1030|0)==($970|0);
+     L459: do {
+      if ($1031) {
+       $T$0$lcssa$i$i = $1027;
       } else {
-       $1039 = $971 << $1040;
-       $K2$015$i$i = $1039;$T$014$i$i = $1031;
+       $1032 = ($I1$0$i$i|0)==(31);
+       $1033 = $I1$0$i$i >>> 1;
+       $1034 = (25 - ($1033))|0;
+       $1035 = $1032 ? 0 : $1034;
+       $1036 = $970 << $1035;
+       $K2$07$i$i = $1036;$T$06$i$i = $1027;
        while(1) {
-        $1047 = $K2$015$i$i >>> 31;
-        $1048 = ((($T$014$i$i) + ($1047<<2)|0) + 16|0);
-        $1043 = HEAP32[$1048>>2]|0;
-        $1049 = ($1043|0)==(0|0);
-        if ($1049) {
+        $1043 = $K2$07$i$i >>> 31;
+        $1044 = (((($T$06$i$i)) + 16|0) + ($1043<<2)|0);
+        $1039 = HEAP32[$1044>>2]|0;
+        $1045 = ($1039|0)==(0|0);
+        if ($1045) {
+         $$lcssa211 = $1044;$T$06$i$i$lcssa = $T$06$i$i;
          break;
         }
-        $1041 = $K2$015$i$i << 1;
-        $1042 = (($1043) + 4|0);
-        $1044 = HEAP32[$1042>>2]|0;
-        $1045 = $1044 & -8;
-        $1046 = ($1045|0)==($971|0);
-        if ($1046) {
-         $T$0$lcssa$i$i = $1043;
-         break L493;
+        $1037 = $K2$07$i$i << 1;
+        $1038 = ((($1039)) + 4|0);
+        $1040 = HEAP32[$1038>>2]|0;
+        $1041 = $1040 & -8;
+        $1042 = ($1041|0)==($970|0);
+        if ($1042) {
+         $T$0$lcssa$i$i = $1039;
+         break L459;
         } else {
-         $K2$015$i$i = $1041;$T$014$i$i = $1043;
+         $K2$07$i$i = $1037;$T$06$i$i = $1039;
         }
        }
-       $1050 = HEAP32[((32544 + 16|0))>>2]|0;
-       $1051 = ($1048>>>0)<($1050>>>0);
-       if ($1051) {
+       $1046 = HEAP32[(32692)>>2]|0;
+       $1047 = ($$lcssa211>>>0)<($1046>>>0);
+       if ($1047) {
         _abort();
         // unreachable;
        } else {
-        HEAP32[$1048>>2] = $636;
-        $1052 = (($636) + 24|0);
-        HEAP32[$1052>>2] = $T$014$i$i;
-        $1053 = (($636) + 12|0);
-        HEAP32[$1053>>2] = $636;
-        $1054 = (($636) + 8|0);
-        HEAP32[$1054>>2] = $636;
-        break L308;
+        HEAP32[$$lcssa211>>2] = $635;
+        $1048 = ((($635)) + 24|0);
+        HEAP32[$1048>>2] = $T$06$i$i$lcssa;
+        $1049 = ((($635)) + 12|0);
+        HEAP32[$1049>>2] = $635;
+        $1050 = ((($635)) + 8|0);
+        HEAP32[$1050>>2] = $635;
+        break L299;
        }
       }
      } while(0);
-     $1055 = (($T$0$lcssa$i$i) + 8|0);
-     $1056 = HEAP32[$1055>>2]|0;
-     $1057 = HEAP32[((32544 + 16|0))>>2]|0;
-     $1058 = ($T$0$lcssa$i$i>>>0)>=($1057>>>0);
-     $1059 = ($1056>>>0)>=($1057>>>0);
-     $or$cond$i$i = $1058 & $1059;
-     if ($or$cond$i$i) {
-      $1060 = (($1056) + 12|0);
-      HEAP32[$1060>>2] = $636;
-      HEAP32[$1055>>2] = $636;
-      $1061 = (($636) + 8|0);
-      HEAP32[$1061>>2] = $1056;
-      $1062 = (($636) + 12|0);
-      HEAP32[$1062>>2] = $T$0$lcssa$i$i;
-      $1063 = (($636) + 24|0);
-      HEAP32[$1063>>2] = 0;
+     $1051 = ((($T$0$lcssa$i$i)) + 8|0);
+     $1052 = HEAP32[$1051>>2]|0;
+     $1053 = HEAP32[(32692)>>2]|0;
+     $1054 = ($1052>>>0)>=($1053>>>0);
+     $not$$i$i = ($T$0$lcssa$i$i>>>0)>=($1053>>>0);
+     $1055 = $1054 & $not$$i$i;
+     if ($1055) {
+      $1056 = ((($1052)) + 12|0);
+      HEAP32[$1056>>2] = $635;
+      HEAP32[$1051>>2] = $635;
+      $1057 = ((($635)) + 8|0);
+      HEAP32[$1057>>2] = $1052;
+      $1058 = ((($635)) + 12|0);
+      HEAP32[$1058>>2] = $T$0$lcssa$i$i;
+      $1059 = ((($635)) + 24|0);
+      HEAP32[$1059>>2] = 0;
       break;
      } else {
       _abort();
@@ -21939,65 +23064,65 @@ function _malloc($bytes) {
     }
    }
   } while(0);
-  $1064 = HEAP32[((32544 + 12|0))>>2]|0;
-  $1065 = ($1064>>>0)>($nb$0>>>0);
-  if ($1065) {
-   $1066 = (($1064) - ($nb$0))|0;
-   HEAP32[((32544 + 12|0))>>2] = $1066;
-   $1067 = HEAP32[((32544 + 24|0))>>2]|0;
-   $1068 = (($1067) + ($nb$0)|0);
-   HEAP32[((32544 + 24|0))>>2] = $1068;
-   $1069 = $1066 | 1;
+  $1060 = HEAP32[(32688)>>2]|0;
+  $1061 = ($1060>>>0)>($nb$0>>>0);
+  if ($1061) {
+   $1062 = (($1060) - ($nb$0))|0;
+   HEAP32[(32688)>>2] = $1062;
+   $1063 = HEAP32[(32700)>>2]|0;
+   $1064 = (($1063) + ($nb$0)|0);
+   HEAP32[(32700)>>2] = $1064;
+   $1065 = $1062 | 1;
    $$sum$i32 = (($nb$0) + 4)|0;
-   $1070 = (($1067) + ($$sum$i32)|0);
-   HEAP32[$1070>>2] = $1069;
-   $1071 = $nb$0 | 3;
-   $1072 = (($1067) + 4|0);
-   HEAP32[$1072>>2] = $1071;
-   $1073 = (($1067) + 8|0);
-   $mem$0 = $1073;
-   STACKTOP = sp;return ($mem$0|0);
+   $1066 = (($1063) + ($$sum$i32)|0);
+   HEAP32[$1066>>2] = $1065;
+   $1067 = $nb$0 | 3;
+   $1068 = ((($1063)) + 4|0);
+   HEAP32[$1068>>2] = $1067;
+   $1069 = ((($1063)) + 8|0);
+   $mem$0 = $1069;
+   return ($mem$0|0);
   }
  }
- $1074 = (___errno_location()|0);
- HEAP32[$1074>>2] = 12;
+ $1070 = (___errno_location()|0);
+ HEAP32[$1070>>2] = 12;
  $mem$0 = 0;
- STACKTOP = sp;return ($mem$0|0);
+ return ($mem$0|0);
 }
 function _free($mem) {
  $mem = $mem|0;
- var $$pre = 0, $$pre$phi66Z2D = 0, $$pre$phi68Z2D = 0, $$pre$phiZ2D = 0, $$pre65 = 0, $$pre67 = 0, $$sum = 0, $$sum16$pre = 0, $$sum17 = 0, $$sum18 = 0, $$sum19 = 0, $$sum2 = 0, $$sum20 = 0, $$sum2324 = 0, $$sum25 = 0, $$sum26 = 0, $$sum28 = 0, $$sum29 = 0, $$sum3 = 0, $$sum30 = 0;
- var $$sum31 = 0, $$sum32 = 0, $$sum33 = 0, $$sum34 = 0, $$sum35 = 0, $$sum36 = 0, $$sum37 = 0, $$sum5 = 0, $$sum67 = 0, $$sum8 = 0, $$sum9 = 0, $0 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0;
- var $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0, $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0;
- var $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0, $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0;
- var $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0, $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0;
- var $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0, $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0;
- var $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0, $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0;
- var $197 = 0, $198 = 0, $199 = 0, $2 = 0, $20 = 0, $200 = 0, $201 = 0, $202 = 0, $203 = 0, $204 = 0, $205 = 0, $206 = 0, $207 = 0, $208 = 0, $209 = 0, $21 = 0, $210 = 0, $211 = 0, $212 = 0, $213 = 0;
- var $214 = 0, $215 = 0, $216 = 0, $217 = 0, $218 = 0, $219 = 0, $22 = 0, $220 = 0, $221 = 0, $222 = 0, $223 = 0, $224 = 0, $225 = 0, $226 = 0, $227 = 0, $228 = 0, $229 = 0, $23 = 0, $230 = 0, $231 = 0;
- var $232 = 0, $233 = 0, $234 = 0, $235 = 0, $236 = 0, $237 = 0, $238 = 0, $239 = 0, $24 = 0, $240 = 0, $241 = 0, $242 = 0, $243 = 0, $244 = 0, $245 = 0, $246 = 0, $247 = 0, $248 = 0, $249 = 0, $25 = 0;
- var $250 = 0, $251 = 0, $252 = 0, $253 = 0, $254 = 0, $255 = 0, $256 = 0, $257 = 0, $258 = 0, $259 = 0, $26 = 0, $260 = 0, $261 = 0, $262 = 0, $263 = 0, $264 = 0, $265 = 0, $266 = 0, $267 = 0, $268 = 0;
- var $269 = 0, $27 = 0, $270 = 0, $271 = 0, $272 = 0, $273 = 0, $274 = 0, $275 = 0, $276 = 0, $277 = 0, $278 = 0, $279 = 0, $28 = 0, $280 = 0, $281 = 0, $282 = 0, $283 = 0, $284 = 0, $285 = 0, $286 = 0;
- var $287 = 0, $288 = 0, $289 = 0, $29 = 0, $290 = 0, $291 = 0, $292 = 0, $293 = 0, $294 = 0, $295 = 0, $296 = 0, $297 = 0, $298 = 0, $299 = 0, $3 = 0, $30 = 0, $300 = 0, $301 = 0, $302 = 0, $303 = 0;
- var $304 = 0, $305 = 0, $306 = 0, $307 = 0, $308 = 0, $309 = 0, $31 = 0, $310 = 0, $311 = 0, $312 = 0, $313 = 0, $314 = 0, $315 = 0, $316 = 0, $317 = 0, $318 = 0, $319 = 0, $32 = 0, $320 = 0, $321 = 0;
- var $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0;
- var $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0, $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0;
- var $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0, $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0;
- var $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, $F16$0 = 0, $I18$0 = 0, $I18$0$c = 0, $K19$058 = 0, $R$0 = 0, $R$1 = 0, $R7$0 = 0;
- var $R7$1 = 0, $RP$0 = 0, $RP9$0 = 0, $T$0$lcssa = 0, $T$057 = 0, $cond = 0, $cond54 = 0, $or$cond = 0, $p$0 = 0, $psize$0 = 0, $psize$1 = 0, $sp$0$i = 0, $sp$0$in$i = 0, label = 0, sp = 0;
+ var $$lcssa = 0, $$pre = 0, $$pre$phi59Z2D = 0, $$pre$phi61Z2D = 0, $$pre$phiZ2D = 0, $$pre57 = 0, $$pre58 = 0, $$pre60 = 0, $$sum = 0, $$sum11 = 0, $$sum12 = 0, $$sum13 = 0, $$sum14 = 0, $$sum1718 = 0, $$sum19 = 0, $$sum2 = 0, $$sum20 = 0, $$sum22 = 0, $$sum23 = 0, $$sum24 = 0;
+ var $$sum25 = 0, $$sum26 = 0, $$sum27 = 0, $$sum28 = 0, $$sum29 = 0, $$sum3 = 0, $$sum30 = 0, $$sum31 = 0, $$sum5 = 0, $$sum67 = 0, $$sum8 = 0, $$sum9 = 0, $0 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0;
+ var $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0, $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0;
+ var $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0, $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0;
+ var $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0, $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0;
+ var $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0, $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0;
+ var $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0, $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0;
+ var $196 = 0, $197 = 0, $198 = 0, $199 = 0, $2 = 0, $20 = 0, $200 = 0, $201 = 0, $202 = 0, $203 = 0, $204 = 0, $205 = 0, $206 = 0, $207 = 0, $208 = 0, $209 = 0, $21 = 0, $210 = 0, $211 = 0, $212 = 0;
+ var $213 = 0, $214 = 0, $215 = 0, $216 = 0, $217 = 0, $218 = 0, $219 = 0, $22 = 0, $220 = 0, $221 = 0, $222 = 0, $223 = 0, $224 = 0, $225 = 0, $226 = 0, $227 = 0, $228 = 0, $229 = 0, $23 = 0, $230 = 0;
+ var $231 = 0, $232 = 0, $233 = 0, $234 = 0, $235 = 0, $236 = 0, $237 = 0, $238 = 0, $239 = 0, $24 = 0, $240 = 0, $241 = 0, $242 = 0, $243 = 0, $244 = 0, $245 = 0, $246 = 0, $247 = 0, $248 = 0, $249 = 0;
+ var $25 = 0, $250 = 0, $251 = 0, $252 = 0, $253 = 0, $254 = 0, $255 = 0, $256 = 0, $257 = 0, $258 = 0, $259 = 0, $26 = 0, $260 = 0, $261 = 0, $262 = 0, $263 = 0, $264 = 0, $265 = 0, $266 = 0, $267 = 0;
+ var $268 = 0, $269 = 0, $27 = 0, $270 = 0, $271 = 0, $272 = 0, $273 = 0, $274 = 0, $275 = 0, $276 = 0, $277 = 0, $278 = 0, $279 = 0, $28 = 0, $280 = 0, $281 = 0, $282 = 0, $283 = 0, $284 = 0, $285 = 0;
+ var $286 = 0, $287 = 0, $288 = 0, $289 = 0, $29 = 0, $290 = 0, $291 = 0, $292 = 0, $293 = 0, $294 = 0, $295 = 0, $296 = 0, $297 = 0, $298 = 0, $299 = 0, $3 = 0, $30 = 0, $300 = 0, $301 = 0, $302 = 0;
+ var $303 = 0, $304 = 0, $305 = 0, $306 = 0, $307 = 0, $308 = 0, $309 = 0, $31 = 0, $310 = 0, $311 = 0, $312 = 0, $313 = 0, $314 = 0, $315 = 0, $316 = 0, $317 = 0, $318 = 0, $319 = 0, $32 = 0, $320 = 0;
+ var $321 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0, $5 = 0;
+ var $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0, $65 = 0, $66 = 0, $67 = 0, $68 = 0;
+ var $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0, $83 = 0, $84 = 0, $85 = 0, $86 = 0;
+ var $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, $F16$0 = 0, $I18$0 = 0, $K19$052 = 0, $R$0 = 0, $R$0$lcssa = 0, $R$1 = 0;
+ var $R7$0 = 0, $R7$0$lcssa = 0, $R7$1 = 0, $RP$0 = 0, $RP$0$lcssa = 0, $RP9$0 = 0, $RP9$0$lcssa = 0, $T$0$lcssa = 0, $T$051 = 0, $T$051$lcssa = 0, $cond = 0, $cond47 = 0, $not$ = 0, $p$0 = 0, $psize$0 = 0, $psize$1 = 0, $sp$0$i = 0, $sp$0$in$i = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $0 = ($mem|0)==(0|0);
  if ($0) {
-  STACKTOP = sp;return;
+  return;
  }
- $1 = (($mem) + -8|0);
- $2 = HEAP32[((32544 + 16|0))>>2]|0;
+ $1 = ((($mem)) + -8|0);
+ $2 = HEAP32[(32692)>>2]|0;
  $3 = ($1>>>0)<($2>>>0);
  if ($3) {
   _abort();
   // unreachable;
  }
- $4 = (($mem) + -4|0);
+ $4 = ((($mem)) + -4|0);
  $5 = HEAP32[$4>>2]|0;
  $6 = $5 & 3;
  $7 = ($6|0)==(1);
@@ -22015,7 +23140,7 @@ function _free($mem) {
    $12 = HEAP32[$1>>2]|0;
    $13 = ($6|0)==(0);
    if ($13) {
-    STACKTOP = sp;return;
+    return;
    }
    $$sum2 = (-8 - ($12))|0;
    $14 = (($mem) + ($$sum2)|0);
@@ -22025,7 +23150,7 @@ function _free($mem) {
     _abort();
     // unreachable;
    }
-   $17 = HEAP32[((32544 + 20|0))>>2]|0;
+   $17 = HEAP32[(32696)>>2]|0;
    $18 = ($14|0)==($17|0);
    if ($18) {
     $$sum3 = (($8) + -4)|0;
@@ -22037,27 +23162,27 @@ function _free($mem) {
      $p$0 = $14;$psize$0 = $15;
      break;
     }
-    HEAP32[((32544 + 8|0))>>2] = $15;
+    HEAP32[(32684)>>2] = $15;
     $107 = $104 & -2;
     HEAP32[$103>>2] = $107;
     $108 = $15 | 1;
-    $$sum26 = (($$sum2) + 4)|0;
-    $109 = (($mem) + ($$sum26)|0);
+    $$sum20 = (($$sum2) + 4)|0;
+    $109 = (($mem) + ($$sum20)|0);
     HEAP32[$109>>2] = $108;
     HEAP32[$9>>2] = $15;
-    STACKTOP = sp;return;
+    return;
    }
    $19 = $12 >>> 3;
    $20 = ($12>>>0)<(256);
    if ($20) {
-    $$sum36 = (($$sum2) + 8)|0;
-    $21 = (($mem) + ($$sum36)|0);
+    $$sum30 = (($$sum2) + 8)|0;
+    $21 = (($mem) + ($$sum30)|0);
     $22 = HEAP32[$21>>2]|0;
-    $$sum37 = (($$sum2) + 12)|0;
-    $23 = (($mem) + ($$sum37)|0);
+    $$sum31 = (($$sum2) + 12)|0;
+    $23 = (($mem) + ($$sum31)|0);
     $24 = HEAP32[$23>>2]|0;
     $25 = $19 << 1;
-    $26 = ((32544 + ($25<<2)|0) + 40|0);
+    $26 = (32716 + ($25<<2)|0);
     $27 = ($22|0)==($26|0);
     if (!($27)) {
      $28 = ($22>>>0)<($2>>>0);
@@ -22065,7 +23190,7 @@ function _free($mem) {
       _abort();
       // unreachable;
      }
-     $29 = (($22) + 12|0);
+     $29 = ((($22)) + 12|0);
      $30 = HEAP32[$29>>2]|0;
      $31 = ($30|0)==($14|0);
      if (!($31)) {
@@ -22077,54 +23202,54 @@ function _free($mem) {
     if ($32) {
      $33 = 1 << $19;
      $34 = $33 ^ -1;
-     $35 = HEAP32[32544>>2]|0;
+     $35 = HEAP32[32676>>2]|0;
      $36 = $35 & $34;
-     HEAP32[32544>>2] = $36;
+     HEAP32[32676>>2] = $36;
      $p$0 = $14;$psize$0 = $15;
      break;
     }
     $37 = ($24|0)==($26|0);
     if ($37) {
-     $$pre67 = (($24) + 8|0);
-     $$pre$phi68Z2D = $$pre67;
+     $$pre60 = ((($24)) + 8|0);
+     $$pre$phi61Z2D = $$pre60;
     } else {
      $38 = ($24>>>0)<($2>>>0);
      if ($38) {
       _abort();
       // unreachable;
      }
-     $39 = (($24) + 8|0);
+     $39 = ((($24)) + 8|0);
      $40 = HEAP32[$39>>2]|0;
      $41 = ($40|0)==($14|0);
      if ($41) {
-      $$pre$phi68Z2D = $39;
+      $$pre$phi61Z2D = $39;
      } else {
       _abort();
       // unreachable;
      }
     }
-    $42 = (($22) + 12|0);
+    $42 = ((($22)) + 12|0);
     HEAP32[$42>>2] = $24;
-    HEAP32[$$pre$phi68Z2D>>2] = $22;
+    HEAP32[$$pre$phi61Z2D>>2] = $22;
     $p$0 = $14;$psize$0 = $15;
     break;
    }
-   $$sum28 = (($$sum2) + 24)|0;
-   $43 = (($mem) + ($$sum28)|0);
+   $$sum22 = (($$sum2) + 24)|0;
+   $43 = (($mem) + ($$sum22)|0);
    $44 = HEAP32[$43>>2]|0;
-   $$sum29 = (($$sum2) + 12)|0;
-   $45 = (($mem) + ($$sum29)|0);
+   $$sum23 = (($$sum2) + 12)|0;
+   $45 = (($mem) + ($$sum23)|0);
    $46 = HEAP32[$45>>2]|0;
    $47 = ($46|0)==($14|0);
    do {
     if ($47) {
-     $$sum31 = (($$sum2) + 20)|0;
-     $57 = (($mem) + ($$sum31)|0);
+     $$sum25 = (($$sum2) + 20)|0;
+     $57 = (($mem) + ($$sum25)|0);
      $58 = HEAP32[$57>>2]|0;
      $59 = ($58|0)==(0|0);
      if ($59) {
-      $$sum30 = (($$sum2) + 16)|0;
-      $60 = (($mem) + ($$sum30)|0);
+      $$sum24 = (($$sum2) + 16)|0;
+      $60 = (($mem) + ($$sum24)|0);
       $61 = HEAP32[$60>>2]|0;
       $62 = ($61|0)==(0|0);
       if ($62) {
@@ -22137,48 +23262,49 @@ function _free($mem) {
       $R$0 = $58;$RP$0 = $57;
      }
      while(1) {
-      $63 = (($R$0) + 20|0);
+      $63 = ((($R$0)) + 20|0);
       $64 = HEAP32[$63>>2]|0;
       $65 = ($64|0)==(0|0);
       if (!($65)) {
        $R$0 = $64;$RP$0 = $63;
        continue;
       }
-      $66 = (($R$0) + 16|0);
+      $66 = ((($R$0)) + 16|0);
       $67 = HEAP32[$66>>2]|0;
       $68 = ($67|0)==(0|0);
       if ($68) {
+       $R$0$lcssa = $R$0;$RP$0$lcssa = $RP$0;
        break;
       } else {
        $R$0 = $67;$RP$0 = $66;
       }
      }
-     $69 = ($RP$0>>>0)<($2>>>0);
+     $69 = ($RP$0$lcssa>>>0)<($2>>>0);
      if ($69) {
       _abort();
       // unreachable;
      } else {
-      HEAP32[$RP$0>>2] = 0;
-      $R$1 = $R$0;
+      HEAP32[$RP$0$lcssa>>2] = 0;
+      $R$1 = $R$0$lcssa;
       break;
      }
     } else {
-     $$sum35 = (($$sum2) + 8)|0;
-     $48 = (($mem) + ($$sum35)|0);
+     $$sum29 = (($$sum2) + 8)|0;
+     $48 = (($mem) + ($$sum29)|0);
      $49 = HEAP32[$48>>2]|0;
      $50 = ($49>>>0)<($2>>>0);
      if ($50) {
       _abort();
       // unreachable;
      }
-     $51 = (($49) + 12|0);
+     $51 = ((($49)) + 12|0);
      $52 = HEAP32[$51>>2]|0;
      $53 = ($52|0)==($14|0);
      if (!($53)) {
       _abort();
       // unreachable;
      }
-     $54 = (($46) + 8|0);
+     $54 = ((($46)) + 8|0);
      $55 = HEAP32[$54>>2]|0;
      $56 = ($55|0)==($14|0);
      if ($56) {
@@ -22196,10 +23322,10 @@ function _free($mem) {
    if ($70) {
     $p$0 = $14;$psize$0 = $15;
    } else {
-    $$sum32 = (($$sum2) + 28)|0;
-    $71 = (($mem) + ($$sum32)|0);
+    $$sum26 = (($$sum2) + 28)|0;
+    $71 = (($mem) + ($$sum26)|0);
     $72 = HEAP32[$71>>2]|0;
-    $73 = ((32544 + ($72<<2)|0) + 304|0);
+    $73 = (32980 + ($72<<2)|0);
     $74 = HEAP32[$73>>2]|0;
     $75 = ($14|0)==($74|0);
     if ($75) {
@@ -22208,26 +23334,26 @@ function _free($mem) {
      if ($cond) {
       $76 = 1 << $72;
       $77 = $76 ^ -1;
-      $78 = HEAP32[((32544 + 4|0))>>2]|0;
+      $78 = HEAP32[(32680)>>2]|0;
       $79 = $78 & $77;
-      HEAP32[((32544 + 4|0))>>2] = $79;
+      HEAP32[(32680)>>2] = $79;
       $p$0 = $14;$psize$0 = $15;
       break;
      }
     } else {
-     $80 = HEAP32[((32544 + 16|0))>>2]|0;
+     $80 = HEAP32[(32692)>>2]|0;
      $81 = ($44>>>0)<($80>>>0);
      if ($81) {
       _abort();
       // unreachable;
      }
-     $82 = (($44) + 16|0);
+     $82 = ((($44)) + 16|0);
      $83 = HEAP32[$82>>2]|0;
      $84 = ($83|0)==($14|0);
      if ($84) {
       HEAP32[$82>>2] = $R$1;
      } else {
-      $85 = (($44) + 20|0);
+      $85 = ((($44)) + 20|0);
       HEAP32[$85>>2] = $R$1;
      }
      $86 = ($R$1|0)==(0|0);
@@ -22236,16 +23362,16 @@ function _free($mem) {
       break;
      }
     }
-    $87 = HEAP32[((32544 + 16|0))>>2]|0;
+    $87 = HEAP32[(32692)>>2]|0;
     $88 = ($R$1>>>0)<($87>>>0);
     if ($88) {
      _abort();
      // unreachable;
     }
-    $89 = (($R$1) + 24|0);
+    $89 = ((($R$1)) + 24|0);
     HEAP32[$89>>2] = $44;
-    $$sum33 = (($$sum2) + 16)|0;
-    $90 = (($mem) + ($$sum33)|0);
+    $$sum27 = (($$sum2) + 16)|0;
+    $90 = (($mem) + ($$sum27)|0);
     $91 = HEAP32[$90>>2]|0;
     $92 = ($91|0)==(0|0);
     do {
@@ -22255,30 +23381,30 @@ function _free($mem) {
        _abort();
        // unreachable;
       } else {
-       $94 = (($R$1) + 16|0);
+       $94 = ((($R$1)) + 16|0);
        HEAP32[$94>>2] = $91;
-       $95 = (($91) + 24|0);
+       $95 = ((($91)) + 24|0);
        HEAP32[$95>>2] = $R$1;
        break;
       }
      }
     } while(0);
-    $$sum34 = (($$sum2) + 20)|0;
-    $96 = (($mem) + ($$sum34)|0);
+    $$sum28 = (($$sum2) + 20)|0;
+    $96 = (($mem) + ($$sum28)|0);
     $97 = HEAP32[$96>>2]|0;
     $98 = ($97|0)==(0|0);
     if ($98) {
      $p$0 = $14;$psize$0 = $15;
     } else {
-     $99 = HEAP32[((32544 + 16|0))>>2]|0;
+     $99 = HEAP32[(32692)>>2]|0;
      $100 = ($97>>>0)<($99>>>0);
      if ($100) {
       _abort();
       // unreachable;
      } else {
-      $101 = (($R$1) + 20|0);
+      $101 = ((($R$1)) + 20|0);
       HEAP32[$101>>2] = $97;
-      $102 = (($97) + 24|0);
+      $102 = ((($97)) + 24|0);
       HEAP32[$102>>2] = $R$1;
       $p$0 = $14;$psize$0 = $15;
       break;
@@ -22294,8 +23420,8 @@ function _free($mem) {
   _abort();
   // unreachable;
  }
- $$sum25 = (($8) + -4)|0;
- $111 = (($mem) + ($$sum25)|0);
+ $$sum19 = (($8) + -4)|0;
+ $111 = (($mem) + ($$sum19)|0);
  $112 = HEAP32[$111>>2]|0;
  $113 = $112 & 1;
  $114 = ($113|0)==(0);
@@ -22306,38 +23432,38 @@ function _free($mem) {
  $115 = $112 & 2;
  $116 = ($115|0)==(0);
  if ($116) {
-  $117 = HEAP32[((32544 + 24|0))>>2]|0;
+  $117 = HEAP32[(32700)>>2]|0;
   $118 = ($9|0)==($117|0);
   if ($118) {
-   $119 = HEAP32[((32544 + 12|0))>>2]|0;
+   $119 = HEAP32[(32688)>>2]|0;
    $120 = (($119) + ($psize$0))|0;
-   HEAP32[((32544 + 12|0))>>2] = $120;
-   HEAP32[((32544 + 24|0))>>2] = $p$0;
+   HEAP32[(32688)>>2] = $120;
+   HEAP32[(32700)>>2] = $p$0;
    $121 = $120 | 1;
-   $122 = (($p$0) + 4|0);
+   $122 = ((($p$0)) + 4|0);
    HEAP32[$122>>2] = $121;
-   $123 = HEAP32[((32544 + 20|0))>>2]|0;
+   $123 = HEAP32[(32696)>>2]|0;
    $124 = ($p$0|0)==($123|0);
    if (!($124)) {
-    STACKTOP = sp;return;
+    return;
    }
-   HEAP32[((32544 + 20|0))>>2] = 0;
-   HEAP32[((32544 + 8|0))>>2] = 0;
-   STACKTOP = sp;return;
+   HEAP32[(32696)>>2] = 0;
+   HEAP32[(32684)>>2] = 0;
+   return;
   }
-  $125 = HEAP32[((32544 + 20|0))>>2]|0;
+  $125 = HEAP32[(32696)>>2]|0;
   $126 = ($9|0)==($125|0);
   if ($126) {
-   $127 = HEAP32[((32544 + 8|0))>>2]|0;
+   $127 = HEAP32[(32684)>>2]|0;
    $128 = (($127) + ($psize$0))|0;
-   HEAP32[((32544 + 8|0))>>2] = $128;
-   HEAP32[((32544 + 20|0))>>2] = $p$0;
+   HEAP32[(32684)>>2] = $128;
+   HEAP32[(32696)>>2] = $p$0;
    $129 = $128 | 1;
-   $130 = (($p$0) + 4|0);
+   $130 = ((($p$0)) + 4|0);
    HEAP32[$130>>2] = $129;
    $131 = (($p$0) + ($128)|0);
    HEAP32[$131>>2] = $128;
-   STACKTOP = sp;return;
+   return;
   }
   $132 = $112 & -8;
   $133 = (($132) + ($psize$0))|0;
@@ -22347,20 +23473,20 @@ function _free($mem) {
    if ($135) {
     $136 = (($mem) + ($8)|0);
     $137 = HEAP32[$136>>2]|0;
-    $$sum2324 = $8 | 4;
-    $138 = (($mem) + ($$sum2324)|0);
+    $$sum1718 = $8 | 4;
+    $138 = (($mem) + ($$sum1718)|0);
     $139 = HEAP32[$138>>2]|0;
     $140 = $134 << 1;
-    $141 = ((32544 + ($140<<2)|0) + 40|0);
+    $141 = (32716 + ($140<<2)|0);
     $142 = ($137|0)==($141|0);
     if (!($142)) {
-     $143 = HEAP32[((32544 + 16|0))>>2]|0;
+     $143 = HEAP32[(32692)>>2]|0;
      $144 = ($137>>>0)<($143>>>0);
      if ($144) {
       _abort();
       // unreachable;
      }
-     $145 = (($137) + 12|0);
+     $145 = ((($137)) + 12|0);
      $146 = HEAP32[$145>>2]|0;
      $147 = ($146|0)==($9|0);
      if (!($147)) {
@@ -22372,35 +23498,35 @@ function _free($mem) {
     if ($148) {
      $149 = 1 << $134;
      $150 = $149 ^ -1;
-     $151 = HEAP32[32544>>2]|0;
+     $151 = HEAP32[32676>>2]|0;
      $152 = $151 & $150;
-     HEAP32[32544>>2] = $152;
+     HEAP32[32676>>2] = $152;
      break;
     }
     $153 = ($139|0)==($141|0);
     if ($153) {
-     $$pre65 = (($139) + 8|0);
-     $$pre$phi66Z2D = $$pre65;
+     $$pre58 = ((($139)) + 8|0);
+     $$pre$phi59Z2D = $$pre58;
     } else {
-     $154 = HEAP32[((32544 + 16|0))>>2]|0;
+     $154 = HEAP32[(32692)>>2]|0;
      $155 = ($139>>>0)<($154>>>0);
      if ($155) {
       _abort();
       // unreachable;
      }
-     $156 = (($139) + 8|0);
+     $156 = ((($139)) + 8|0);
      $157 = HEAP32[$156>>2]|0;
      $158 = ($157|0)==($9|0);
      if ($158) {
-      $$pre$phi66Z2D = $156;
+      $$pre$phi59Z2D = $156;
      } else {
       _abort();
       // unreachable;
      }
     }
-    $159 = (($137) + 12|0);
+    $159 = ((($137)) + 12|0);
     HEAP32[$159>>2] = $139;
-    HEAP32[$$pre$phi66Z2D>>2] = $137;
+    HEAP32[$$pre$phi59Z2D>>2] = $137;
    } else {
     $$sum5 = (($8) + 16)|0;
     $160 = (($mem) + ($$sum5)|0);
@@ -22430,49 +23556,50 @@ function _free($mem) {
        $R7$0 = $176;$RP9$0 = $175;
       }
       while(1) {
-       $181 = (($R7$0) + 20|0);
+       $181 = ((($R7$0)) + 20|0);
        $182 = HEAP32[$181>>2]|0;
        $183 = ($182|0)==(0|0);
        if (!($183)) {
         $R7$0 = $182;$RP9$0 = $181;
         continue;
        }
-       $184 = (($R7$0) + 16|0);
+       $184 = ((($R7$0)) + 16|0);
        $185 = HEAP32[$184>>2]|0;
        $186 = ($185|0)==(0|0);
        if ($186) {
+        $R7$0$lcssa = $R7$0;$RP9$0$lcssa = $RP9$0;
         break;
        } else {
         $R7$0 = $185;$RP9$0 = $184;
        }
       }
-      $187 = HEAP32[((32544 + 16|0))>>2]|0;
-      $188 = ($RP9$0>>>0)<($187>>>0);
+      $187 = HEAP32[(32692)>>2]|0;
+      $188 = ($RP9$0$lcssa>>>0)<($187>>>0);
       if ($188) {
        _abort();
        // unreachable;
       } else {
-       HEAP32[$RP9$0>>2] = 0;
-       $R7$1 = $R7$0;
+       HEAP32[$RP9$0$lcssa>>2] = 0;
+       $R7$1 = $R7$0$lcssa;
        break;
       }
      } else {
       $165 = (($mem) + ($8)|0);
       $166 = HEAP32[$165>>2]|0;
-      $167 = HEAP32[((32544 + 16|0))>>2]|0;
+      $167 = HEAP32[(32692)>>2]|0;
       $168 = ($166>>>0)<($167>>>0);
       if ($168) {
        _abort();
        // unreachable;
       }
-      $169 = (($166) + 12|0);
+      $169 = ((($166)) + 12|0);
       $170 = HEAP32[$169>>2]|0;
       $171 = ($170|0)==($9|0);
       if (!($171)) {
        _abort();
        // unreachable;
       }
-      $172 = (($163) + 8|0);
+      $172 = ((($163)) + 8|0);
       $173 = HEAP32[$172>>2]|0;
       $174 = ($173|0)==($9|0);
       if ($174) {
@@ -22488,37 +23615,37 @@ function _free($mem) {
     } while(0);
     $189 = ($161|0)==(0|0);
     if (!($189)) {
-     $$sum18 = (($8) + 20)|0;
-     $190 = (($mem) + ($$sum18)|0);
+     $$sum12 = (($8) + 20)|0;
+     $190 = (($mem) + ($$sum12)|0);
      $191 = HEAP32[$190>>2]|0;
-     $192 = ((32544 + ($191<<2)|0) + 304|0);
+     $192 = (32980 + ($191<<2)|0);
      $193 = HEAP32[$192>>2]|0;
      $194 = ($9|0)==($193|0);
      if ($194) {
       HEAP32[$192>>2] = $R7$1;
-      $cond54 = ($R7$1|0)==(0|0);
-      if ($cond54) {
+      $cond47 = ($R7$1|0)==(0|0);
+      if ($cond47) {
        $195 = 1 << $191;
        $196 = $195 ^ -1;
-       $197 = HEAP32[((32544 + 4|0))>>2]|0;
+       $197 = HEAP32[(32680)>>2]|0;
        $198 = $197 & $196;
-       HEAP32[((32544 + 4|0))>>2] = $198;
+       HEAP32[(32680)>>2] = $198;
        break;
       }
      } else {
-      $199 = HEAP32[((32544 + 16|0))>>2]|0;
+      $199 = HEAP32[(32692)>>2]|0;
       $200 = ($161>>>0)<($199>>>0);
       if ($200) {
        _abort();
        // unreachable;
       }
-      $201 = (($161) + 16|0);
+      $201 = ((($161)) + 16|0);
       $202 = HEAP32[$201>>2]|0;
       $203 = ($202|0)==($9|0);
       if ($203) {
        HEAP32[$201>>2] = $R7$1;
       } else {
-       $204 = (($161) + 20|0);
+       $204 = ((($161)) + 20|0);
        HEAP32[$204>>2] = $R7$1;
       }
       $205 = ($R7$1|0)==(0|0);
@@ -22526,16 +23653,16 @@ function _free($mem) {
        break;
       }
      }
-     $206 = HEAP32[((32544 + 16|0))>>2]|0;
+     $206 = HEAP32[(32692)>>2]|0;
      $207 = ($R7$1>>>0)<($206>>>0);
      if ($207) {
       _abort();
       // unreachable;
      }
-     $208 = (($R7$1) + 24|0);
+     $208 = ((($R7$1)) + 24|0);
      HEAP32[$208>>2] = $161;
-     $$sum19 = (($8) + 8)|0;
-     $209 = (($mem) + ($$sum19)|0);
+     $$sum13 = (($8) + 8)|0;
+     $209 = (($mem) + ($$sum13)|0);
      $210 = HEAP32[$209>>2]|0;
      $211 = ($210|0)==(0|0);
      do {
@@ -22545,28 +23672,28 @@ function _free($mem) {
         _abort();
         // unreachable;
        } else {
-        $213 = (($R7$1) + 16|0);
+        $213 = ((($R7$1)) + 16|0);
         HEAP32[$213>>2] = $210;
-        $214 = (($210) + 24|0);
+        $214 = ((($210)) + 24|0);
         HEAP32[$214>>2] = $R7$1;
         break;
        }
       }
      } while(0);
-     $$sum20 = (($8) + 12)|0;
-     $215 = (($mem) + ($$sum20)|0);
+     $$sum14 = (($8) + 12)|0;
+     $215 = (($mem) + ($$sum14)|0);
      $216 = HEAP32[$215>>2]|0;
      $217 = ($216|0)==(0|0);
      if (!($217)) {
-      $218 = HEAP32[((32544 + 16|0))>>2]|0;
+      $218 = HEAP32[(32692)>>2]|0;
       $219 = ($216>>>0)<($218>>>0);
       if ($219) {
        _abort();
        // unreachable;
       } else {
-       $220 = (($R7$1) + 20|0);
+       $220 = ((($R7$1)) + 20|0);
        HEAP32[$220>>2] = $216;
-       $221 = (($216) + 24|0);
+       $221 = ((($216)) + 24|0);
        HEAP32[$221>>2] = $R7$1;
        break;
       }
@@ -22575,15 +23702,15 @@ function _free($mem) {
    }
   } while(0);
   $222 = $133 | 1;
-  $223 = (($p$0) + 4|0);
+  $223 = ((($p$0)) + 4|0);
   HEAP32[$223>>2] = $222;
   $224 = (($p$0) + ($133)|0);
   HEAP32[$224>>2] = $133;
-  $225 = HEAP32[((32544 + 20|0))>>2]|0;
+  $225 = HEAP32[(32696)>>2]|0;
   $226 = ($p$0|0)==($225|0);
   if ($226) {
-   HEAP32[((32544 + 8|0))>>2] = $133;
-   STACKTOP = sp;return;
+   HEAP32[(32684)>>2] = $133;
+   return;
   } else {
    $psize$1 = $133;
   }
@@ -22591,7 +23718,7 @@ function _free($mem) {
   $227 = $112 & -2;
   HEAP32[$111>>2] = $227;
   $228 = $psize$0 | 1;
-  $229 = (($p$0) + 4|0);
+  $229 = ((($p$0)) + 4|0);
   HEAP32[$229>>2] = $228;
   $230 = (($p$0) + ($psize$0)|0);
   HEAP32[$230>>2] = $psize$0;
@@ -22601,22 +23728,22 @@ function _free($mem) {
  $232 = ($psize$1>>>0)<(256);
  if ($232) {
   $233 = $231 << 1;
-  $234 = ((32544 + ($233<<2)|0) + 40|0);
-  $235 = HEAP32[32544>>2]|0;
+  $234 = (32716 + ($233<<2)|0);
+  $235 = HEAP32[32676>>2]|0;
   $236 = 1 << $231;
   $237 = $235 & $236;
   $238 = ($237|0)==(0);
   if ($238) {
    $239 = $235 | $236;
-   HEAP32[32544>>2] = $239;
-   $$sum16$pre = (($233) + 2)|0;
-   $$pre = ((32544 + ($$sum16$pre<<2)|0) + 40|0);
-   $$pre$phiZ2D = $$pre;$F16$0 = $234;
+   HEAP32[32676>>2] = $239;
+   $$pre = (($233) + 2)|0;
+   $$pre57 = (32716 + ($$pre<<2)|0);
+   $$pre$phiZ2D = $$pre57;$F16$0 = $234;
   } else {
-   $$sum17 = (($233) + 2)|0;
-   $240 = ((32544 + ($$sum17<<2)|0) + 40|0);
+   $$sum11 = (($233) + 2)|0;
+   $240 = (32716 + ($$sum11<<2)|0);
    $241 = HEAP32[$240>>2]|0;
-   $242 = HEAP32[((32544 + 16|0))>>2]|0;
+   $242 = HEAP32[(32692)>>2]|0;
    $243 = ($241>>>0)<($242>>>0);
    if ($243) {
     _abort();
@@ -22626,13 +23753,13 @@ function _free($mem) {
    }
   }
   HEAP32[$$pre$phiZ2D>>2] = $p$0;
-  $244 = (($F16$0) + 12|0);
+  $244 = ((($F16$0)) + 12|0);
   HEAP32[$244>>2] = $p$0;
-  $245 = (($p$0) + 8|0);
+  $245 = ((($p$0)) + 8|0);
   HEAP32[$245>>2] = $F16$0;
-  $246 = (($p$0) + 12|0);
+  $246 = ((($p$0)) + 12|0);
   HEAP32[$246>>2] = $234;
-  STACKTOP = sp;return;
+  return;
  }
  $247 = $psize$1 >>> 8;
  $248 = ($247|0)==(0);
@@ -22668,101 +23795,97 @@ function _free($mem) {
    $I18$0 = $271;
   }
  }
- $272 = ((32544 + ($I18$0<<2)|0) + 304|0);
- $273 = (($p$0) + 28|0);
- $I18$0$c = $I18$0;
- HEAP32[$273>>2] = $I18$0$c;
- $274 = (($p$0) + 20|0);
- HEAP32[$274>>2] = 0;
- $275 = (($p$0) + 16|0);
+ $272 = (32980 + ($I18$0<<2)|0);
+ $273 = ((($p$0)) + 28|0);
+ HEAP32[$273>>2] = $I18$0;
+ $274 = ((($p$0)) + 16|0);
+ $275 = ((($p$0)) + 20|0);
  HEAP32[$275>>2] = 0;
- $276 = HEAP32[((32544 + 4|0))>>2]|0;
+ HEAP32[$274>>2] = 0;
+ $276 = HEAP32[(32680)>>2]|0;
  $277 = 1 << $I18$0;
  $278 = $276 & $277;
  $279 = ($278|0)==(0);
  L199: do {
   if ($279) {
    $280 = $276 | $277;
-   HEAP32[((32544 + 4|0))>>2] = $280;
+   HEAP32[(32680)>>2] = $280;
    HEAP32[$272>>2] = $p$0;
-   $281 = (($p$0) + 24|0);
+   $281 = ((($p$0)) + 24|0);
    HEAP32[$281>>2] = $272;
-   $282 = (($p$0) + 12|0);
+   $282 = ((($p$0)) + 12|0);
    HEAP32[$282>>2] = $p$0;
-   $283 = (($p$0) + 8|0);
+   $283 = ((($p$0)) + 8|0);
    HEAP32[$283>>2] = $p$0;
   } else {
    $284 = HEAP32[$272>>2]|0;
-   $285 = ($I18$0|0)==(31);
-   if ($285) {
-    $293 = 0;
-   } else {
-    $286 = $I18$0 >>> 1;
-    $287 = (25 - ($286))|0;
-    $293 = $287;
-   }
-   $288 = (($284) + 4|0);
-   $289 = HEAP32[$288>>2]|0;
-   $290 = $289 & -8;
-   $291 = ($290|0)==($psize$1|0);
-   L205: do {
-    if ($291) {
+   $285 = ((($284)) + 4|0);
+   $286 = HEAP32[$285>>2]|0;
+   $287 = $286 & -8;
+   $288 = ($287|0)==($psize$1|0);
+   L202: do {
+    if ($288) {
      $T$0$lcssa = $284;
     } else {
-     $292 = $psize$1 << $293;
-     $K19$058 = $292;$T$057 = $284;
+     $289 = ($I18$0|0)==(31);
+     $290 = $I18$0 >>> 1;
+     $291 = (25 - ($290))|0;
+     $292 = $289 ? 0 : $291;
+     $293 = $psize$1 << $292;
+     $K19$052 = $293;$T$051 = $284;
      while(1) {
-      $300 = $K19$058 >>> 31;
-      $301 = ((($T$057) + ($300<<2)|0) + 16|0);
+      $300 = $K19$052 >>> 31;
+      $301 = (((($T$051)) + 16|0) + ($300<<2)|0);
       $296 = HEAP32[$301>>2]|0;
       $302 = ($296|0)==(0|0);
       if ($302) {
+       $$lcssa = $301;$T$051$lcssa = $T$051;
        break;
       }
-      $294 = $K19$058 << 1;
-      $295 = (($296) + 4|0);
+      $294 = $K19$052 << 1;
+      $295 = ((($296)) + 4|0);
       $297 = HEAP32[$295>>2]|0;
       $298 = $297 & -8;
       $299 = ($298|0)==($psize$1|0);
       if ($299) {
        $T$0$lcssa = $296;
-       break L205;
+       break L202;
       } else {
-       $K19$058 = $294;$T$057 = $296;
+       $K19$052 = $294;$T$051 = $296;
       }
      }
-     $303 = HEAP32[((32544 + 16|0))>>2]|0;
-     $304 = ($301>>>0)<($303>>>0);
+     $303 = HEAP32[(32692)>>2]|0;
+     $304 = ($$lcssa>>>0)<($303>>>0);
      if ($304) {
       _abort();
       // unreachable;
      } else {
-      HEAP32[$301>>2] = $p$0;
-      $305 = (($p$0) + 24|0);
-      HEAP32[$305>>2] = $T$057;
-      $306 = (($p$0) + 12|0);
+      HEAP32[$$lcssa>>2] = $p$0;
+      $305 = ((($p$0)) + 24|0);
+      HEAP32[$305>>2] = $T$051$lcssa;
+      $306 = ((($p$0)) + 12|0);
       HEAP32[$306>>2] = $p$0;
-      $307 = (($p$0) + 8|0);
+      $307 = ((($p$0)) + 8|0);
       HEAP32[$307>>2] = $p$0;
       break L199;
      }
     }
    } while(0);
-   $308 = (($T$0$lcssa) + 8|0);
+   $308 = ((($T$0$lcssa)) + 8|0);
    $309 = HEAP32[$308>>2]|0;
-   $310 = HEAP32[((32544 + 16|0))>>2]|0;
-   $311 = ($T$0$lcssa>>>0)>=($310>>>0);
-   $312 = ($309>>>0)>=($310>>>0);
-   $or$cond = $311 & $312;
-   if ($or$cond) {
-    $313 = (($309) + 12|0);
+   $310 = HEAP32[(32692)>>2]|0;
+   $311 = ($309>>>0)>=($310>>>0);
+   $not$ = ($T$0$lcssa>>>0)>=($310>>>0);
+   $312 = $311 & $not$;
+   if ($312) {
+    $313 = ((($309)) + 12|0);
     HEAP32[$313>>2] = $p$0;
     HEAP32[$308>>2] = $p$0;
-    $314 = (($p$0) + 8|0);
+    $314 = ((($p$0)) + 8|0);
     HEAP32[$314>>2] = $309;
-    $315 = (($p$0) + 12|0);
+    $315 = ((($p$0)) + 12|0);
     HEAP32[$315>>2] = $T$0$lcssa;
-    $316 = (($p$0) + 24|0);
+    $316 = ((($p$0)) + 24|0);
     HEAP32[$316>>2] = 0;
     break;
    } else {
@@ -22771,30 +23894,29 @@ function _free($mem) {
    }
   }
  } while(0);
- $317 = HEAP32[((32544 + 32|0))>>2]|0;
+ $317 = HEAP32[(32708)>>2]|0;
  $318 = (($317) + -1)|0;
- HEAP32[((32544 + 32|0))>>2] = $318;
+ HEAP32[(32708)>>2] = $318;
  $319 = ($318|0)==(0);
  if ($319) {
-  $sp$0$in$i = ((32544 + 456|0));
+  $sp$0$in$i = (33132);
  } else {
-  STACKTOP = sp;return;
+  return;
  }
  while(1) {
   $sp$0$i = HEAP32[$sp$0$in$i>>2]|0;
   $320 = ($sp$0$i|0)==(0|0);
-  $321 = (($sp$0$i) + 8|0);
+  $321 = ((($sp$0$i)) + 8|0);
   if ($320) {
    break;
   } else {
    $sp$0$in$i = $321;
   }
  }
- HEAP32[((32544 + 32|0))>>2] = -1;
- STACKTOP = sp;return;
+ HEAP32[(32708)>>2] = -1;
+ return;
 }
 function runPostSets() {
- 
 }
 function _bitshift64Ashr(low, high, bits) {
     low = low|0; high = high|0; bits = bits|0;
@@ -22877,17 +23999,7 @@ function _bitshift64Shl(low, high, bits) {
     tempRet0 = low << (bits - 32);
     return 0;
 }
-function _strlen(ptr) {
-    ptr = ptr|0;
-    var curr = 0;
-    curr = ptr;
-    while (((HEAP8[((curr)>>0)])|0)) {
-      curr = (curr + 1)|0;
-    }
-    return (curr - ptr)|0;
-}
 function _memcpy(dest, src, num) {
-
     dest = dest|0; src = src|0; num = num|0;
     var ret = 0;
     if ((num|0) >= 4096) return _emscripten_memcpy_big(dest|0, src|0, num|0)|0;
@@ -22935,18 +24047,6 @@ function _memmove(dest, src, num) {
     }
     return dest | 0;
 }
-function _llvm_ctlz_i32(x) {
-    x = x|0;
-    var ret = 0;
-    ret = ((HEAP8[(((ctlz_i8)+(x >>> 24))>>0)])|0);
-    if ((ret|0) < 8) return ret|0;
-    ret = ((HEAP8[(((ctlz_i8)+((x >> 16)&0xff))>>0)])|0);
-    if ((ret|0) < 8) return (ret + 8)|0;
-    ret = ((HEAP8[(((ctlz_i8)+((x >> 8)&0xff))>>0)])|0);
-    if ((ret|0) < 8) return (ret + 16)|0;
-    return (((HEAP8[(((ctlz_i8)+(x&0xff))>>0)])|0) + 24)|0;
-  }
-
 function _llvm_cttz_i32(x) {
     x = x|0;
     var ret = 0;
@@ -22990,7 +24090,7 @@ function ___divdi3($a$0, $a$1, $b$0, $b$1) {
   $7$1 = $2$1 ^ $1$1;
   $8$0 = ___udivmoddi4($4$0, $4$1, $6$0, tempRet0, 0) | 0;
   $10$0 = _i64Subtract($8$0 ^ $7$0, tempRet0 ^ $7$1, $7$0, $7$1) | 0;
-  return (tempRet0 = tempRet0, $10$0) | 0;
+  return $10$0 | 0;
 }
 function ___remdi3($a$0, $a$1, $b$0, $b$1) {
   $a$0 = $a$0 | 0;
@@ -22999,7 +24099,7 @@ function ___remdi3($a$0, $a$1, $b$0, $b$1) {
   $b$1 = $b$1 | 0;
   var $rem = 0, $1$0 = 0, $1$1 = 0, $2$0 = 0, $2$1 = 0, $4$0 = 0, $4$1 = 0, $6$0 = 0, $10$0 = 0, $10$1 = 0, __stackBase__ = 0;
   __stackBase__ = STACKTOP;
-  STACKTOP = STACKTOP + 8 | 0;
+  STACKTOP = STACKTOP + 16 | 0;
   $rem = __stackBase__ | 0;
   $1$0 = $a$1 >> 31 | (($a$1 | 0) < 0 ? -1 : 0) << 1;
   $1$1 = (($a$1 | 0) < 0 ? -1 : 0) >> 31 | (($a$1 | 0) < 0 ? -1 : 0) << 1;
@@ -23034,7 +24134,7 @@ function ___udivdi3($a$0, $a$1, $b$0, $b$1) {
   $b$1 = $b$1 | 0;
   var $1$0 = 0;
   $1$0 = ___udivmoddi4($a$0, $a$1, $b$0, $b$1, 0) | 0;
-  return (tempRet0 = tempRet0, $1$0) | 0;
+  return $1$0 | 0;
 }
 function ___uremdi3($a$0, $a$1, $b$0, $b$1) {
   $a$0 = $a$0 | 0;
@@ -23043,7 +24143,7 @@ function ___uremdi3($a$0, $a$1, $b$0, $b$1) {
   $b$1 = $b$1 | 0;
   var $rem = 0, __stackBase__ = 0;
   __stackBase__ = STACKTOP;
-  STACKTOP = STACKTOP + 8 | 0;
+  STACKTOP = STACKTOP + 16 | 0;
   $rem = __stackBase__ | 0;
   ___udivmoddi4($a$0, $a$1, $b$0, $b$1, $rem) | 0;
   STACKTOP = __stackBase__;
@@ -23116,8 +24216,8 @@ function ___udivmoddi4($a$0, $a$1, $b$0, $b$1, $rem) {
         $_0$0 = $n_sroa_1_4_extract_trunc >>> ((_llvm_cttz_i32($d_sroa_1_4_extract_trunc | 0) | 0) >>> 0);
         return (tempRet0 = $_0$1, $_0$0) | 0;
       }
-      $49 = _llvm_ctlz_i32($d_sroa_1_4_extract_trunc | 0) | 0;
-      $51 = $49 - (_llvm_ctlz_i32($n_sroa_1_4_extract_trunc | 0) | 0) | 0;
+      $49 = Math_clz32($d_sroa_1_4_extract_trunc | 0) | 0;
+      $51 = $49 - (Math_clz32($n_sroa_1_4_extract_trunc | 0) | 0) | 0;
       if ($51 >>> 0 <= 30) {
         $57 = $51 + 1 | 0;
         $58 = 31 - $51 | 0;
@@ -23140,8 +24240,8 @@ function ___udivmoddi4($a$0, $a$1, $b$0, $b$1, $rem) {
       return (tempRet0 = $_0$1, $_0$0) | 0;
     } else {
       if (!$17) {
-        $117 = _llvm_ctlz_i32($d_sroa_1_4_extract_trunc | 0) | 0;
-        $119 = $117 - (_llvm_ctlz_i32($n_sroa_1_4_extract_trunc | 0) | 0) | 0;
+        $117 = Math_clz32($d_sroa_1_4_extract_trunc | 0) | 0;
+        $119 = $117 - (Math_clz32($n_sroa_1_4_extract_trunc | 0) | 0) | 0;
         if ($119 >>> 0 <= 31) {
           $125 = $119 + 1 | 0;
           $126 = 31 - $119 | 0;
@@ -23166,8 +24266,8 @@ function ___udivmoddi4($a$0, $a$1, $b$0, $b$1, $rem) {
       }
       $66 = $d_sroa_0_0_extract_trunc - 1 | 0;
       if (($66 & $d_sroa_0_0_extract_trunc | 0) != 0) {
-        $86 = (_llvm_ctlz_i32($d_sroa_0_0_extract_trunc | 0) | 0) + 33 | 0;
-        $88 = $86 - (_llvm_ctlz_i32($n_sroa_1_4_extract_trunc | 0) | 0) | 0;
+        $86 = (Math_clz32($d_sroa_0_0_extract_trunc | 0) | 0) + 33 | 0;
+        $88 = $86 - (Math_clz32($n_sroa_1_4_extract_trunc | 0) | 0) | 0;
         $89 = 64 - $88 | 0;
         $91 = 32 - $88 | 0;
         $92 = $91 >> 31;
@@ -23206,7 +24306,7 @@ function ___udivmoddi4($a$0, $a$1, $b$0, $b$1, $rem) {
   } else {
     $d_sroa_0_0_insert_insert99$0 = 0 | $b$0 & -1;
     $d_sroa_0_0_insert_insert99$1 = $d_sroa_1_4_extract_shift$0 | $b$1 & 0;
-    $137$0 = _i64Add($d_sroa_0_0_insert_insert99$0, $d_sroa_0_0_insert_insert99$1, -1, -1) | 0;
+    $137$0 = _i64Add($d_sroa_0_0_insert_insert99$0 | 0, $d_sroa_0_0_insert_insert99$1 | 0, -1, -1) | 0;
     $137$1 = tempRet0;
     $q_sroa_1_1198 = $q_sroa_1_1_ph;
     $q_sroa_0_1199 = $q_sroa_0_1_ph;
@@ -23260,21 +24360,51 @@ function ___udivmoddi4($a$0, $a$1, $b$0, $b$1, $rem) {
 
 
 
+  
+function dynCall_ii(index,a1) {
+  index = index|0;
+  a1=a1|0;
+  return FUNCTION_TABLE_ii[index&1](a1|0)|0;
+}
+
+
+function dynCall_iiii(index,a1,a2,a3) {
+  index = index|0;
+  a1=a1|0; a2=a2|0; a3=a3|0;
+  return FUNCTION_TABLE_iiii[index&3](a1|0,a2|0,a3|0)|0;
+}
+
+
+function dynCall_vi(index,a1) {
+  index = index|0;
+  a1=a1|0;
+  FUNCTION_TABLE_vi[index&1](a1|0);
+}
+
+function b0(p0) {
+ p0 = p0|0; abort(0);return 0;
+}
+function b1(p0,p1,p2) {
+ p0 = p0|0;p1 = p1|0;p2 = p2|0; abort(1);return 0;
+}
+function b2(p0) {
+ p0 = p0|0; abort(2);
+}
+
 // EMSCRIPTEN_END_FUNCS
+var FUNCTION_TABLE_ii = [b0,___stdio_close];
+var FUNCTION_TABLE_iiii = [b1,___stdout_write,___stdio_seek,___stdio_write];
+var FUNCTION_TABLE_vi = [b2,_cleanup392];
 
-  
-
-  // EMSCRIPTEN_END_FUNCS
-  
-
-  return { _curve25519_verify: _curve25519_verify, _crypto_sign_ed25519_ref10_ge_scalarmult_base: _crypto_sign_ed25519_ref10_ge_scalarmult_base, _curve25519_sign: _curve25519_sign, _free: _free, _i64Add: _i64Add, _memmove: _memmove, _bitshift64Ashr: _bitshift64Ashr, _sph_sha512_init: _sph_sha512_init, _curve25519_donna: _curve25519_donna, _memset: _memset, _malloc: _malloc, _memcpy: _memcpy, _strlen: _strlen, _bitshift64Lshr: _bitshift64Lshr, _i64Subtract: _i64Subtract, _bitshift64Shl: _bitshift64Shl, runPostSets: runPostSets, stackAlloc: stackAlloc, stackSave: stackSave, stackRestore: stackRestore, setThrew: setThrew, setTempRet0: setTempRet0, getTempRet0: getTempRet0 };
+  return { _curve25519_verify: _curve25519_verify, _crypto_sign_ed25519_ref10_ge_scalarmult_base: _crypto_sign_ed25519_ref10_ge_scalarmult_base, _curve25519_sign: _curve25519_sign, _fflush: _fflush, _i64Add: _i64Add, _memmove: _memmove, _bitshift64Ashr: _bitshift64Ashr, _sph_sha512_init: _sph_sha512_init, _curve25519_donna: _curve25519_donna, _memset: _memset, _malloc: _malloc, _memcpy: _memcpy, _bitshift64Lshr: _bitshift64Lshr, _free: _free, _i64Subtract: _i64Subtract, ___errno_location: ___errno_location, _bitshift64Shl: _bitshift64Shl, runPostSets: runPostSets, stackAlloc: stackAlloc, stackSave: stackSave, stackRestore: stackRestore, establishStackSpace: establishStackSpace, setThrew: setThrew, setTempRet0: setTempRet0, getTempRet0: getTempRet0, dynCall_ii: dynCall_ii, dynCall_iiii: dynCall_iiii, dynCall_vi: dynCall_vi };
 })
 // EMSCRIPTEN_END_ASM
 (Module.asmGlobalArg, Module.asmLibraryArg, buffer);
 var _curve25519_verify = Module["_curve25519_verify"] = asm["_curve25519_verify"];
 var _crypto_sign_ed25519_ref10_ge_scalarmult_base = Module["_crypto_sign_ed25519_ref10_ge_scalarmult_base"] = asm["_crypto_sign_ed25519_ref10_ge_scalarmult_base"];
 var _curve25519_sign = Module["_curve25519_sign"] = asm["_curve25519_sign"];
-var _free = Module["_free"] = asm["_free"];
+var _fflush = Module["_fflush"] = asm["_fflush"];
+var runPostSets = Module["runPostSets"] = asm["runPostSets"];
 var _i64Add = Module["_i64Add"] = asm["_i64Add"];
 var _memmove = Module["_memmove"] = asm["_memmove"];
 var _bitshift64Ashr = Module["_bitshift64Ashr"] = asm["_bitshift64Ashr"];
@@ -23283,1651 +24413,28 @@ var _curve25519_donna = Module["_curve25519_donna"] = asm["_curve25519_donna"];
 var _memset = Module["_memset"] = asm["_memset"];
 var _malloc = Module["_malloc"] = asm["_malloc"];
 var _memcpy = Module["_memcpy"] = asm["_memcpy"];
-var _strlen = Module["_strlen"] = asm["_strlen"];
 var _bitshift64Lshr = Module["_bitshift64Lshr"] = asm["_bitshift64Lshr"];
+var _free = Module["_free"] = asm["_free"];
 var _i64Subtract = Module["_i64Subtract"] = asm["_i64Subtract"];
+var ___errno_location = Module["___errno_location"] = asm["___errno_location"];
 var _bitshift64Shl = Module["_bitshift64Shl"] = asm["_bitshift64Shl"];
-var runPostSets = Module["runPostSets"] = asm["runPostSets"];
+var dynCall_ii = Module["dynCall_ii"] = asm["dynCall_ii"];
+var dynCall_iiii = Module["dynCall_iiii"] = asm["dynCall_iiii"];
+var dynCall_vi = Module["dynCall_vi"] = asm["dynCall_vi"];
+;
 
 Runtime.stackAlloc = asm['stackAlloc'];
 Runtime.stackSave = asm['stackSave'];
 Runtime.stackRestore = asm['stackRestore'];
+Runtime.establishStackSpace = asm['establishStackSpace'];
+
 Runtime.setTempRet0 = asm['setTempRet0'];
 Runtime.getTempRet0 = asm['getTempRet0'];
-
-
-// TODO: strip out parts of this we do not need
-
-//======= begin closure i64 code =======
-
-// Copyright 2009 The Closure Library Authors. All Rights Reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS-IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-/**
- * @fileoverview Defines a Long class for representing a 64-bit two's-complement
- * integer value, which faithfully simulates the behavior of a Java "long". This
- * implementation is derived from LongLib in GWT.
- *
- */
-
-var i64Math = (function() { // Emscripten wrapper
-  var goog = { math: {} };
-
-
-  /**
-   * Constructs a 64-bit two's-complement integer, given its low and high 32-bit
-   * values as *signed* integers.  See the from* functions below for more
-   * convenient ways of constructing Longs.
-   *
-   * The internal representation of a long is the two given signed, 32-bit values.
-   * We use 32-bit pieces because these are the size of integers on which
-   * Javascript performs bit-operations.  For operations like addition and
-   * multiplication, we split each number into 16-bit pieces, which can easily be
-   * multiplied within Javascript's floating-point representation without overflow
-   * or change in sign.
-   *
-   * In the algorithms below, we frequently reduce the negative case to the
-   * positive case by negating the input(s) and then post-processing the result.
-   * Note that we must ALWAYS check specially whether those values are MIN_VALUE
-   * (-2^63) because -MIN_VALUE == MIN_VALUE (since 2^63 cannot be represented as
-   * a positive number, it overflows back into a negative).  Not handling this
-   * case would often result in infinite recursion.
-   *
-   * @param {number} low  The low (signed) 32 bits of the long.
-   * @param {number} high  The high (signed) 32 bits of the long.
-   * @constructor
-   */
-  goog.math.Long = function(low, high) {
-    /**
-     * @type {number}
-     * @private
-     */
-    this.low_ = low | 0;  // force into 32 signed bits.
-
-    /**
-     * @type {number}
-     * @private
-     */
-    this.high_ = high | 0;  // force into 32 signed bits.
-  };
-
-
-  // NOTE: Common constant values ZERO, ONE, NEG_ONE, etc. are defined below the
-  // from* methods on which they depend.
-
-
-  /**
-   * A cache of the Long representations of small integer values.
-   * @type {!Object}
-   * @private
-   */
-  goog.math.Long.IntCache_ = {};
-
-
-  /**
-   * Returns a Long representing the given (32-bit) integer value.
-   * @param {number} value The 32-bit integer in question.
-   * @return {!goog.math.Long} The corresponding Long value.
-   */
-  goog.math.Long.fromInt = function(value) {
-    if (-128 <= value && value < 128) {
-      var cachedObj = goog.math.Long.IntCache_[value];
-      if (cachedObj) {
-        return cachedObj;
-      }
-    }
-
-    var obj = new goog.math.Long(value | 0, value < 0 ? -1 : 0);
-    if (-128 <= value && value < 128) {
-      goog.math.Long.IntCache_[value] = obj;
-    }
-    return obj;
-  };
-
-
-  /**
-   * Returns a Long representing the given value, provided that it is a finite
-   * number.  Otherwise, zero is returned.
-   * @param {number} value The number in question.
-   * @return {!goog.math.Long} The corresponding Long value.
-   */
-  goog.math.Long.fromNumber = function(value) {
-    if (isNaN(value) || !isFinite(value)) {
-      return goog.math.Long.ZERO;
-    } else if (value <= -goog.math.Long.TWO_PWR_63_DBL_) {
-      return goog.math.Long.MIN_VALUE;
-    } else if (value + 1 >= goog.math.Long.TWO_PWR_63_DBL_) {
-      return goog.math.Long.MAX_VALUE;
-    } else if (value < 0) {
-      return goog.math.Long.fromNumber(-value).negate();
-    } else {
-      return new goog.math.Long(
-          (value % goog.math.Long.TWO_PWR_32_DBL_) | 0,
-          (value / goog.math.Long.TWO_PWR_32_DBL_) | 0);
-    }
-  };
-
-
-  /**
-   * Returns a Long representing the 64-bit integer that comes by concatenating
-   * the given high and low bits.  Each is assumed to use 32 bits.
-   * @param {number} lowBits The low 32-bits.
-   * @param {number} highBits The high 32-bits.
-   * @return {!goog.math.Long} The corresponding Long value.
-   */
-  goog.math.Long.fromBits = function(lowBits, highBits) {
-    return new goog.math.Long(lowBits, highBits);
-  };
-
-
-  /**
-   * Returns a Long representation of the given string, written using the given
-   * radix.
-   * @param {string} str The textual representation of the Long.
-   * @param {number=} opt_radix The radix in which the text is written.
-   * @return {!goog.math.Long} The corresponding Long value.
-   */
-  goog.math.Long.fromString = function(str, opt_radix) {
-    if (str.length == 0) {
-      throw Error('number format error: empty string');
-    }
-
-    var radix = opt_radix || 10;
-    if (radix < 2 || 36 < radix) {
-      throw Error('radix out of range: ' + radix);
-    }
-
-    if (str.charAt(0) == '-') {
-      return goog.math.Long.fromString(str.substring(1), radix).negate();
-    } else if (str.indexOf('-') >= 0) {
-      throw Error('number format error: interior "-" character: ' + str);
-    }
-
-    // Do several (8) digits each time through the loop, so as to
-    // minimize the calls to the very expensive emulated div.
-    var radixToPower = goog.math.Long.fromNumber(Math.pow(radix, 8));
-
-    var result = goog.math.Long.ZERO;
-    for (var i = 0; i < str.length; i += 8) {
-      var size = Math.min(8, str.length - i);
-      var value = parseInt(str.substring(i, i + size), radix);
-      if (size < 8) {
-        var power = goog.math.Long.fromNumber(Math.pow(radix, size));
-        result = result.multiply(power).add(goog.math.Long.fromNumber(value));
-      } else {
-        result = result.multiply(radixToPower);
-        result = result.add(goog.math.Long.fromNumber(value));
-      }
-    }
-    return result;
-  };
-
-
-  // NOTE: the compiler should inline these constant values below and then remove
-  // these variables, so there should be no runtime penalty for these.
-
-
-  /**
-   * Number used repeated below in calculations.  This must appear before the
-   * first call to any from* function below.
-   * @type {number}
-   * @private
-   */
-  goog.math.Long.TWO_PWR_16_DBL_ = 1 << 16;
-
-
-  /**
-   * @type {number}
-   * @private
-   */
-  goog.math.Long.TWO_PWR_24_DBL_ = 1 << 24;
-
-
-  /**
-   * @type {number}
-   * @private
-   */
-  goog.math.Long.TWO_PWR_32_DBL_ =
-      goog.math.Long.TWO_PWR_16_DBL_ * goog.math.Long.TWO_PWR_16_DBL_;
-
-
-  /**
-   * @type {number}
-   * @private
-   */
-  goog.math.Long.TWO_PWR_31_DBL_ =
-      goog.math.Long.TWO_PWR_32_DBL_ / 2;
-
-
-  /**
-   * @type {number}
-   * @private
-   */
-  goog.math.Long.TWO_PWR_48_DBL_ =
-      goog.math.Long.TWO_PWR_32_DBL_ * goog.math.Long.TWO_PWR_16_DBL_;
-
-
-  /**
-   * @type {number}
-   * @private
-   */
-  goog.math.Long.TWO_PWR_64_DBL_ =
-      goog.math.Long.TWO_PWR_32_DBL_ * goog.math.Long.TWO_PWR_32_DBL_;
-
-
-  /**
-   * @type {number}
-   * @private
-   */
-  goog.math.Long.TWO_PWR_63_DBL_ =
-      goog.math.Long.TWO_PWR_64_DBL_ / 2;
-
-
-  /** @type {!goog.math.Long} */
-  goog.math.Long.ZERO = goog.math.Long.fromInt(0);
-
-
-  /** @type {!goog.math.Long} */
-  goog.math.Long.ONE = goog.math.Long.fromInt(1);
-
-
-  /** @type {!goog.math.Long} */
-  goog.math.Long.NEG_ONE = goog.math.Long.fromInt(-1);
-
-
-  /** @type {!goog.math.Long} */
-  goog.math.Long.MAX_VALUE =
-      goog.math.Long.fromBits(0xFFFFFFFF | 0, 0x7FFFFFFF | 0);
-
-
-  /** @type {!goog.math.Long} */
-  goog.math.Long.MIN_VALUE = goog.math.Long.fromBits(0, 0x80000000 | 0);
-
-
-  /**
-   * @type {!goog.math.Long}
-   * @private
-   */
-  goog.math.Long.TWO_PWR_24_ = goog.math.Long.fromInt(1 << 24);
-
-
-  /** @return {number} The value, assuming it is a 32-bit integer. */
-  goog.math.Long.prototype.toInt = function() {
-    return this.low_;
-  };
-
-
-  /** @return {number} The closest floating-point representation to this value. */
-  goog.math.Long.prototype.toNumber = function() {
-    return this.high_ * goog.math.Long.TWO_PWR_32_DBL_ +
-           this.getLowBitsUnsigned();
-  };
-
-
-  /**
-   * @param {number=} opt_radix The radix in which the text should be written.
-   * @return {string} The textual representation of this value.
-   */
-  goog.math.Long.prototype.toString = function(opt_radix) {
-    var radix = opt_radix || 10;
-    if (radix < 2 || 36 < radix) {
-      throw Error('radix out of range: ' + radix);
-    }
-
-    if (this.isZero()) {
-      return '0';
-    }
-
-    if (this.isNegative()) {
-      if (this.equals(goog.math.Long.MIN_VALUE)) {
-        // We need to change the Long value before it can be negated, so we remove
-        // the bottom-most digit in this base and then recurse to do the rest.
-        var radixLong = goog.math.Long.fromNumber(radix);
-        var div = this.div(radixLong);
-        var rem = div.multiply(radixLong).subtract(this);
-        return div.toString(radix) + rem.toInt().toString(radix);
-      } else {
-        return '-' + this.negate().toString(radix);
-      }
-    }
-
-    // Do several (6) digits each time through the loop, so as to
-    // minimize the calls to the very expensive emulated div.
-    var radixToPower = goog.math.Long.fromNumber(Math.pow(radix, 6));
-
-    var rem = this;
-    var result = '';
-    while (true) {
-      var remDiv = rem.div(radixToPower);
-      var intval = rem.subtract(remDiv.multiply(radixToPower)).toInt();
-      var digits = intval.toString(radix);
-
-      rem = remDiv;
-      if (rem.isZero()) {
-        return digits + result;
-      } else {
-        while (digits.length < 6) {
-          digits = '0' + digits;
-        }
-        result = '' + digits + result;
-      }
-    }
-  };
-
-
-  /** @return {number} The high 32-bits as a signed value. */
-  goog.math.Long.prototype.getHighBits = function() {
-    return this.high_;
-  };
-
-
-  /** @return {number} The low 32-bits as a signed value. */
-  goog.math.Long.prototype.getLowBits = function() {
-    return this.low_;
-  };
-
-
-  /** @return {number} The low 32-bits as an unsigned value. */
-  goog.math.Long.prototype.getLowBitsUnsigned = function() {
-    return (this.low_ >= 0) ?
-        this.low_ : goog.math.Long.TWO_PWR_32_DBL_ + this.low_;
-  };
-
-
-  /**
-   * @return {number} Returns the number of bits needed to represent the absolute
-   *     value of this Long.
-   */
-  goog.math.Long.prototype.getNumBitsAbs = function() {
-    if (this.isNegative()) {
-      if (this.equals(goog.math.Long.MIN_VALUE)) {
-        return 64;
-      } else {
-        return this.negate().getNumBitsAbs();
-      }
-    } else {
-      var val = this.high_ != 0 ? this.high_ : this.low_;
-      for (var bit = 31; bit > 0; bit--) {
-        if ((val & (1 << bit)) != 0) {
-          break;
-        }
-      }
-      return this.high_ != 0 ? bit + 33 : bit + 1;
-    }
-  };
-
-
-  /** @return {boolean} Whether this value is zero. */
-  goog.math.Long.prototype.isZero = function() {
-    return this.high_ == 0 && this.low_ == 0;
-  };
-
-
-  /** @return {boolean} Whether this value is negative. */
-  goog.math.Long.prototype.isNegative = function() {
-    return this.high_ < 0;
-  };
-
-
-  /** @return {boolean} Whether this value is odd. */
-  goog.math.Long.prototype.isOdd = function() {
-    return (this.low_ & 1) == 1;
-  };
-
-
-  /**
-   * @param {goog.math.Long} other Long to compare against.
-   * @return {boolean} Whether this Long equals the other.
-   */
-  goog.math.Long.prototype.equals = function(other) {
-    return (this.high_ == other.high_) && (this.low_ == other.low_);
-  };
-
-
-  /**
-   * @param {goog.math.Long} other Long to compare against.
-   * @return {boolean} Whether this Long does not equal the other.
-   */
-  goog.math.Long.prototype.notEquals = function(other) {
-    return (this.high_ != other.high_) || (this.low_ != other.low_);
-  };
-
-
-  /**
-   * @param {goog.math.Long} other Long to compare against.
-   * @return {boolean} Whether this Long is less than the other.
-   */
-  goog.math.Long.prototype.lessThan = function(other) {
-    return this.compare(other) < 0;
-  };
-
-
-  /**
-   * @param {goog.math.Long} other Long to compare against.
-   * @return {boolean} Whether this Long is less than or equal to the other.
-   */
-  goog.math.Long.prototype.lessThanOrEqual = function(other) {
-    return this.compare(other) <= 0;
-  };
-
-
-  /**
-   * @param {goog.math.Long} other Long to compare against.
-   * @return {boolean} Whether this Long is greater than the other.
-   */
-  goog.math.Long.prototype.greaterThan = function(other) {
-    return this.compare(other) > 0;
-  };
-
-
-  /**
-   * @param {goog.math.Long} other Long to compare against.
-   * @return {boolean} Whether this Long is greater than or equal to the other.
-   */
-  goog.math.Long.prototype.greaterThanOrEqual = function(other) {
-    return this.compare(other) >= 0;
-  };
-
-
-  /**
-   * Compares this Long with the given one.
-   * @param {goog.math.Long} other Long to compare against.
-   * @return {number} 0 if they are the same, 1 if the this is greater, and -1
-   *     if the given one is greater.
-   */
-  goog.math.Long.prototype.compare = function(other) {
-    if (this.equals(other)) {
-      return 0;
-    }
-
-    var thisNeg = this.isNegative();
-    var otherNeg = other.isNegative();
-    if (thisNeg && !otherNeg) {
-      return -1;
-    }
-    if (!thisNeg && otherNeg) {
-      return 1;
-    }
-
-    // at this point, the signs are the same, so subtraction will not overflow
-    if (this.subtract(other).isNegative()) {
-      return -1;
-    } else {
-      return 1;
-    }
-  };
-
-
-  /** @return {!goog.math.Long} The negation of this value. */
-  goog.math.Long.prototype.negate = function() {
-    if (this.equals(goog.math.Long.MIN_VALUE)) {
-      return goog.math.Long.MIN_VALUE;
-    } else {
-      return this.not().add(goog.math.Long.ONE);
-    }
-  };
-
-
-  /**
-   * Returns the sum of this and the given Long.
-   * @param {goog.math.Long} other Long to add to this one.
-   * @return {!goog.math.Long} The sum of this and the given Long.
-   */
-  goog.math.Long.prototype.add = function(other) {
-    // Divide each number into 4 chunks of 16 bits, and then sum the chunks.
-
-    var a48 = this.high_ >>> 16;
-    var a32 = this.high_ & 0xFFFF;
-    var a16 = this.low_ >>> 16;
-    var a00 = this.low_ & 0xFFFF;
-
-    var b48 = other.high_ >>> 16;
-    var b32 = other.high_ & 0xFFFF;
-    var b16 = other.low_ >>> 16;
-    var b00 = other.low_ & 0xFFFF;
-
-    var c48 = 0, c32 = 0, c16 = 0, c00 = 0;
-    c00 += a00 + b00;
-    c16 += c00 >>> 16;
-    c00 &= 0xFFFF;
-    c16 += a16 + b16;
-    c32 += c16 >>> 16;
-    c16 &= 0xFFFF;
-    c32 += a32 + b32;
-    c48 += c32 >>> 16;
-    c32 &= 0xFFFF;
-    c48 += a48 + b48;
-    c48 &= 0xFFFF;
-    return goog.math.Long.fromBits((c16 << 16) | c00, (c48 << 16) | c32);
-  };
-
-
-  /**
-   * Returns the difference of this and the given Long.
-   * @param {goog.math.Long} other Long to subtract from this.
-   * @return {!goog.math.Long} The difference of this and the given Long.
-   */
-  goog.math.Long.prototype.subtract = function(other) {
-    return this.add(other.negate());
-  };
-
-
-  /**
-   * Returns the product of this and the given long.
-   * @param {goog.math.Long} other Long to multiply with this.
-   * @return {!goog.math.Long} The product of this and the other.
-   */
-  goog.math.Long.prototype.multiply = function(other) {
-    if (this.isZero()) {
-      return goog.math.Long.ZERO;
-    } else if (other.isZero()) {
-      return goog.math.Long.ZERO;
-    }
-
-    if (this.equals(goog.math.Long.MIN_VALUE)) {
-      return other.isOdd() ? goog.math.Long.MIN_VALUE : goog.math.Long.ZERO;
-    } else if (other.equals(goog.math.Long.MIN_VALUE)) {
-      return this.isOdd() ? goog.math.Long.MIN_VALUE : goog.math.Long.ZERO;
-    }
-
-    if (this.isNegative()) {
-      if (other.isNegative()) {
-        return this.negate().multiply(other.negate());
-      } else {
-        return this.negate().multiply(other).negate();
-      }
-    } else if (other.isNegative()) {
-      return this.multiply(other.negate()).negate();
-    }
-
-    // If both longs are small, use float multiplication
-    if (this.lessThan(goog.math.Long.TWO_PWR_24_) &&
-        other.lessThan(goog.math.Long.TWO_PWR_24_)) {
-      return goog.math.Long.fromNumber(this.toNumber() * other.toNumber());
-    }
-
-    // Divide each long into 4 chunks of 16 bits, and then add up 4x4 products.
-    // We can skip products that would overflow.
-
-    var a48 = this.high_ >>> 16;
-    var a32 = this.high_ & 0xFFFF;
-    var a16 = this.low_ >>> 16;
-    var a00 = this.low_ & 0xFFFF;
-
-    var b48 = other.high_ >>> 16;
-    var b32 = other.high_ & 0xFFFF;
-    var b16 = other.low_ >>> 16;
-    var b00 = other.low_ & 0xFFFF;
-
-    var c48 = 0, c32 = 0, c16 = 0, c00 = 0;
-    c00 += a00 * b00;
-    c16 += c00 >>> 16;
-    c00 &= 0xFFFF;
-    c16 += a16 * b00;
-    c32 += c16 >>> 16;
-    c16 &= 0xFFFF;
-    c16 += a00 * b16;
-    c32 += c16 >>> 16;
-    c16 &= 0xFFFF;
-    c32 += a32 * b00;
-    c48 += c32 >>> 16;
-    c32 &= 0xFFFF;
-    c32 += a16 * b16;
-    c48 += c32 >>> 16;
-    c32 &= 0xFFFF;
-    c32 += a00 * b32;
-    c48 += c32 >>> 16;
-    c32 &= 0xFFFF;
-    c48 += a48 * b00 + a32 * b16 + a16 * b32 + a00 * b48;
-    c48 &= 0xFFFF;
-    return goog.math.Long.fromBits((c16 << 16) | c00, (c48 << 16) | c32);
-  };
-
-
-  /**
-   * Returns this Long divided by the given one.
-   * @param {goog.math.Long} other Long by which to divide.
-   * @return {!goog.math.Long} This Long divided by the given one.
-   */
-  goog.math.Long.prototype.div = function(other) {
-    if (other.isZero()) {
-      throw Error('division by zero');
-    } else if (this.isZero()) {
-      return goog.math.Long.ZERO;
-    }
-
-    if (this.equals(goog.math.Long.MIN_VALUE)) {
-      if (other.equals(goog.math.Long.ONE) ||
-          other.equals(goog.math.Long.NEG_ONE)) {
-        return goog.math.Long.MIN_VALUE;  // recall that -MIN_VALUE == MIN_VALUE
-      } else if (other.equals(goog.math.Long.MIN_VALUE)) {
-        return goog.math.Long.ONE;
-      } else {
-        // At this point, we have |other| >= 2, so |this/other| < |MIN_VALUE|.
-        var halfThis = this.shiftRight(1);
-        var approx = halfThis.div(other).shiftLeft(1);
-        if (approx.equals(goog.math.Long.ZERO)) {
-          return other.isNegative() ? goog.math.Long.ONE : goog.math.Long.NEG_ONE;
-        } else {
-          var rem = this.subtract(other.multiply(approx));
-          var result = approx.add(rem.div(other));
-          return result;
-        }
-      }
-    } else if (other.equals(goog.math.Long.MIN_VALUE)) {
-      return goog.math.Long.ZERO;
-    }
-
-    if (this.isNegative()) {
-      if (other.isNegative()) {
-        return this.negate().div(other.negate());
-      } else {
-        return this.negate().div(other).negate();
-      }
-    } else if (other.isNegative()) {
-      return this.div(other.negate()).negate();
-    }
-
-    // Repeat the following until the remainder is less than other:  find a
-    // floating-point that approximates remainder / other *from below*, add this
-    // into the result, and subtract it from the remainder.  It is critical that
-    // the approximate value is less than or equal to the real value so that the
-    // remainder never becomes negative.
-    var res = goog.math.Long.ZERO;
-    var rem = this;
-    while (rem.greaterThanOrEqual(other)) {
-      // Approximate the result of division. This may be a little greater or
-      // smaller than the actual value.
-      var approx = Math.max(1, Math.floor(rem.toNumber() / other.toNumber()));
-
-      // We will tweak the approximate result by changing it in the 48-th digit or
-      // the smallest non-fractional digit, whichever is larger.
-      var log2 = Math.ceil(Math.log(approx) / Math.LN2);
-      var delta = (log2 <= 48) ? 1 : Math.pow(2, log2 - 48);
-
-      // Decrease the approximation until it is smaller than the remainder.  Note
-      // that if it is too large, the product overflows and is negative.
-      var approxRes = goog.math.Long.fromNumber(approx);
-      var approxRem = approxRes.multiply(other);
-      while (approxRem.isNegative() || approxRem.greaterThan(rem)) {
-        approx -= delta;
-        approxRes = goog.math.Long.fromNumber(approx);
-        approxRem = approxRes.multiply(other);
-      }
-
-      // We know the answer can't be zero... and actually, zero would cause
-      // infinite recursion since we would make no progress.
-      if (approxRes.isZero()) {
-        approxRes = goog.math.Long.ONE;
-      }
-
-      res = res.add(approxRes);
-      rem = rem.subtract(approxRem);
-    }
-    return res;
-  };
-
-
-  /**
-   * Returns this Long modulo the given one.
-   * @param {goog.math.Long} other Long by which to mod.
-   * @return {!goog.math.Long} This Long modulo the given one.
-   */
-  goog.math.Long.prototype.modulo = function(other) {
-    return this.subtract(this.div(other).multiply(other));
-  };
-
-
-  /** @return {!goog.math.Long} The bitwise-NOT of this value. */
-  goog.math.Long.prototype.not = function() {
-    return goog.math.Long.fromBits(~this.low_, ~this.high_);
-  };
-
-
-  /**
-   * Returns the bitwise-AND of this Long and the given one.
-   * @param {goog.math.Long} other The Long with which to AND.
-   * @return {!goog.math.Long} The bitwise-AND of this and the other.
-   */
-  goog.math.Long.prototype.and = function(other) {
-    return goog.math.Long.fromBits(this.low_ & other.low_,
-                                   this.high_ & other.high_);
-  };
-
-
-  /**
-   * Returns the bitwise-OR of this Long and the given one.
-   * @param {goog.math.Long} other The Long with which to OR.
-   * @return {!goog.math.Long} The bitwise-OR of this and the other.
-   */
-  goog.math.Long.prototype.or = function(other) {
-    return goog.math.Long.fromBits(this.low_ | other.low_,
-                                   this.high_ | other.high_);
-  };
-
-
-  /**
-   * Returns the bitwise-XOR of this Long and the given one.
-   * @param {goog.math.Long} other The Long with which to XOR.
-   * @return {!goog.math.Long} The bitwise-XOR of this and the other.
-   */
-  goog.math.Long.prototype.xor = function(other) {
-    return goog.math.Long.fromBits(this.low_ ^ other.low_,
-                                   this.high_ ^ other.high_);
-  };
-
-
-  /**
-   * Returns this Long with bits shifted to the left by the given amount.
-   * @param {number} numBits The number of bits by which to shift.
-   * @return {!goog.math.Long} This shifted to the left by the given amount.
-   */
-  goog.math.Long.prototype.shiftLeft = function(numBits) {
-    numBits &= 63;
-    if (numBits == 0) {
-      return this;
-    } else {
-      var low = this.low_;
-      if (numBits < 32) {
-        var high = this.high_;
-        return goog.math.Long.fromBits(
-            low << numBits,
-            (high << numBits) | (low >>> (32 - numBits)));
-      } else {
-        return goog.math.Long.fromBits(0, low << (numBits - 32));
-      }
-    }
-  };
-
-
-  /**
-   * Returns this Long with bits shifted to the right by the given amount.
-   * @param {number} numBits The number of bits by which to shift.
-   * @return {!goog.math.Long} This shifted to the right by the given amount.
-   */
-  goog.math.Long.prototype.shiftRight = function(numBits) {
-    numBits &= 63;
-    if (numBits == 0) {
-      return this;
-    } else {
-      var high = this.high_;
-      if (numBits < 32) {
-        var low = this.low_;
-        return goog.math.Long.fromBits(
-            (low >>> numBits) | (high << (32 - numBits)),
-            high >> numBits);
-      } else {
-        return goog.math.Long.fromBits(
-            high >> (numBits - 32),
-            high >= 0 ? 0 : -1);
-      }
-    }
-  };
-
-
-  /**
-   * Returns this Long with bits shifted to the right by the given amount, with
-   * the new top bits matching the current sign bit.
-   * @param {number} numBits The number of bits by which to shift.
-   * @return {!goog.math.Long} This shifted to the right by the given amount, with
-   *     zeros placed into the new leading bits.
-   */
-  goog.math.Long.prototype.shiftRightUnsigned = function(numBits) {
-    numBits &= 63;
-    if (numBits == 0) {
-      return this;
-    } else {
-      var high = this.high_;
-      if (numBits < 32) {
-        var low = this.low_;
-        return goog.math.Long.fromBits(
-            (low >>> numBits) | (high << (32 - numBits)),
-            high >>> numBits);
-      } else if (numBits == 32) {
-        return goog.math.Long.fromBits(high, 0);
-      } else {
-        return goog.math.Long.fromBits(high >>> (numBits - 32), 0);
-      }
-    }
-  };
-
-  //======= begin jsbn =======
-
-  var navigator = { appName: 'Modern Browser' }; // polyfill a little
-
-  // Copyright (c) 2005  Tom Wu
-  // All Rights Reserved.
-  // http://www-cs-students.stanford.edu/~tjw/jsbn/
-
-  /*
-   * Copyright (c) 2003-2005  Tom Wu
-   * All Rights Reserved.
-   *
-   * Permission is hereby granted, free of charge, to any person obtaining
-   * a copy of this software and associated documentation files (the
-   * "Software"), to deal in the Software without restriction, including
-   * without limitation the rights to use, copy, modify, merge, publish,
-   * distribute, sublicense, and/or sell copies of the Software, and to
-   * permit persons to whom the Software is furnished to do so, subject to
-   * the following conditions:
-   *
-   * The above copyright notice and this permission notice shall be
-   * included in all copies or substantial portions of the Software.
-   *
-   * THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
-   * EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
-   * WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
-   *
-   * IN NO EVENT SHALL TOM WU BE LIABLE FOR ANY SPECIAL, INCIDENTAL,
-   * INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND, OR ANY DAMAGES WHATSOEVER
-   * RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER OR NOT ADVISED OF
-   * THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF LIABILITY, ARISING OUT
-   * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-   *
-   * In addition, the following condition applies:
-   *
-   * All redistributions must retain an intact copy of this copyright notice
-   * and disclaimer.
-   */
-
-  // Basic JavaScript BN library - subset useful for RSA encryption.
-
-  // Bits per digit
-  var dbits;
-
-  // JavaScript engine analysis
-  var canary = 0xdeadbeefcafe;
-  var j_lm = ((canary&0xffffff)==0xefcafe);
-
-  // (public) Constructor
-  function BigInteger(a,b,c) {
-    if(a != null)
-      if("number" == typeof a) this.fromNumber(a,b,c);
-      else if(b == null && "string" != typeof a) this.fromString(a,256);
-      else this.fromString(a,b);
-  }
-
-  // return new, unset BigInteger
-  function nbi() { return new BigInteger(null); }
-
-  // am: Compute w_j += (x*this_i), propagate carries,
-  // c is initial carry, returns final carry.
-  // c < 3*dvalue, x < 2*dvalue, this_i < dvalue
-  // We need to select the fastest one that works in this environment.
-
-  // am1: use a single mult and divide to get the high bits,
-  // max digit bits should be 26 because
-  // max internal value = 2*dvalue^2-2*dvalue (< 2^53)
-  function am1(i,x,w,j,c,n) {
-    while(--n >= 0) {
-      var v = x*this[i++]+w[j]+c;
-      c = Math.floor(v/0x4000000);
-      w[j++] = v&0x3ffffff;
-    }
-    return c;
-  }
-  // am2 avoids a big mult-and-extract completely.
-  // Max digit bits should be <= 30 because we do bitwise ops
-  // on values up to 2*hdvalue^2-hdvalue-1 (< 2^31)
-  function am2(i,x,w,j,c,n) {
-    var xl = x&0x7fff, xh = x>>15;
-    while(--n >= 0) {
-      var l = this[i]&0x7fff;
-      var h = this[i++]>>15;
-      var m = xh*l+h*xl;
-      l = xl*l+((m&0x7fff)<<15)+w[j]+(c&0x3fffffff);
-      c = (l>>>30)+(m>>>15)+xh*h+(c>>>30);
-      w[j++] = l&0x3fffffff;
-    }
-    return c;
-  }
-  // Alternately, set max digit bits to 28 since some
-  // browsers slow down when dealing with 32-bit numbers.
-  function am3(i,x,w,j,c,n) {
-    var xl = x&0x3fff, xh = x>>14;
-    while(--n >= 0) {
-      var l = this[i]&0x3fff;
-      var h = this[i++]>>14;
-      var m = xh*l+h*xl;
-      l = xl*l+((m&0x3fff)<<14)+w[j]+c;
-      c = (l>>28)+(m>>14)+xh*h;
-      w[j++] = l&0xfffffff;
-    }
-    return c;
-  }
-  if(j_lm && (navigator.appName == "Microsoft Internet Explorer")) {
-    BigInteger.prototype.am = am2;
-    dbits = 30;
-  }
-  else if(j_lm && (navigator.appName != "Netscape")) {
-    BigInteger.prototype.am = am1;
-    dbits = 26;
-  }
-  else { // Mozilla/Netscape seems to prefer am3
-    BigInteger.prototype.am = am3;
-    dbits = 28;
-  }
-
-  BigInteger.prototype.DB = dbits;
-  BigInteger.prototype.DM = ((1<<dbits)-1);
-  BigInteger.prototype.DV = (1<<dbits);
-
-  var BI_FP = 52;
-  BigInteger.prototype.FV = Math.pow(2,BI_FP);
-  BigInteger.prototype.F1 = BI_FP-dbits;
-  BigInteger.prototype.F2 = 2*dbits-BI_FP;
-
-  // Digit conversions
-  var BI_RM = "0123456789abcdefghijklmnopqrstuvwxyz";
-  var BI_RC = new Array();
-  var rr,vv;
-  rr = "0".charCodeAt(0);
-  for(vv = 0; vv <= 9; ++vv) BI_RC[rr++] = vv;
-  rr = "a".charCodeAt(0);
-  for(vv = 10; vv < 36; ++vv) BI_RC[rr++] = vv;
-  rr = "A".charCodeAt(0);
-  for(vv = 10; vv < 36; ++vv) BI_RC[rr++] = vv;
-
-  function int2char(n) { return BI_RM.charAt(n); }
-  function intAt(s,i) {
-    var c = BI_RC[s.charCodeAt(i)];
-    return (c==null)?-1:c;
-  }
-
-  // (protected) copy this to r
-  function bnpCopyTo(r) {
-    for(var i = this.t-1; i >= 0; --i) r[i] = this[i];
-    r.t = this.t;
-    r.s = this.s;
-  }
-
-  // (protected) set from integer value x, -DV <= x < DV
-  function bnpFromInt(x) {
-    this.t = 1;
-    this.s = (x<0)?-1:0;
-    if(x > 0) this[0] = x;
-    else if(x < -1) this[0] = x+DV;
-    else this.t = 0;
-  }
-
-  // return bigint initialized to value
-  function nbv(i) { var r = nbi(); r.fromInt(i); return r; }
-
-  // (protected) set from string and radix
-  function bnpFromString(s,b) {
-    var k;
-    if(b == 16) k = 4;
-    else if(b == 8) k = 3;
-    else if(b == 256) k = 8; // byte array
-    else if(b == 2) k = 1;
-    else if(b == 32) k = 5;
-    else if(b == 4) k = 2;
-    else { this.fromRadix(s,b); return; }
-    this.t = 0;
-    this.s = 0;
-    var i = s.length, mi = false, sh = 0;
-    while(--i >= 0) {
-      var x = (k==8)?s[i]&0xff:intAt(s,i);
-      if(x < 0) {
-        if(s.charAt(i) == "-") mi = true;
-        continue;
-      }
-      mi = false;
-      if(sh == 0)
-        this[this.t++] = x;
-      else if(sh+k > this.DB) {
-        this[this.t-1] |= (x&((1<<(this.DB-sh))-1))<<sh;
-        this[this.t++] = (x>>(this.DB-sh));
-      }
-      else
-        this[this.t-1] |= x<<sh;
-      sh += k;
-      if(sh >= this.DB) sh -= this.DB;
-    }
-    if(k == 8 && (s[0]&0x80) != 0) {
-      this.s = -1;
-      if(sh > 0) this[this.t-1] |= ((1<<(this.DB-sh))-1)<<sh;
-    }
-    this.clamp();
-    if(mi) BigInteger.ZERO.subTo(this,this);
-  }
-
-  // (protected) clamp off excess high words
-  function bnpClamp() {
-    var c = this.s&this.DM;
-    while(this.t > 0 && this[this.t-1] == c) --this.t;
-  }
-
-  // (public) return string representation in given radix
-  function bnToString(b) {
-    if(this.s < 0) return "-"+this.negate().toString(b);
-    var k;
-    if(b == 16) k = 4;
-    else if(b == 8) k = 3;
-    else if(b == 2) k = 1;
-    else if(b == 32) k = 5;
-    else if(b == 4) k = 2;
-    else return this.toRadix(b);
-    var km = (1<<k)-1, d, m = false, r = "", i = this.t;
-    var p = this.DB-(i*this.DB)%k;
-    if(i-- > 0) {
-      if(p < this.DB && (d = this[i]>>p) > 0) { m = true; r = int2char(d); }
-      while(i >= 0) {
-        if(p < k) {
-          d = (this[i]&((1<<p)-1))<<(k-p);
-          d |= this[--i]>>(p+=this.DB-k);
-        }
-        else {
-          d = (this[i]>>(p-=k))&km;
-          if(p <= 0) { p += this.DB; --i; }
-        }
-        if(d > 0) m = true;
-        if(m) r += int2char(d);
-      }
-    }
-    return m?r:"0";
-  }
-
-  // (public) -this
-  function bnNegate() { var r = nbi(); BigInteger.ZERO.subTo(this,r); return r; }
-
-  // (public) |this|
-  function bnAbs() { return (this.s<0)?this.negate():this; }
-
-  // (public) return + if this > a, - if this < a, 0 if equal
-  function bnCompareTo(a) {
-    var r = this.s-a.s;
-    if(r != 0) return r;
-    var i = this.t;
-    r = i-a.t;
-    if(r != 0) return (this.s<0)?-r:r;
-    while(--i >= 0) if((r=this[i]-a[i]) != 0) return r;
-    return 0;
-  }
-
-  // returns bit length of the integer x
-  function nbits(x) {
-    var r = 1, t;
-    if((t=x>>>16) != 0) { x = t; r += 16; }
-    if((t=x>>8) != 0) { x = t; r += 8; }
-    if((t=x>>4) != 0) { x = t; r += 4; }
-    if((t=x>>2) != 0) { x = t; r += 2; }
-    if((t=x>>1) != 0) { x = t; r += 1; }
-    return r;
-  }
-
-  // (public) return the number of bits in "this"
-  function bnBitLength() {
-    if(this.t <= 0) return 0;
-    return this.DB*(this.t-1)+nbits(this[this.t-1]^(this.s&this.DM));
-  }
-
-  // (protected) r = this << n*DB
-  function bnpDLShiftTo(n,r) {
-    var i;
-    for(i = this.t-1; i >= 0; --i) r[i+n] = this[i];
-    for(i = n-1; i >= 0; --i) r[i] = 0;
-    r.t = this.t+n;
-    r.s = this.s;
-  }
-
-  // (protected) r = this >> n*DB
-  function bnpDRShiftTo(n,r) {
-    for(var i = n; i < this.t; ++i) r[i-n] = this[i];
-    r.t = Math.max(this.t-n,0);
-    r.s = this.s;
-  }
-
-  // (protected) r = this << n
-  function bnpLShiftTo(n,r) {
-    var bs = n%this.DB;
-    var cbs = this.DB-bs;
-    var bm = (1<<cbs)-1;
-    var ds = Math.floor(n/this.DB), c = (this.s<<bs)&this.DM, i;
-    for(i = this.t-1; i >= 0; --i) {
-      r[i+ds+1] = (this[i]>>cbs)|c;
-      c = (this[i]&bm)<<bs;
-    }
-    for(i = ds-1; i >= 0; --i) r[i] = 0;
-    r[ds] = c;
-    r.t = this.t+ds+1;
-    r.s = this.s;
-    r.clamp();
-  }
-
-  // (protected) r = this >> n
-  function bnpRShiftTo(n,r) {
-    r.s = this.s;
-    var ds = Math.floor(n/this.DB);
-    if(ds >= this.t) { r.t = 0; return; }
-    var bs = n%this.DB;
-    var cbs = this.DB-bs;
-    var bm = (1<<bs)-1;
-    r[0] = this[ds]>>bs;
-    for(var i = ds+1; i < this.t; ++i) {
-      r[i-ds-1] |= (this[i]&bm)<<cbs;
-      r[i-ds] = this[i]>>bs;
-    }
-    if(bs > 0) r[this.t-ds-1] |= (this.s&bm)<<cbs;
-    r.t = this.t-ds;
-    r.clamp();
-  }
-
-  // (protected) r = this - a
-  function bnpSubTo(a,r) {
-    var i = 0, c = 0, m = Math.min(a.t,this.t);
-    while(i < m) {
-      c += this[i]-a[i];
-      r[i++] = c&this.DM;
-      c >>= this.DB;
-    }
-    if(a.t < this.t) {
-      c -= a.s;
-      while(i < this.t) {
-        c += this[i];
-        r[i++] = c&this.DM;
-        c >>= this.DB;
-      }
-      c += this.s;
-    }
-    else {
-      c += this.s;
-      while(i < a.t) {
-        c -= a[i];
-        r[i++] = c&this.DM;
-        c >>= this.DB;
-      }
-      c -= a.s;
-    }
-    r.s = (c<0)?-1:0;
-    if(c < -1) r[i++] = this.DV+c;
-    else if(c > 0) r[i++] = c;
-    r.t = i;
-    r.clamp();
-  }
-
-  // (protected) r = this * a, r != this,a (HAC 14.12)
-  // "this" should be the larger one if appropriate.
-  function bnpMultiplyTo(a,r) {
-    var x = this.abs(), y = a.abs();
-    var i = x.t;
-    r.t = i+y.t;
-    while(--i >= 0) r[i] = 0;
-    for(i = 0; i < y.t; ++i) r[i+x.t] = x.am(0,y[i],r,i,0,x.t);
-    r.s = 0;
-    r.clamp();
-    if(this.s != a.s) BigInteger.ZERO.subTo(r,r);
-  }
-
-  // (protected) r = this^2, r != this (HAC 14.16)
-  function bnpSquareTo(r) {
-    var x = this.abs();
-    var i = r.t = 2*x.t;
-    while(--i >= 0) r[i] = 0;
-    for(i = 0; i < x.t-1; ++i) {
-      var c = x.am(i,x[i],r,2*i,0,1);
-      if((r[i+x.t]+=x.am(i+1,2*x[i],r,2*i+1,c,x.t-i-1)) >= x.DV) {
-        r[i+x.t] -= x.DV;
-        r[i+x.t+1] = 1;
-      }
-    }
-    if(r.t > 0) r[r.t-1] += x.am(i,x[i],r,2*i,0,1);
-    r.s = 0;
-    r.clamp();
-  }
-
-  // (protected) divide this by m, quotient and remainder to q, r (HAC 14.20)
-  // r != q, this != m.  q or r may be null.
-  function bnpDivRemTo(m,q,r) {
-    var pm = m.abs();
-    if(pm.t <= 0) return;
-    var pt = this.abs();
-    if(pt.t < pm.t) {
-      if(q != null) q.fromInt(0);
-      if(r != null) this.copyTo(r);
-      return;
-    }
-    if(r == null) r = nbi();
-    var y = nbi(), ts = this.s, ms = m.s;
-    var nsh = this.DB-nbits(pm[pm.t-1]);	// normalize modulus
-    if(nsh > 0) { pm.lShiftTo(nsh,y); pt.lShiftTo(nsh,r); }
-    else { pm.copyTo(y); pt.copyTo(r); }
-    var ys = y.t;
-    var y0 = y[ys-1];
-    if(y0 == 0) return;
-    var yt = y0*(1<<this.F1)+((ys>1)?y[ys-2]>>this.F2:0);
-    var d1 = this.FV/yt, d2 = (1<<this.F1)/yt, e = 1<<this.F2;
-    var i = r.t, j = i-ys, t = (q==null)?nbi():q;
-    y.dlShiftTo(j,t);
-    if(r.compareTo(t) >= 0) {
-      r[r.t++] = 1;
-      r.subTo(t,r);
-    }
-    BigInteger.ONE.dlShiftTo(ys,t);
-    t.subTo(y,y);	// "negative" y so we can replace sub with am later
-    while(y.t < ys) y[y.t++] = 0;
-    while(--j >= 0) {
-      // Estimate quotient digit
-      var qd = (r[--i]==y0)?this.DM:Math.floor(r[i]*d1+(r[i-1]+e)*d2);
-      if((r[i]+=y.am(0,qd,r,j,0,ys)) < qd) {	// Try it out
-        y.dlShiftTo(j,t);
-        r.subTo(t,r);
-        while(r[i] < --qd) r.subTo(t,r);
-      }
-    }
-    if(q != null) {
-      r.drShiftTo(ys,q);
-      if(ts != ms) BigInteger.ZERO.subTo(q,q);
-    }
-    r.t = ys;
-    r.clamp();
-    if(nsh > 0) r.rShiftTo(nsh,r);	// Denormalize remainder
-    if(ts < 0) BigInteger.ZERO.subTo(r,r);
-  }
-
-  // (public) this mod a
-  function bnMod(a) {
-    var r = nbi();
-    this.abs().divRemTo(a,null,r);
-    if(this.s < 0 && r.compareTo(BigInteger.ZERO) > 0) a.subTo(r,r);
-    return r;
-  }
-
-  // Modular reduction using "classic" algorithm
-  function Classic(m) { this.m = m; }
-  function cConvert(x) {
-    if(x.s < 0 || x.compareTo(this.m) >= 0) return x.mod(this.m);
-    else return x;
-  }
-  function cRevert(x) { return x; }
-  function cReduce(x) { x.divRemTo(this.m,null,x); }
-  function cMulTo(x,y,r) { x.multiplyTo(y,r); this.reduce(r); }
-  function cSqrTo(x,r) { x.squareTo(r); this.reduce(r); }
-
-  Classic.prototype.convert = cConvert;
-  Classic.prototype.revert = cRevert;
-  Classic.prototype.reduce = cReduce;
-  Classic.prototype.mulTo = cMulTo;
-  Classic.prototype.sqrTo = cSqrTo;
-
-  // (protected) return "-1/this % 2^DB"; useful for Mont. reduction
-  // justification:
-  //         xy == 1 (mod m)
-  //         xy =  1+km
-  //   xy(2-xy) = (1+km)(1-km)
-  // x[y(2-xy)] = 1-k^2m^2
-  // x[y(2-xy)] == 1 (mod m^2)
-  // if y is 1/x mod m, then y(2-xy) is 1/x mod m^2
-  // should reduce x and y(2-xy) by m^2 at each step to keep size bounded.
-  // JS multiply "overflows" differently from C/C++, so care is needed here.
-  function bnpInvDigit() {
-    if(this.t < 1) return 0;
-    var x = this[0];
-    if((x&1) == 0) return 0;
-    var y = x&3;		// y == 1/x mod 2^2
-    y = (y*(2-(x&0xf)*y))&0xf;	// y == 1/x mod 2^4
-    y = (y*(2-(x&0xff)*y))&0xff;	// y == 1/x mod 2^8
-    y = (y*(2-(((x&0xffff)*y)&0xffff)))&0xffff;	// y == 1/x mod 2^16
-    // last step - calculate inverse mod DV directly;
-    // assumes 16 < DB <= 32 and assumes ability to handle 48-bit ints
-    y = (y*(2-x*y%this.DV))%this.DV;		// y == 1/x mod 2^dbits
-    // we really want the negative inverse, and -DV < y < DV
-    return (y>0)?this.DV-y:-y;
-  }
-
-  // Montgomery reduction
-  function Montgomery(m) {
-    this.m = m;
-    this.mp = m.invDigit();
-    this.mpl = this.mp&0x7fff;
-    this.mph = this.mp>>15;
-    this.um = (1<<(m.DB-15))-1;
-    this.mt2 = 2*m.t;
-  }
-
-  // xR mod m
-  function montConvert(x) {
-    var r = nbi();
-    x.abs().dlShiftTo(this.m.t,r);
-    r.divRemTo(this.m,null,r);
-    if(x.s < 0 && r.compareTo(BigInteger.ZERO) > 0) this.m.subTo(r,r);
-    return r;
-  }
-
-  // x/R mod m
-  function montRevert(x) {
-    var r = nbi();
-    x.copyTo(r);
-    this.reduce(r);
-    return r;
-  }
-
-  // x = x/R mod m (HAC 14.32)
-  function montReduce(x) {
-    while(x.t <= this.mt2)	// pad x so am has enough room later
-      x[x.t++] = 0;
-    for(var i = 0; i < this.m.t; ++i) {
-      // faster way of calculating u0 = x[i]*mp mod DV
-      var j = x[i]&0x7fff;
-      var u0 = (j*this.mpl+(((j*this.mph+(x[i]>>15)*this.mpl)&this.um)<<15))&x.DM;
-      // use am to combine the multiply-shift-add into one call
-      j = i+this.m.t;
-      x[j] += this.m.am(0,u0,x,i,0,this.m.t);
-      // propagate carry
-      while(x[j] >= x.DV) { x[j] -= x.DV; x[++j]++; }
-    }
-    x.clamp();
-    x.drShiftTo(this.m.t,x);
-    if(x.compareTo(this.m) >= 0) x.subTo(this.m,x);
-  }
-
-  // r = "x^2/R mod m"; x != r
-  function montSqrTo(x,r) { x.squareTo(r); this.reduce(r); }
-
-  // r = "xy/R mod m"; x,y != r
-  function montMulTo(x,y,r) { x.multiplyTo(y,r); this.reduce(r); }
-
-  Montgomery.prototype.convert = montConvert;
-  Montgomery.prototype.revert = montRevert;
-  Montgomery.prototype.reduce = montReduce;
-  Montgomery.prototype.mulTo = montMulTo;
-  Montgomery.prototype.sqrTo = montSqrTo;
-
-  // (protected) true iff this is even
-  function bnpIsEven() { return ((this.t>0)?(this[0]&1):this.s) == 0; }
-
-  // (protected) this^e, e < 2^32, doing sqr and mul with "r" (HAC 14.79)
-  function bnpExp(e,z) {
-    if(e > 0xffffffff || e < 1) return BigInteger.ONE;
-    var r = nbi(), r2 = nbi(), g = z.convert(this), i = nbits(e)-1;
-    g.copyTo(r);
-    while(--i >= 0) {
-      z.sqrTo(r,r2);
-      if((e&(1<<i)) > 0) z.mulTo(r2,g,r);
-      else { var t = r; r = r2; r2 = t; }
-    }
-    return z.revert(r);
-  }
-
-  // (public) this^e % m, 0 <= e < 2^32
-  function bnModPowInt(e,m) {
-    var z;
-    if(e < 256 || m.isEven()) z = new Classic(m); else z = new Montgomery(m);
-    return this.exp(e,z);
-  }
-
-  // protected
-  BigInteger.prototype.copyTo = bnpCopyTo;
-  BigInteger.prototype.fromInt = bnpFromInt;
-  BigInteger.prototype.fromString = bnpFromString;
-  BigInteger.prototype.clamp = bnpClamp;
-  BigInteger.prototype.dlShiftTo = bnpDLShiftTo;
-  BigInteger.prototype.drShiftTo = bnpDRShiftTo;
-  BigInteger.prototype.lShiftTo = bnpLShiftTo;
-  BigInteger.prototype.rShiftTo = bnpRShiftTo;
-  BigInteger.prototype.subTo = bnpSubTo;
-  BigInteger.prototype.multiplyTo = bnpMultiplyTo;
-  BigInteger.prototype.squareTo = bnpSquareTo;
-  BigInteger.prototype.divRemTo = bnpDivRemTo;
-  BigInteger.prototype.invDigit = bnpInvDigit;
-  BigInteger.prototype.isEven = bnpIsEven;
-  BigInteger.prototype.exp = bnpExp;
-
-  // public
-  BigInteger.prototype.toString = bnToString;
-  BigInteger.prototype.negate = bnNegate;
-  BigInteger.prototype.abs = bnAbs;
-  BigInteger.prototype.compareTo = bnCompareTo;
-  BigInteger.prototype.bitLength = bnBitLength;
-  BigInteger.prototype.mod = bnMod;
-  BigInteger.prototype.modPowInt = bnModPowInt;
-
-  // "constants"
-  BigInteger.ZERO = nbv(0);
-  BigInteger.ONE = nbv(1);
-
-  // jsbn2 stuff
-
-  // (protected) convert from radix string
-  function bnpFromRadix(s,b) {
-    this.fromInt(0);
-    if(b == null) b = 10;
-    var cs = this.chunkSize(b);
-    var d = Math.pow(b,cs), mi = false, j = 0, w = 0;
-    for(var i = 0; i < s.length; ++i) {
-      var x = intAt(s,i);
-      if(x < 0) {
-        if(s.charAt(i) == "-" && this.signum() == 0) mi = true;
-        continue;
-      }
-      w = b*w+x;
-      if(++j >= cs) {
-        this.dMultiply(d);
-        this.dAddOffset(w,0);
-        j = 0;
-        w = 0;
-      }
-    }
-    if(j > 0) {
-      this.dMultiply(Math.pow(b,j));
-      this.dAddOffset(w,0);
-    }
-    if(mi) BigInteger.ZERO.subTo(this,this);
-  }
-
-  // (protected) return x s.t. r^x < DV
-  function bnpChunkSize(r) { return Math.floor(Math.LN2*this.DB/Math.log(r)); }
-
-  // (public) 0 if this == 0, 1 if this > 0
-  function bnSigNum() {
-    if(this.s < 0) return -1;
-    else if(this.t <= 0 || (this.t == 1 && this[0] <= 0)) return 0;
-    else return 1;
-  }
-
-  // (protected) this *= n, this >= 0, 1 < n < DV
-  function bnpDMultiply(n) {
-    this[this.t] = this.am(0,n-1,this,0,0,this.t);
-    ++this.t;
-    this.clamp();
-  }
-
-  // (protected) this += n << w words, this >= 0
-  function bnpDAddOffset(n,w) {
-    if(n == 0) return;
-    while(this.t <= w) this[this.t++] = 0;
-    this[w] += n;
-    while(this[w] >= this.DV) {
-      this[w] -= this.DV;
-      if(++w >= this.t) this[this.t++] = 0;
-      ++this[w];
-    }
-  }
-
-  // (protected) convert to radix string
-  function bnpToRadix(b) {
-    if(b == null) b = 10;
-    if(this.signum() == 0 || b < 2 || b > 36) return "0";
-    var cs = this.chunkSize(b);
-    var a = Math.pow(b,cs);
-    var d = nbv(a), y = nbi(), z = nbi(), r = "";
-    this.divRemTo(d,y,z);
-    while(y.signum() > 0) {
-      r = (a+z.intValue()).toString(b).substr(1) + r;
-      y.divRemTo(d,y,z);
-    }
-    return z.intValue().toString(b) + r;
-  }
-
-  // (public) return value as integer
-  function bnIntValue() {
-    if(this.s < 0) {
-      if(this.t == 1) return this[0]-this.DV;
-      else if(this.t == 0) return -1;
-    }
-    else if(this.t == 1) return this[0];
-    else if(this.t == 0) return 0;
-    // assumes 16 < DB < 32
-    return ((this[1]&((1<<(32-this.DB))-1))<<this.DB)|this[0];
-  }
-
-  // (protected) r = this + a
-  function bnpAddTo(a,r) {
-    var i = 0, c = 0, m = Math.min(a.t,this.t);
-    while(i < m) {
-      c += this[i]+a[i];
-      r[i++] = c&this.DM;
-      c >>= this.DB;
-    }
-    if(a.t < this.t) {
-      c += a.s;
-      while(i < this.t) {
-        c += this[i];
-        r[i++] = c&this.DM;
-        c >>= this.DB;
-      }
-      c += this.s;
-    }
-    else {
-      c += this.s;
-      while(i < a.t) {
-        c += a[i];
-        r[i++] = c&this.DM;
-        c >>= this.DB;
-      }
-      c += a.s;
-    }
-    r.s = (c<0)?-1:0;
-    if(c > 0) r[i++] = c;
-    else if(c < -1) r[i++] = this.DV+c;
-    r.t = i;
-    r.clamp();
-  }
-
-  BigInteger.prototype.fromRadix = bnpFromRadix;
-  BigInteger.prototype.chunkSize = bnpChunkSize;
-  BigInteger.prototype.signum = bnSigNum;
-  BigInteger.prototype.dMultiply = bnpDMultiply;
-  BigInteger.prototype.dAddOffset = bnpDAddOffset;
-  BigInteger.prototype.toRadix = bnpToRadix;
-  BigInteger.prototype.intValue = bnIntValue;
-  BigInteger.prototype.addTo = bnpAddTo;
-
-  //======= end jsbn =======
-
-  // Emscripten wrapper
-  var Wrapper = {
-    abs: function(l, h) {
-      var x = new goog.math.Long(l, h);
-      var ret;
-      if (x.isNegative()) {
-        ret = x.negate();
-      } else {
-        ret = x;
-      }
-      HEAP32[tempDoublePtr>>2] = ret.low_;
-      HEAP32[tempDoublePtr+4>>2] = ret.high_;
-    },
-    ensureTemps: function() {
-      if (Wrapper.ensuredTemps) return;
-      Wrapper.ensuredTemps = true;
-      Wrapper.two32 = new BigInteger();
-      Wrapper.two32.fromString('4294967296', 10);
-      Wrapper.two64 = new BigInteger();
-      Wrapper.two64.fromString('18446744073709551616', 10);
-      Wrapper.temp1 = new BigInteger();
-      Wrapper.temp2 = new BigInteger();
-    },
-    lh2bignum: function(l, h) {
-      var a = new BigInteger();
-      a.fromString(h.toString(), 10);
-      var b = new BigInteger();
-      a.multiplyTo(Wrapper.two32, b);
-      var c = new BigInteger();
-      c.fromString(l.toString(), 10);
-      var d = new BigInteger();
-      c.addTo(b, d);
-      return d;
-    },
-    stringify: function(l, h, unsigned) {
-      var ret = new goog.math.Long(l, h).toString();
-      if (unsigned && ret[0] == '-') {
-        // unsign slowly using jsbn bignums
-        Wrapper.ensureTemps();
-        var bignum = new BigInteger();
-        bignum.fromString(ret, 10);
-        ret = new BigInteger();
-        Wrapper.two64.addTo(bignum, ret);
-        ret = ret.toString(10);
-      }
-      return ret;
-    },
-    fromString: function(str, base, min, max, unsigned) {
-      Wrapper.ensureTemps();
-      var bignum = new BigInteger();
-      bignum.fromString(str, base);
-      var bigmin = new BigInteger();
-      bigmin.fromString(min, 10);
-      var bigmax = new BigInteger();
-      bigmax.fromString(max, 10);
-      if (unsigned && bignum.compareTo(BigInteger.ZERO) < 0) {
-        var temp = new BigInteger();
-        bignum.addTo(Wrapper.two64, temp);
-        bignum = temp;
-      }
-      var error = false;
-      if (bignum.compareTo(bigmin) < 0) {
-        bignum = bigmin;
-        error = true;
-      } else if (bignum.compareTo(bigmax) > 0) {
-        bignum = bigmax;
-        error = true;
-      }
-      var ret = goog.math.Long.fromString(bignum.toString()); // min-max checks should have clamped this to a range goog.math.Long can handle well
-      HEAP32[tempDoublePtr>>2] = ret.low_;
-      HEAP32[tempDoublePtr+4>>2] = ret.high_;
-      if (error) throw 'range error';
-    }
-  };
-  return Wrapper;
-})();
-
-//======= end closure i64 code =======
 
 
 
 // === Auto-generated postamble setup entry stuff ===
 
-if (memoryInitializer) {
-  if (typeof Module['locateFile'] === 'function') {
-    memoryInitializer = Module['locateFile'](memoryInitializer);
-  } else if (Module['memoryInitializerPrefixURL']) {
-    memoryInitializer = Module['memoryInitializerPrefixURL'] + memoryInitializer;
-  }
-  if (ENVIRONMENT_IS_NODE || ENVIRONMENT_IS_SHELL) {
-    var data = Module['readBinary'](memoryInitializer);
-    HEAPU8.set(data, STATIC_BASE);
-  } else {
-    addRunDependency('memory initializer');
-    Browser.asyncLoad(memoryInitializer, function(data) {
-      HEAPU8.set(data, STATIC_BASE);
-      removeRunDependency('memory initializer');
-    }, function(data) {
-      throw 'could not load memory initializer ' + memoryInitializer;
-    });
-  }
-}
 
 function ExitStatus(status) {
   this.name = "ExitStatus";
@@ -24943,7 +24450,7 @@ var calledMain = false;
 
 dependenciesFulfilled = function runCaller() {
   // If run has never been called, and we should call run (INVOKE_RUN is true, and Module.noInitialRun is not false)
-  if (!Module['calledRun'] && shouldRunNow) run();
+  if (!Module['calledRun']) run();
   if (!Module['calledRun']) dependenciesFulfilled = runCaller; // try this again later, after new deps are fulfilled
 }
 
@@ -24970,7 +24477,6 @@ Module['callMain'] = Module.callMain = function callMain(args) {
   argv.push(0);
   argv = allocate(argv, 'i32', ALLOC_NORMAL);
 
-  initialStackTop = STACKTOP;
 
   try {
 
@@ -24978,7 +24484,7 @@ Module['callMain'] = Module.callMain = function callMain(args) {
 
 
     // if we're not running an evented main loop, it's time to exit
-    exit(ret);
+    exit(ret, /* implicit = */ true);
   }
   catch(e) {
     if (e instanceof ExitStatus) {
@@ -25025,9 +24531,6 @@ function run(args) {
 
     preMain();
 
-    if (ENVIRONMENT_IS_WEB && preloadStartTime !== null) {
-      Module.printErr('pre-main prep time: ' + (Date.now() - preloadStartTime) + ' ms');
-    }
 
     if (Module['onRuntimeInitialized']) Module['onRuntimeInitialized']();
 
@@ -25050,17 +24553,22 @@ function run(args) {
 }
 Module['run'] = Module.run = run;
 
-function exit(status) {
-  if (Module['noExitRuntime']) {
+function exit(status, implicit) {
+  if (implicit && Module['noExitRuntime']) {
     return;
   }
 
-  ABORT = true;
-  EXITSTATUS = status;
-  STACKTOP = initialStackTop;
+  if (Module['noExitRuntime']) {
+  } else {
 
-  // exit the runtime
-  exitRuntime();
+    ABORT = true;
+    EXITSTATUS = status;
+    STACKTOP = initialStackTop;
+
+    exitRuntime();
+
+    if (Module['onExit']) Module['onExit'](status);
+  }
 
   if (ENVIRONMENT_IS_NODE) {
     // Work around a node.js bug where stdout buffer is not flushed at process exit:
@@ -25085,10 +24593,15 @@ function exit(status) {
 }
 Module['exit'] = Module.exit = exit;
 
-function abort(text) {
-  if (text) {
-    Module.print(text);
-    Module.printErr(text);
+var abortDecorators = [];
+
+function abort(what) {
+  if (what !== undefined) {
+    Module.print(what);
+    Module.printErr(what);
+    what = JSON.stringify(what)
+  } else {
+    what = '';
   }
 
   ABORT = true;
@@ -25096,7 +24609,13 @@ function abort(text) {
 
   var extra = '\nIf this abort() is unexpected, build with -s ASSERTIONS=1 which can give more information.';
 
-  throw 'abort() at ' + stackTrace() + extra;
+  var output = 'abort(' + what + ') at ' + stackTrace() + extra;
+  if (abortDecorators) {
+    abortDecorators.forEach(function(decorator) {
+      output = decorator(output, what);
+    });
+  }
+  throw output;
 }
 Module['abort'] = Module.abort = abort;
 
