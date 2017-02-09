@@ -35845,15 +35845,20 @@ SessionBuilder.prototype = {
       }).then(function() {
         return Internal.crypto.createKeyPair();
       }).then(function(baseKey) {
-        var devicePreKey = (device.preKey.publicKey);
+        var devicePreKey;
+        if (device.preKey) {
+            devicePreKey = device.preKey.publicKey;
+        }
         return this.initSession(true, baseKey, undefined, device.identityKey,
           devicePreKey, device.signedPreKey.publicKey, device.registrationId
         ).then(function(session) {
             session.pendingPreKey = {
-                preKeyId    : device.preKey.keyId,
                 signedKeyId : device.signedPreKey.keyId,
                 baseKey     : baseKey.pubKey
             };
+            if (device.preKey) {
+              session.pendingPreKey.preKeyId = device.preKey.keyId;
+            }
             return session;
         });
       }.bind(this)).then(function(session) {
@@ -36136,7 +36141,9 @@ SessionCipher.prototype = {
               preKeyMsg.registrationId = myRegistrationId;
 
               preKeyMsg.baseKey = util.toArrayBuffer(session.pendingPreKey.baseKey);
-              preKeyMsg.preKeyId = session.pendingPreKey.preKeyId;
+              if (session.pendingPreKey.preKeyId) {
+                  preKeyMsg.preKeyId = session.pendingPreKey.preKeyId;
+              }
               preKeyMsg.signedPreKeyId = session.pendingPreKey.signedKeyId;
 
               preKeyMsg.message = message;
@@ -36219,7 +36226,7 @@ SessionCipher.prototype = {
                   ).then(function(plaintext) {
                       record.updateSessionState(session);
                       return this.storage.storeSession(address, record.serialize()).then(function() {
-                          if (preKeyId !== undefined) {
+                          if (preKeyId !== undefined && preKeyId !== null) {
                               return this.storage.removePreKey(preKeyId);
                           }
                       }.bind(this)).then(function() {

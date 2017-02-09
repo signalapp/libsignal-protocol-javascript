@@ -89,7 +89,9 @@ SessionCipher.prototype = {
               preKeyMsg.registrationId = myRegistrationId;
 
               preKeyMsg.baseKey = util.toArrayBuffer(session.pendingPreKey.baseKey);
-              preKeyMsg.preKeyId = session.pendingPreKey.preKeyId;
+              if (session.pendingPreKey.preKeyId) {
+                  preKeyMsg.preKeyId = session.pendingPreKey.preKeyId;
+              }
               preKeyMsg.signedPreKeyId = session.pendingPreKey.signedKeyId;
 
               preKeyMsg.message = message;
@@ -172,7 +174,7 @@ SessionCipher.prototype = {
                   ).then(function(plaintext) {
                       record.updateSessionState(session);
                       return this.storage.storeSession(address, record.serialize()).then(function() {
-                          if (preKeyId !== undefined) {
+                          if (preKeyId !== undefined && preKeyId !== null) {
                               return this.storage.removePreKey(preKeyId);
                           }
                       }.bind(this)).then(function() {
