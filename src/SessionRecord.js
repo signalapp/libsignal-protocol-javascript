@@ -127,7 +127,7 @@ Internal.SessionRecord = function() {
         },
         haveOpenSession: function() {
             var openSession = this.getOpenSession();
-            return (!!openSession && !!openSession.registrationId);
+            return (!!openSession && typeof openSession.registrationId === 'number');
         },
 
         getSessionByBaseKey: function(baseKey) {
