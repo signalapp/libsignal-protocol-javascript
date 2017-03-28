@@ -143,6 +143,10 @@ SessionCipher.prototype = {
             var errors = [];
             return this.decryptWithSessionList(buffer, record.getSessions(), errors).then(function(result) {
                 return this.getRecord(address).then(function(record) {
+                    if (result.session !== record.getOpenSession()) {
+                      record.archiveCurrentState();
+                      record.promoteState(result.session);
+                    }
                     record.updateSessionState(result.session);
                     return this.storage.storeSession(address, record.serialize()).then(function() {
                         return result.plaintext;
