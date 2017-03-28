@@ -124,6 +124,10 @@ SessionCipher.prototype = {
     return this.doDecryptWhisperMessage(buffer, session).then(function(plaintext) {
         return { plaintext: plaintext, session: session };
     }).catch(function(e) {
+        if (e.name === 'MessageCounterError') {
+            return Promise.reject(e);
+        }
+
         errors.push(e);
         return this.decryptWithSessionList(buffer, sessionList, errors);
     }.bind(this));
