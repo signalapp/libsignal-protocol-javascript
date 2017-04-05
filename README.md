@@ -1,4 +1,6 @@
-#libsignal-protocol-javascript
+# libsignal-protocol-javascript
+
+[![Build Status](https://travis-ci.org/WhisperSystems/libsignal-protocol-javascript.svg?branch=master)](https://travis-ci.org/WhisperSystems/libsignal-protocol-javascript)
 
 Signal Protocol implementation for the browser based on
 [libsignal-protocol-java](https://github.com/WhisperSystems/libsignal-protocol-java).
