@@ -1,4 +1,4 @@
-#libsignal-protocol-javascript
+# libsignal-protocol-javascript
 
 Signal Protocol implementation for the browser based on
 [libsignal-protocol-java](https://github.com/WhisperSystems/libsignal-protocol-java).
