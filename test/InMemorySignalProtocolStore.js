@@ -1,8 +1,13 @@
-function SignalProtocolStore() {
+  function SignalProtocolStore() {
   this.store = {};
 }
 
 SignalProtocolStore.prototype = {
+  Direction: {
+    SENDING: 1,
+    RECEIVING: 2,
+  },
+
   getIdentityKeyPair: function() {
     return Promise.resolve(this.get('identityKey'));
   },
@@ -29,7 +34,7 @@ SignalProtocolStore.prototype = {
     delete this.store[key];
   },
 
-  isTrustedIdentity: function(identifier, identityKey) {
+  isTrustedIdentity: function(identifier, identityKey, direction) {
     if (identifier === null || identifier === undefined) {
       throw new Error("tried to check identity key for undefined/null key");
     }
