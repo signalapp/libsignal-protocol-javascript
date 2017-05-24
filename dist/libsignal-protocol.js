@@ -35762,6 +35762,17 @@ Internal.SessionRecord = function() {
                 delete sessions[util.toString(oldestBaseKey)];
             }
         },
+        removePreviousSessions: function() {
+            var sessions = this.sessions;
+            for (var key in sessions) {
+                if (sessions[key].indexInfo.closed === -1) {
+                    var newSessions = {};
+                    newSessions[key] = sessions[key];
+                    this.sessions = newSessions;
+                    return;
+                }
+            }
+        },
     };
 
     return SessionRecord;
@@ -35857,7 +35868,11 @@ SessionBuilder.prototype = {
           record.updateSessionState(session);
           return Promise.all([
             this.storage.storeSession(address, record.serialize()),
-            this.storage.saveIdentity(this.remoteAddress.getName(), session.indexInfo.remoteIdentityKey)
+            this.storage.saveIdentity(this.remoteAddress.getName(), session.indexInfo.remoteIdentityKey).then(function(changed) {
+              if (changed) {
+                return record.removePreviousSessions();
+              }
+            }.bind(this))
           ]);
         }.bind(this));
       }.bind(this));
@@ -35914,7 +35929,11 @@ SessionBuilder.prototype = {
             // end of decryptWhisperMessage ... to ensure that the sender
             // actually holds the private keys for all reported pubkeys
             record.updateSessionState(new_session);
-            return this.storage.saveIdentity(this.remoteAddress.getName(), message.identityKey.toArrayBuffer()).then(function() {
+            return this.storage.saveIdentity(this.remoteAddress.getName(), message.identityKey.toArrayBuffer()).then(function(changed) {
+              if (changed) {
+                return record.removePreviousSessions();
+              }
+            }).then(function() {
               return message.preKeyId;
             });
         }.bind(this));
