@@ -55,7 +55,16 @@ SignalProtocolStore.prototype = {
   saveIdentity: function(identifier, identityKey) {
     if (identifier === null || identifier === undefined)
       throw new Error("Tried to put identity key for undefined/null key");
-    return Promise.resolve(this.put('identityKey' + identifier, identityKey));
+
+    var existing = this.get('identityKey' + identifier);
+    this.put('identityKey' + identifier, identityKey)
+
+    if (existing && util.toString(identityKey) !== util.toString(existing)) {
+      return Promise.resolve(true);
+    } else {
+      return Promise.resolve(false);
+    }
+
   },
 
   /* Returns a prekeypair object or undefined */
