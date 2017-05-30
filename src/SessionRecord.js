@@ -263,17 +263,6 @@ Internal.SessionRecord = function() {
                 delete sessions[util.toString(oldestBaseKey)];
             }
         },
-        removePreviousSessions: function() {
-            var sessions = this.sessions;
-            for (var key in sessions) {
-                if (sessions[key].indexInfo.closed === -1) {
-                    var newSessions = {};
-                    newSessions[key] = sessions[key];
-                    this.sessions = newSessions;
-                    return;
-                }
-            }
-        },
     };
 
     return SessionRecord;

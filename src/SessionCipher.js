@@ -83,11 +83,7 @@ SessionCipher.prototype = {
                           throw new Error('Identity key changed');
                       }
                   }).then(function() {
-                      return this.storage.saveIdentity(this.remoteAddress.getName(), session.indexInfo.remoteIdentityKey).then(function(changed) {
-                          if (changed) {
-                              return record.removePreviousSessions();
-                          }
-                      });
+                      return this.storage.saveIdentity(this.remoteAddress.getName(), session.indexInfo.remoteIdentityKey);
                   }.bind(this)).then(function() {
                       record.updateSessionState(session);
                       return this.storage.storeSession(address, record.serialize()).then(function() {
@@ -169,11 +165,7 @@ SessionCipher.prototype = {
                             throw new Error('Identity key changed');
                         }
                     }).then(function() {
-                        return this.storage.saveIdentity(this.remoteAddress.getName(), result.session.indexInfo.remoteIdentityKey).then(function(changed) {
-                            if (changed) {
-                                return record.removePreviousSessions();
-                            }
-                        });
+                        return this.storage.saveIdentity(this.remoteAddress.getName(), result.session.indexInfo.remoteIdentityKey);
                     }.bind(this)).then(function() {
                         record.updateSessionState(result.session);
                         return this.storage.storeSession(address, record.serialize()).then(function() {
