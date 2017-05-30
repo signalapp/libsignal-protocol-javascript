@@ -365,4 +365,68 @@ describe('SessionCipher', function() {
             });
         });
     });
+
+    describe("key changes", function() {
+      var ALICE_ADDRESS = new SignalProtocolAddress("+14151111111", 1);
+      var BOB_ADDRESS   = new SignalProtocolAddress("+14152222222", 1);
+      var originalMessage = util.toArrayBuffer("L'homme est condamné à être libre");
+
+      var aliceStore = new SignalProtocolStore();
+
+      var bobStore = new SignalProtocolStore();
+      var bobPreKeyId = 1337;
+      var bobSignedKeyId = 1;
+
+      var Curve = libsignal.Curve;
+
+      var bobSessionCipher = new libsignal.SessionCipher(bobStore, ALICE_ADDRESS);
+
+      before(function(done) {
+        Promise.all(
+          [aliceStore, bobStore].map(generateIdentity)
+        ).then(function() {
+            return generatePreKeyBundle(bobStore, bobPreKeyId, bobSignedKeyId);
+        }).then(function(preKeyBundle) {
+            var builder = new libsignal.SessionBuilder(aliceStore, BOB_ADDRESS);
+            return builder.processPreKey(preKeyBundle).then(function() {
+              var aliceSessionCipher = new libsignal.SessionCipher(aliceStore, BOB_ADDRESS);
+              return aliceSessionCipher.encrypt(originalMessage);
+            }).then(function(ciphertext) {
+              return bobSessionCipher.decryptPreKeyWhisperMessage(ciphertext.body, 'binary');
+            }).then(function() {
+              done();
+            });
+          }).catch(done);
+      });
+
+
+      describe("When bob's identity changes", function() {
+        var messageFromBob;
+        before(function(done) {
+          return bobSessionCipher.encrypt(originalMessage).then(function(ciphertext) {
+            messageFromBob = ciphertext;
+          }).then(function() {
+            return generateIdentity(bobStore);
+          }).then(function() {
+            return aliceStore.saveIdentity(BOB_ADDRESS.getName(), bobStore.get('identityKey').pubKey);
+          }).then(function() {
+            done();
+          });
+        });
+
+        it('alice cannot encrypt with the old session', function(done) {
+          var aliceSessionCipher = new libsignal.SessionCipher(aliceStore, BOB_ADDRESS);
+          return aliceSessionCipher.encrypt(originalMessage).catch(function(e) {
+            assert.strictEqual(e.message, 'Identity key changed');
+          }).then(done,done);
+        });
+
+        it('alice cannot decrypt from the old session', function(done) {
+          var aliceSessionCipher = new libsignal.SessionCipher(aliceStore, BOB_ADDRESS);
+          return aliceSessionCipher.decryptWhisperMessage(messageFromBob.body, 'binary').catch(function(e) {
+            assert.strictEqual(e.message, 'Identity key changed');
+          }).then(done, done);
+        });
+      });
+    });
 });
