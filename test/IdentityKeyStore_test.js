@@ -1,6 +1,7 @@
 function testIdentityKeyStore(store, registrationId, identityKey) {
     describe('IdentityKeyStore', function() {
         var number = '+5558675309';
+        var address = new libsignal.SignalProtocolAddress('+5558675309', 1);
         var testKey;
         before(function(done) {
             Internal.crypto.createKeyPair().then(function(keyPair) {
@@ -25,7 +26,7 @@ function testIdentityKeyStore(store, registrationId, identityKey) {
         });
         describe('saveIdentity', function() {
             it('stores identity keys', function(done) {
-                store.saveIdentity(number, testKey.pubKey).then(function() {
+                store.saveIdentity(address.toString(), testKey.pubKey).then(function() {
                     return store.loadIdentityKey(number).then(function(key) {
                         assertEqualArrayBuffers(key, testKey.pubKey);
                     });
@@ -34,7 +35,7 @@ function testIdentityKeyStore(store, registrationId, identityKey) {
         });
         describe('isTrustedIdentity', function() {
             it('returns true if a key is trusted', function(done) {
-                store.saveIdentity(number, testKey.pubKey).then(function() {
+                store.saveIdentity(address.toString(), testKey.pubKey).then(function() {
                     store.isTrustedIdentity(number, testKey.pubKey).then(function(trusted) {
                         if (trusted) {
                             done();
@@ -46,7 +47,7 @@ function testIdentityKeyStore(store, registrationId, identityKey) {
             });
             it('returns false if a key is untrusted', function(done) {
                 var newIdentity = libsignal.crypto.getRandomBytes(33);
-                store.saveIdentity(number, testKey.pubKey).then(function() {
+                store.saveIdentity(address.toString(), testKey.pubKey).then(function() {
                     store.isTrustedIdentity(number, newIdentity).then(function(trusted) {
                         if (trusted) {
                             done(new Error('Wrong value for untrusted key'));

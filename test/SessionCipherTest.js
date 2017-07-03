@@ -408,7 +408,7 @@ describe('SessionCipher', function() {
           }).then(function() {
             return generateIdentity(bobStore);
           }).then(function() {
-            return aliceStore.saveIdentity(BOB_ADDRESS.getName(), bobStore.get('identityKey').pubKey);
+            return aliceStore.saveIdentity(BOB_ADDRESS.toString(), bobStore.get('identityKey').pubKey);
           }).then(function() {
             done();
           });

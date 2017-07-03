@@ -56,8 +56,10 @@ SignalProtocolStore.prototype = {
     if (identifier === null || identifier === undefined)
       throw new Error("Tried to put identity key for undefined/null key");
 
-    var existing = this.get('identityKey' + identifier);
-    this.put('identityKey' + identifier, identityKey)
+    var address = new libsignal.SignalProtocolAddress.fromString(identifier);
+
+    var existing = this.get('identityKey' + address.getName());
+    this.put('identityKey' + address.getName(), identityKey)
 
     if (existing && util.toString(identityKey) !== util.toString(existing)) {
       return Promise.resolve(true);
