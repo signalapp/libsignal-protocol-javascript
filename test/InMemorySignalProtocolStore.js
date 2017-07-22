@@ -38,7 +38,7 @@ SignalProtocolStore.prototype = {
     }
 		var trusted = this.get('identityKey' + identifier);
     if (trusted === undefined) {
-      return Promise.resolve(true);
+      return Promise.resolve(false);
     }
     return Promise.resolve(util.toString(identityKey) === util.toString(trusted));
 	},
