@@ -1,0 +1,15 @@
+.button-group {
+    text-align: center;
+    padding-top: 10px;
+}
+
+.message-container {
+    text-align: center;
+    padding-top: 10px;
+}
+
+input {
+    width: 800px;
+    height: 50px;
+    overflow: scroll;
+}
