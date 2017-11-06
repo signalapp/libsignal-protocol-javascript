@@ -1,5 +1,5 @@
 ;(function(){
-var Internal = {};
+window.Internal = {};
 window.libsignal = {};
 // The Module object: Our interface to the outside world. We import
 // and export values on it, and do the work to get that through

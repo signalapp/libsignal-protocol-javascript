@@ -48,3 +48,5 @@ var KeyHelper = {
 };
 
 libsignal.KeyHelper = KeyHelper;
+
+// module.exports = KeyHelper;
