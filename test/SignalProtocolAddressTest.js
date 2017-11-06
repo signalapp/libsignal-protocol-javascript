@@ -1,3 +1,5 @@
+var SignalProtocolAddress = require('../src/SignalProtocolAddress.js');
+
 describe('SignalProtocolAddress', function() {
   var name = 'name';
   var deviceId = 42;
@@ -24,12 +26,12 @@ describe('SignalProtocolAddress', function() {
     it('throws on a bad inputs', function() {
       [ '', null, {} ].forEach(function(input) {
         assert.throws(function() {
-          var address = libsignal.SignalProtocolAddress.fromString(input);
+          var address = SignalProtocolAddress.fromString(input);
         });
       });
     });
     it('constructs the address', function() {
-      var address = libsignal.SignalProtocolAddress.fromString(string);
+      var address = SignalProtocolAddress.fromString(string);
       assert.strictEqual(deviceId, address.getDeviceId());
       assert.strictEqual(name, address.getName());
     });

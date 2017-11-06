@@ -4,48 +4,11 @@
   <link rel="stylesheet" href="../node_modules/mocha/mocha.css" />
 </head>
 <body>
-
   <div id="mocha"></div>
   <div id="tests"></div>
-
-  <script type="text/javascript" src="test.js"></script>
-
-  <script type="text/javascript" src="../build/curve25519_concat.js"></script>
-  <script type="text/javascript" src="../src/curve25519_worker_manager.js"></script>
-  <script type="text/javascript" src="../build/components_concat.js"></script>
-
-  <!-- TODO: Remove the following -->
-  <script type="text/javascript" src="temp_helpers.js"></script>
-  <!--<script type="text/javascript" src="../../libtextsecure/protobufs.js"></script>-->
-
-  <script type="text/javascript" src="../src/Curve.js" data-cover></script>
-  <script type="text/javascript" src="../src/crypto.js" data-cover></script>
-  <script type="text/javascript" src="../src/helpers.js" data-cover></script>
-  <script type="text/javascript" src="../src/KeyHelper.js" data-cover></script>
-  <script type="text/javascript" src="../src/SignalProtocolAddress.js" data-cover></script>
-  <script type="text/javascript" src="../src/SessionBuilder.js" data-cover></script>
-  <script type="text/javascript" src="../src/SessionCipher.js" data-cover></script>
-  <script type="text/javascript" src="../build/protobufs_concat.js" data-cover></script>
-  <script type="text/javascript" src="../src/SessionRecord.js" data-cover></script>
-  <script type="text/javascript" src="../src/SessionLock.js" data-cover></script>
-  <script type="text/javascript" src="../src/NumericFingerprint.js" data-cover></script>
-
-  <script type="text/javascript" src="InMemorySignalProtocolStore.js"></script>
-  <script type="text/javascript" src="crypto_test.js"></script>
-  <script type="text/javascript" src="testvectors.js"></script>
-  <script type="text/javascript" src="SessionCipherTest.js"></script>
-  <script type="text/javascript" src="KeyHelperTest.js"></script>
-  <script type="text/javascript" src="NumericFingerprintTest.js"></script>
-
-  <script type="text/javascript" src="SessionBuilderTest.js"></script>
-
-  <script type="text/javascript" src="IdentityKeyStore_test.js"></script>
-  <script type="text/javascript" src="PreKeyStore_test.js"></script>
-  <script type="text/javascript" src="SignedPreKeyStore_test.js"></script>
-  <script type="text/javascript" src="SessionStore_test.js"></script>
-  <script type="text/javascript" src="SignalProtocolStore_test.js"></script>
-
-  <script type="text/javascript" src="SignalProtocolAddressTest.js"></script>
-  <script type="text/javascript" src="helpers_test.js"></script>
+  <!-- Test essentials - Mocha, Chai, etc. -->
+  <script type="text/javascript" src="../build/test_lib.js"></script>
+  <!-- Tests run here -->
+  <script type="text/javascript" src="../build/test_main.js"></script>
 </body>
 </html>

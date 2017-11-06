@@ -49,7 +49,7 @@
     "sub"           : false,
     "supernew"      : false,
     "validthis"     : false,
-    "browser"       : false,
+    "browser"       : true,
     "browserify"    : false,
     "couch"         : false,
     "devel"         : false,
@@ -67,5 +67,8 @@
     "worker"        : false,
     "wsh"           : false,
     "yui"           : false,
-    "globals"       : {}
+    "node"          : true,
+    "globals"       : {
+      "Promise"     : true
+    }
 }

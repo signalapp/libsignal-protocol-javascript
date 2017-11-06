@@ -1,3 +1,5 @@
+var util = require('../src/helpers.js');
+
 function SignalProtocolStore() {
 	this.store = {};
 }
@@ -101,3 +103,5 @@ SignalProtocolStore.prototype = {
     return Promise.resolve();
   }
 };
+
+module.exports = SignalProtocolStore;

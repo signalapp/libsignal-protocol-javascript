@@ -73,7 +73,15 @@ types/interfaces, which are available in most modern browsers.
 
 ## Usage
 
-Include `dist/libsignal-protocol.js` in your webpage.
+There are two ways to use this package.
+
+You can require with your front-end bundler of choice (e.g. browserify, webpack):
+
+```js
+var libsignal = require('libsignal-protocol')
+```
+
+Or, you can include the prebundled `dist/libsignal.js` in your HTML file.
 
 ### Install time
 
@@ -81,6 +89,7 @@ At install time, a libsignal client needs to generate its identity keys,
 registration id, and prekeys.
 
 ```js
+var libsignal = require('libsignal-protocol')
 var KeyHelper = libsignal.KeyHelper;
 
 var registrationId = KeyHelper.generateRegistrationId();
@@ -115,7 +124,7 @@ var store   = new MySignalProtocolStore();
 var address = new libsignal.SignalProtocolAddress(recipientId, deviceId);
 
 // Instantiate a SessionBuilder for a remote recipientId + deviceId tuple.
-SessionBuilder sessionBuilder = new libsignal.SessionBuilder(store, address);
+var sessionBuilder = new libsignal.SessionBuilder(store, address);
 
 // Process a prekey fetched from the server. Returns a promise that resolves
 // once a session is created and saved in the store, or rejects if the
@@ -182,13 +191,22 @@ sessionCipher.decryptWhisperMessage(ciphertext).then(function(plaintext) {
 });
 ```
 
-## Building
+## Contributing
 
 To compile curve25519 from C souce files in `/native`, install
 [emscripten](https://kripken.github.io/emscripten-site/docs/getting_started/downloads.html).
+Theen, build all the assets with
 
 ```
-grunt compile
+grunt build
+```
+
+To test, you can serve the project root and navigate to localhost:[port]/test to see the Mocha tests run.
+For the full CI experience, you will need an account with [Sauce Labs](https://saucelabs.com). 
+Get your username and API key, then set the appropriate envirionment variables to run the tests:
+
+```sh
+SAUCE_USERNAME="your-sauce-username" SAUCE_ACCESS_KEY="your-sauce-key" grunt test
 ```
 
 ## License

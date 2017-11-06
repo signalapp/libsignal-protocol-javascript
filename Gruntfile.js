@@ -6,6 +6,16 @@ module.exports = function(grunt) {
 
   grunt.initConfig({
     pkg: grunt.file.readJSON('package.json'),
+    browserify: {
+      legacy: {
+        src: 'src/main_window.js',
+        dest: 'dist/libsignal.js'
+      },
+      test: {
+        src: 'test/main.js',
+        dest: 'build/test_main.js'
+      }
+    },
     concat: {
       components: {
         src: [
@@ -13,14 +23,18 @@ module.exports = function(grunt) {
           'node_modules/bytebuffer/dist/ByteBufferAB.js',
           'node_modules/protobufjs/dist/protobuf.js'
         ],
-        dest: 'build/components_concat.js',
+        dest: 'build/dcodeIO.js'
       },
       curve25519: {
         src: [
           'build/curve25519_compiled.js',
-          'src/curve25519_wrapper.js',
         ],
-        dest: 'build/curve25519_concat.js'
+        dest: 'build/curve25519_concat.js',
+        // Append this to the build for browser require compatibility
+        // via https://github.com/nfroidure/ttf2woff2/blob/master/jssrc/post.js
+        options: {
+          footer: "module.exports = Module;\nModule.inspect = function() { return '[Module]'; };"
+        }
       },
       protos: {
         src: [
@@ -48,43 +62,6 @@ module.exports = function(grunt) {
         dest: 'build/protobufs_concat.js'
       },
 
-      worker: {
-        src: [
-          'build/curve25519_concat.js',
-          'src/curve25519_worker.js',
-        ],
-        dest: 'dist/libsignal-protocol-worker.js',
-        options: {
-          banner: ';(function(){\nvar Internal = {};\nvar libsignal = {};\n',
-          footer: '\n})();'
-        }
-
-      },
-      libsignalprotocol: {
-        src: [
-          'build/curve25519_concat.js',
-          'src/curve25519_worker_manager.js',
-          'build/components_concat.js',
-
-          'src/Curve.js',
-          'src/crypto.js',
-          'src/helpers.js',
-          'src/KeyHelper.js',
-          'build/protobufs_concat.js',
-          'src/SessionRecord.js',
-          'src/SignalProtocolAddress.js',
-          'src/SessionBuilder.js',
-          'src/SessionCipher.js',
-          'src/SessionLock.js',
-          'src/NumericFingerprint.js'
-        ],
-        dest: 'dist/libsignal-protocol.js',
-        options: {
-          banner: ';(function(){\nvar Internal = {};\nwindow.libsignal = {};\n',
-          footer: '\n})();'
-        }
-
-      },
       test: {
         src: [
           'node_modules/mocha/mocha.js',
@@ -93,10 +70,7 @@ module.exports = function(grunt) {
           'node_modules/blanket/dist/mocha/blanket_mocha.js',
           'test/_test.js'
         ],
-        dest: 'test/test.js',
-        options: {
-          banner: 'var Internal = {};\nwindow.libsignal = {};\n'
-        }
+        dest: 'build/test_lib.js'
       }
     },
     compile: {
@@ -138,10 +112,10 @@ module.exports = function(grunt) {
         files: ['<%= jshint.files %>', '.jshintrc'],
         tasks: ['jshint']
       },
-      worker: {
-        files: ['<%= concat.worker.src %>'],
-        tasks: ['concat:worker']
-      },
+      // worker: {
+      //   files: ['<%= concat.worker.src %>'],
+      //   tasks: ['concat:worker']
+      // },
       libsignalprotocol: {
         files: ['<%= concat.libsignalprotocol.src %>'],
         tasks: ['concat:libsignalprotocol']
@@ -224,6 +198,5 @@ module.exports = function(grunt) {
   grunt.registerTask('dev', ['connect', 'watch']);
   grunt.registerTask('test', ['jshint', 'jscs', 'connect', 'saucelabs-mocha']);
   grunt.registerTask('default', ['concat']);
-  grunt.registerTask('build', ['compile', 'concat']);
-
+  grunt.registerTask('build', ['compile', 'concat', 'browserify']);
 };

@@ -2,20 +2,14 @@
  * vim: ts=4:sw=4
  */
 
-var Internal = Internal || {};
+var util = require('./helpers.js');
+var dcodeIO = require('../build/dcodeIO.js');
 
-Internal.BaseKeyType = {
-  OURS: 1,
-  THEIRS: 2
-};
-Internal.ChainType = {
-  SENDING: 1,
-  RECEIVING: 2
-};
+var BaseKeyType = require('./BaseKeyType.js');
 
 var ARCHIVED_STATES_MAX_LENGTH = 40;
 
-Internal.SessionRecord = function() {
+var SessionRecord = function() {
     'use strict';
     var MESSAGE_LOST_THRESHOLD_MS = 1000*60*60*24*7;
 
@@ -98,7 +92,7 @@ Internal.SessionRecord = function() {
 
         getSessionByBaseKey: function(baseKey) {
             var session = this._sessions[util.toString(baseKey)];
-            if (session && session.indexInfo.baseKeyType === Internal.BaseKeyType.OURS) {
+            if (session && session.indexInfo.baseKeyType === BaseKeyType.OURS) {
                 console.log("Tried to lookup a session using our basekey");
                 return undefined;
             }
@@ -273,3 +267,5 @@ Internal.SessionRecord = function() {
 
     return SessionRecord;
 }();
+
+module.exports = SessionRecord;
