@@ -398,6 +398,20 @@ SessionCipher.prototype = {
         return this.storage.storeSession(address, record.serialize());
       }.bind(this));
     }.bind(this));
+  },
+  deleteAllSessionsForDevice: function() {
+    // Used in session reset scenarios, where we really need to delete
+    var address = this.remoteAddress.toString();
+    return Internal.SessionLock.queueJobForNumber(address, function() {
+      return this.getRecord(address).then(function(record) {
+        if (record === undefined) {
+            return;
+        }
+
+        record.deleteAllSessions();
+        return this.storage.storeSession(address, record.serialize());
+      }.bind(this));
+    }.bind(this));
   }
 };
 
@@ -417,4 +431,5 @@ libsignal.SessionCipher = function(storage, remoteAddress, options) {
     this.getRemoteRegistrationId = cipher.getRemoteRegistrationId.bind(cipher);
     this.hasOpenSession = cipher.hasOpenSession.bind(cipher);
     this.closeOpenSessionForDevice = cipher.closeOpenSessionForDevice.bind(cipher);
+    this.deleteAllSessionsForDevice = cipher.deleteAllSessionsForDevice.bind(cipher);
 };

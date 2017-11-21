@@ -263,6 +263,10 @@ Internal.SessionRecord = function() {
                 delete sessions[util.toString(oldestBaseKey)];
             }
         },
+        deleteAllSessions: function() {
+            // Used primarily in session reset scenarios, where we really delete sessions
+            this.sessions = {};
+        }
     };
 
     return SessionRecord;
