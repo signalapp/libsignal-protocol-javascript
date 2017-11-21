@@ -4,14 +4,31 @@
 
 'use strict';
 describe('SessionCipher', function() {
+
     describe('getRemoteRegistrationId', function() {
         var store = new SignalProtocolStore();
         var registrationId = 1337;
         var address = new libsignal.SignalProtocolAddress('foo', 1);
         var sessionCipher = new libsignal.SessionCipher(store, address.toString());
-        describe('when a record exists', function() {
+        describe('when an open record exists', function() {
             before(function(done) {
-                var record = new Internal.SessionRecord('identityKey', registrationId);
+                var record = new Internal.SessionRecord(registrationId);
+                var session = {
+                    registrationId: registrationId,
+                    currentRatchet: {
+                        rootKey                : new ArrayBuffer(32),
+                        lastRemoteEphemeralKey : new ArrayBuffer(32),
+                        previousCounter        : 0
+                    },
+                    indexInfo: {
+                        baseKey           : new ArrayBuffer(32),
+                        baseKeyType       : Internal.BaseKeyType.OURS,
+                        remoteIdentityKey : new ArrayBuffer(32),
+                        closed            : -1
+                    },
+                    oldRatchetList: []
+                };
+                record.updateSessionState(session);
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
             it('returns a valid registrationId', function(done) {
@@ -34,23 +51,39 @@ describe('SessionCipher', function() {
         var store = new SignalProtocolStore();
         var address = new libsignal.SignalProtocolAddress('foo', 1);
         var sessionCipher = new libsignal.SessionCipher(store, address.toString());
-        describe('registrationId is valid', function() {
+        describe('open session exists', function() {
             before(function(done) {
-                var record = new Internal.SessionRecord('identityKey', 1);
+                var record = new Internal.SessionRecord();
+                var session = {
+                    registrationId: 1337,
+                    currentRatchet: {
+                        rootKey                : new ArrayBuffer(32),
+                        lastRemoteEphemeralKey : new ArrayBuffer(32),
+                        previousCounter        : 0
+                    },
+                    indexInfo: {
+                        baseKey           : new ArrayBuffer(32),
+                        baseKeyType       : Internal.BaseKeyType.OURS,
+                        remoteIdentityKey : new ArrayBuffer(32),
+                        closed            : -1
+                    },
+                    oldRatchetList: []
+                };
+                record.updateSessionState(session);
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
-            it('returns true for a session with a valid registrationId', function(done) {
+            it('returns true', function(done) {
                 sessionCipher.hasOpenSession(address.toString()).then(function(value) {
                     assert.isTrue(value);
                 }).then(done,done);
             });
         });
-        describe('registrationId is null', function() {
+        describe('no open session exists', function() {
             before(function(done) {
-                var record = new Internal.SessionRecord('identityKey');
+                var record = new Internal.SessionRecord();
                 store.storeSession(address.toString(), record.serialize()).then(done);
             });
-            it('returns false for a session with a null registrationId', function(done) {
+            it('returns false', function(done) {
                 sessionCipher.hasOpenSession(address.toString()).then(function(value) {
                     assert.isFalse(value);
                 }).then(done,done);
@@ -331,5 +364,69 @@ describe('SessionCipher', function() {
                 });
             });
         });
+    });
+
+    describe("key changes", function() {
+      var ALICE_ADDRESS = new SignalProtocolAddress("+14151111111", 1);
+      var BOB_ADDRESS   = new SignalProtocolAddress("+14152222222", 1);
+      var originalMessage = util.toArrayBuffer("L'homme est condamné à être libre");
+
+      var aliceStore = new SignalProtocolStore();
+
+      var bobStore = new SignalProtocolStore();
+      var bobPreKeyId = 1337;
+      var bobSignedKeyId = 1;
+
+      var Curve = libsignal.Curve;
+
+      var bobSessionCipher = new libsignal.SessionCipher(bobStore, ALICE_ADDRESS);
+
+      before(function(done) {
+        Promise.all(
+          [aliceStore, bobStore].map(generateIdentity)
+        ).then(function() {
+            return generatePreKeyBundle(bobStore, bobPreKeyId, bobSignedKeyId);
+        }).then(function(preKeyBundle) {
+            var builder = new libsignal.SessionBuilder(aliceStore, BOB_ADDRESS);
+            return builder.processPreKey(preKeyBundle).then(function() {
+              var aliceSessionCipher = new libsignal.SessionCipher(aliceStore, BOB_ADDRESS);
+              return aliceSessionCipher.encrypt(originalMessage);
+            }).then(function(ciphertext) {
+              return bobSessionCipher.decryptPreKeyWhisperMessage(ciphertext.body, 'binary');
+            }).then(function() {
+              done();
+            });
+          }).catch(done);
+      });
+
+
+      describe("When bob's identity changes", function() {
+        var messageFromBob;
+        before(function(done) {
+          return bobSessionCipher.encrypt(originalMessage).then(function(ciphertext) {
+            messageFromBob = ciphertext;
+          }).then(function() {
+            return generateIdentity(bobStore);
+          }).then(function() {
+            return aliceStore.saveIdentity(BOB_ADDRESS.toString(), bobStore.get('identityKey').pubKey);
+          }).then(function() {
+            done();
+          });
+        });
+
+        it('alice cannot encrypt with the old session', function(done) {
+          var aliceSessionCipher = new libsignal.SessionCipher(aliceStore, BOB_ADDRESS);
+          return aliceSessionCipher.encrypt(originalMessage).catch(function(e) {
+            assert.strictEqual(e.message, 'Identity key changed');
+          }).then(done,done);
+        });
+
+        it('alice cannot decrypt from the old session', function(done) {
+          var aliceSessionCipher = new libsignal.SessionCipher(aliceStore, BOB_ADDRESS);
+          return aliceSessionCipher.decryptWhisperMessage(messageFromBob.body, 'binary').catch(function(e) {
+            assert.strictEqual(e.message, 'Identity key changed');
+          }).then(done, done);
+        });
+      });
     });
 });

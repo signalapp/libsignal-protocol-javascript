@@ -13,11 +13,11 @@ Internal.ChainType = {
   RECEIVING: 2
 };
 
-var ARCHIVED_STATES_MAX_LENGTH = 40;
-
 Internal.SessionRecord = function() {
     'use strict';
-    var MESSAGE_LOST_THRESHOLD_MS = 1000*60*60*24*7;
+    var ARCHIVED_STATES_MAX_LENGTH = 40;
+    var OLD_RATCHETS_MAX_LENGTH = 10;
+    var SESSION_RECORD_VERSION = 'v1';
 
     var StaticByteBufferProto = new dcodeIO.ByteBuffer().__proto__;
     var StaticArrayBufferProto = new ArrayBuffer().__proto__;
@@ -43,7 +43,12 @@ Internal.SessionRecord = function() {
         } else if (thing === Object(thing)) {
             var obj = {};
             for (var key in thing) {
-                obj[key] = ensureStringed(thing[key]);
+                try {
+                  obj[key] = ensureStringed(thing[key]);
+                } catch (ex) {
+                  console.log('Error serializing key', key);
+                  throw ex;
+                }
             }
             return obj;
         } else if (thing === null) {
@@ -57,28 +62,57 @@ Internal.SessionRecord = function() {
         return JSON.stringify(ensureStringed(thing)); //TODO: jquery???
     }
 
-    var SessionRecord = function(identityKey, registrationId) {
-        this._sessions = {};
-        identityKey = util.toString(identityKey);
-        if (typeof identityKey !== 'string') {
-            throw new Error('SessionRecord: Invalid identityKey');
+    var migrations = [
+      {
+        version: 'v1',
+        migrate: function migrateV1(data) {
+          var sessions = data.sessions;
+          var key;
+          if (data.registrationId) {
+              for (key in sessions) {
+                  if (!sessions[key].registrationId) {
+                      sessions[key].registrationId = data.registrationId;
+                  }
+              }
+          } else {
+              for (key in sessions) {
+                  if (sessions[key].indexInfo.closed === -1) {
+                      console.log('V1 session storage migration error: registrationId',
+                          data.registrationId, 'for open session version',
+                          data.version);
+                  }
+              }
+          }
         }
-        this.identityKey = identityKey;
-        this.registrationId = registrationId;
+      }
+    ];
 
-        if (this.registrationId === undefined || typeof this.registrationId !== 'number') {
-            this.registrationId = null;
+    function migrate(data) {
+      var run = (data.version === undefined);
+      for (var i=0; i < migrations.length; ++i) {
+        if (run) {
+          migrations[i].migrate(data);
+        } else if (migrations[i].version === data.version) {
+          run = true;
         }
+      }
+      if (!run) {
+        throw new Error("Error migrating SessionRecord");
+      }
+    }
+
+    var SessionRecord = function() {
+        this.sessions = {};
+        this.version = SESSION_RECORD_VERSION;
     };
 
     SessionRecord.deserialize = function(serialized) {
         var data = JSON.parse(serialized);
-        var record = new SessionRecord(data.identityKey, data.registrationId);
-        record._sessions = data.sessions;
-        if (record._sessions === undefined || record._sessions === null || typeof record._sessions !== "object" || Array.isArray(record._sessions)) {
-            throw new Error("Error deserializing SessionRecord");
-        }
-        if (record.identityKey === undefined || record.registrationId === undefined) {
+        if (data.version !== SESSION_RECORD_VERSION) { migrate(data); }
+
+        var record = new SessionRecord();
+        record.sessions = data.sessions;
+        if (record.sessions === undefined || record.sessions === null || typeof record.sessions !== "object" || Array.isArray(record.sessions)) {
             throw new Error("Error deserializing SessionRecord");
         }
         return record;
@@ -87,17 +121,17 @@ Internal.SessionRecord = function() {
     SessionRecord.prototype = {
         serialize: function() {
             return jsonThing({
-                sessions       : this._sessions,
-                registrationId : this.registrationId,
-                identityKey    : this.identityKey
+                sessions       : this.sessions,
+                version        : this.version
             });
         },
         haveOpenSession: function() {
-            return this.registrationId !== null;
+            var openSession = this.getOpenSession();
+            return (!!openSession && typeof openSession.registrationId === 'number');
         },
 
         getSessionByBaseKey: function(baseKey) {
-            var session = this._sessions[util.toString(baseKey)];
+            var session = this.sessions[util.toString(baseKey)];
             if (session && session.indexInfo.baseKeyType === Internal.BaseKeyType.OURS) {
                 console.log("Tried to lookup a session using our basekey");
                 return undefined;
@@ -106,7 +140,7 @@ Internal.SessionRecord = function() {
         },
         getSessionByRemoteEphemeralKey: function(remoteEphemeralKey) {
             this.detectDuplicateOpenSessions();
-            var sessions = this._sessions;
+            var sessions = this.sessions;
 
             var searchKey = util.toString(remoteEphemeralKey);
 
@@ -126,7 +160,7 @@ Internal.SessionRecord = function() {
             return undefined;
         },
         getOpenSession: function() {
-            var sessions = this._sessions;
+            var sessions = this.sessions;
             if (sessions === undefined) {
                 return undefined;
             }
@@ -142,7 +176,7 @@ Internal.SessionRecord = function() {
         },
         detectDuplicateOpenSessions: function() {
             var openSession;
-            var sessions = this._sessions;
+            var sessions = this.sessions;
             for (var key in sessions) {
                 if (sessions[key].indexInfo.closed == -1) {
                     if (openSession !== undefined) {
@@ -152,48 +186,26 @@ Internal.SessionRecord = function() {
                 }
             }
         },
-        updateSessionState: function(session, registrationId) {
-            var sessions = this._sessions;
+        updateSessionState: function(session) {
+            var sessions = this.sessions;
 
             this.removeOldChains(session);
-
-            if (this.identityKey === null) {
-                this.identityKey = session.indexInfo.remoteIdentityKey;
-            }
-            if (util.toString(this.identityKey) !== util.toString(session.indexInfo.remoteIdentityKey)) {
-                var e = new Error("Identity key changed at session save time");
-                e.identityKey = session.indexInfo.remoteIdentityKey.toArrayBuffer();
-                throw e;
-            }
 
             sessions[util.toString(session.indexInfo.baseKey)] = session;
 
             this.removeOldSessions();
 
-            var openSessionRemaining = false;
-            for (var key in sessions) {
-                if (sessions[key].indexInfo.closed == -1) {
-                    openSessionRemaining = true;
-                }
-            }
-            if (!openSessionRemaining) { // Used as a flag to get new pre keys for the next session
-                this.registrationId = null;
-            } else if (this.registrationId === null && registrationId !== undefined) {
-                this.registrationId = registrationId;
-            } else if (this.registrationId === null) {
-                throw new Error("Had open sessions on a record that had no registrationId set");
-            }
         },
         getSessions: function() {
             // return an array of sessions ordered by time closed,
             // followed by the open session
             var list = [];
             var openSession;
-            for (var k in this._sessions) {
-                if (this._sessions[k].indexInfo.closed === -1) {
-                    openSession = this._sessions[k];
+            for (var k in this.sessions) {
+                if (this.sessions[k].indexInfo.closed === -1) {
+                    openSession = this.sessions[k];
                 } else {
-                    list.push(this._sessions[k]);
+                    list.push(this.sessions[k]);
                 }
             }
             list = list.sort(function(s1, s2) {
@@ -207,38 +219,20 @@ Internal.SessionRecord = function() {
         archiveCurrentState: function() {
             var open_session = this.getOpenSession();
             if (open_session !== undefined) {
-                this.closeSession(open_session);
+                console.log('closing session');
+                open_session.indexInfo.closed = Date.now();
                 this.updateSessionState(open_session);
             }
         },
-        closeSession: function(session) {
-            if (session.indexInfo.closed > -1) {
-                return;
-            }
-            console.log('closing session', session.indexInfo.baseKey);
-
-            // After this has run, we can still receive messages on ratchet chains which
-            // were already open (unless we know we dont need them),
-            // but we cannot send messages or step the ratchet
-
-            // Delete current sending ratchet
-            delete session[util.toString(session.currentRatchet.ephemeralKeyPair.pubKey)];
-            // Move all receive ratchets to the oldRatchetList to mark them for deletion
-            for (var i in session) {
-                if (session[i].chainKey !== undefined && session[i].chainKey.key !== undefined) {
-                    session.oldRatchetList[session.oldRatchetList.length] = {
-                        added: Date.now(), ephemeralKey: i
-                    };
-                }
-            }
-            session.indexInfo.closed = Date.now();
-            this.removeOldChains(session);
+        promoteState: function(session) {
+            console.log('promoting session');
+            session.indexInfo.closed = -1;
         },
         removeOldChains: function(session) {
             // Sending ratchets are always removed when we step because we never need them again
             // Receiving ratchets are added to the oldRatchetList, which we parse
-            // here and remove all but the last five.
-            while (session.oldRatchetList.length > 5) {
+            // here and remove all but the last ten.
+            while (session.oldRatchetList.length > OLD_RATCHETS_MAX_LENGTH) {
                 var index = 0;
                 var oldest = session.oldRatchetList[0];
                 for (var i = 0; i < session.oldRatchetList.length; i++) {
@@ -254,7 +248,7 @@ Internal.SessionRecord = function() {
         },
         removeOldSessions: function() {
             // Retain only the last 20 sessions
-            var sessions = this._sessions;
+            var sessions = this.sessions;
             var oldestBaseKey, oldestSession;
             while (Object.keys(sessions).length > ARCHIVED_STATES_MAX_LENGTH) {
                 for (var key in sessions) {
