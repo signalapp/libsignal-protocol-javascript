@@ -115,7 +115,7 @@ var store   = new MySignalProtocolStore();
 var address = new libsignal.SignalProtocolAddress(recipientId, deviceId);
 
 // Instantiate a SessionBuilder for a remote recipientId + deviceId tuple.
-SessionBuilder sessionBuilder = new libsignal.SessionBuilder(store, address);
+var sessionBuilder = new libsignal.SessionBuilder(store, address);
 
 // Process a prekey fetched from the server. Returns a promise that resolves
 // once a session is created and saved in the store, or rejects if the
