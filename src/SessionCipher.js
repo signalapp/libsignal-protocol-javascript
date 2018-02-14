@@ -287,6 +287,10 @@ SessionCipher.prototype = {
           return Promise.resolve(); // Already calculated
       }
 
+      if (counter - chain.chainKey.counter > 2000) {
+          throw new Error('Over 2000 messages into the future!');
+      }
+
       if (chain.chainKey.key === undefined) {
           throw new Error("Got invalid request to extend chain after it was already closed");
       }
