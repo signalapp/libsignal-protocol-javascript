@@ -101,8 +101,6 @@ var Internal = Internal || {};
                 result = result | (a[i] ^ b[i]);
             }
             if (result !== 0) {
-                console.log('Our MAC  ', dcodeIO.ByteBuffer.wrap(calculated_mac).toHex());
-                console.log('Their MAC', dcodeIO.ByteBuffer.wrap(mac).toHex());
                 throw new Error("Bad MAC");
             }
         });
