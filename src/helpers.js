@@ -5,7 +5,7 @@
 var util = (function() {
     'use strict';
 
-    var StaticArrayBufferProto = new ArrayBuffer().__proto__;
+    var StaticArrayBufferProto = Object.getPrototypeOf(new ArrayBuffer());
 
     return {
         toString: function(thing) {
@@ -19,7 +19,7 @@ var util = (function() {
                 return undefined;
             }
             if (thing === Object(thing)) {
-                if (thing.__proto__ == StaticArrayBufferProto) {
+                if (Object.getPrototypeOf(thing) == StaticArrayBufferProto) {
                     return thing;
                 }
             }

@@ -19,15 +19,15 @@ Internal.SessionRecord = function() {
     var OLD_RATCHETS_MAX_LENGTH = 10;
     var SESSION_RECORD_VERSION = 'v1';
 
-    var StaticByteBufferProto = new dcodeIO.ByteBuffer().__proto__;
-    var StaticArrayBufferProto = new ArrayBuffer().__proto__;
-    var StaticUint8ArrayProto = new Uint8Array().__proto__;
+    var StaticByteBufferProto = Object.getPrototypeOf(new dcodeIO.ByteBuffer());
+    var StaticArrayBufferProto = Object.getPrototypeOf(new ArrayBuffer());
+    var StaticUint8ArrayProto = Object.getPrototypeOf(new Uint8Array());
 
     function isStringable(thing) {
         return (thing === Object(thing) &&
-                (thing.__proto__ == StaticArrayBufferProto ||
-                    thing.__proto__ == StaticUint8ArrayProto ||
-                    thing.__proto__ == StaticByteBufferProto));
+                (Object.getPrototypeOf(thing) == StaticArrayBufferProto ||
+                    Object.getPrototypeOf(thing) == StaticUint8ArrayProto ||
+                    Object.getPrototypeOf(thing) == StaticByteBufferProto));
     }
     function ensureStringed(thing) {
         if (typeof thing == "string" || typeof thing == "number" || typeof thing == "boolean") {

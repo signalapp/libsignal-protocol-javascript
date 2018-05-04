@@ -29,6 +29,7 @@
     "debug"         : false,
     "eqnull"        : false,
     "es5"           : false,
+    "esversion"     : 6,
     "esnext"        : false,
     "moz"           : false,
     "evil"          : false,
@@ -37,13 +38,13 @@
     "globalstrict"  : false,
     "iterator"      : false,
     "lastsemic"     : false,
-    "laxbreak"      : false,
+    "laxbreak"      : true,
     "laxcomma"      : false,
     "loopfunc"      : false,
     "multistr"      : false,
     "noyield"       : false,
     "notypeof"      : false,
-    "proto"         : true,
+    "proto"         : false,
     "scripturl"     : false,
     "shadow"        : false,
     "sub"           : false,
@@ -67,5 +68,6 @@
     "worker"        : false,
     "wsh"           : false,
     "yui"           : false,
-    "globals"       : {}
+    "globals"       : {},
+    "-W100"         : true
 }
