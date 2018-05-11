@@ -191,6 +191,14 @@ To compile curve25519 from C souce files in `/native`, install
 grunt compile
 ```
 
+## Testing
+
+In order to run the automated tests, you must sign up for a [SauceLabs](https://saucelabs.com/) account, and use your username and access code to run the test. Once these are generated, include them in the test command.
+
+```
+SAUCE_USERNAME="your-usrname" SAUCE_ACCESS_KEY="your-access-key" grunt test
+```
+
 ## License
 
 Copyright 2015-2018 Open Whisper Systems
