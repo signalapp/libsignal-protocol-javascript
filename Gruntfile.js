@@ -232,7 +232,7 @@ module.exports = function(grunt) {
   grunt.registerTask('test', ['jshint', 'jscs', 'connect', 'saucelabs-mocha']);
   grunt.registerTask('default', ['concat']);
   grunt.registerTask('build', ['compile', 'concat']);
-  grunt.registerTask('localTest', function () {
+  grunt.registerTask('testLocal', ['jshint', 'jscs'], function () {
     const {runner} = require('mocha-headless-chrome');
 
     grunt.event.once('connect.https.listening', async (host, port) => {

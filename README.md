@@ -199,7 +199,9 @@ In order to run the automated tests, you must sign up for a [SauceLabs](https://
 SAUCE_USERNAME="your-usrname" SAUCE_ACCESS_KEY="your-access-key" grunt test
 ```
 
-There is also a task to run tests against headless chrome locally: `grunt localTest`.
+There is also a task to run tests against headless chrome locally: 
+
+`grunt testLocal` or `yarn run testLocal`
 
 For information on how to configure options, please see:
 

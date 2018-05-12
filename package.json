@@ -27,6 +27,7 @@
   },
   "scripts": {
     "test": "grunt test",
+    "testLocal": "grunt testLocal",
     "lint": "grunt jshint"
   }
 }
