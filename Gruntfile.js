@@ -162,6 +162,13 @@ module.exports = function(grunt) {
           base: '.',
           port: 9998
         }
+      },
+      https: {
+        options: {
+          base: '.',
+          port: 9998,
+          protocol: 'https'
+        }
       }
     },
     'saucelabs-mocha': {
@@ -225,5 +232,30 @@ module.exports = function(grunt) {
   grunt.registerTask('test', ['jshint', 'jscs', 'connect', 'saucelabs-mocha']);
   grunt.registerTask('default', ['concat']);
   grunt.registerTask('build', ['compile', 'concat']);
+  grunt.registerTask('testLocal', ['jshint', 'jscs'], function () {
+    const {runner} = require('mocha-headless-chrome');
 
+    grunt.event.once('connect.https.listening', async (host, port) => {
+      const done = this.async();
+      const url = `https://${host}:${port}/test`;
+      const options = {
+        file: url,
+        timeout: 120000,
+        args: ['no-sandbox']
+      };
+      runner(options)
+        .then(({result: {failures}})=> {
+          if (failures && failures.length) {
+            done(new Error(failures.map(failure => `${failure.fullTitle}: ${failure.err.stack}`).join('\n') + '\n'));
+          } else {
+            done();
+          }
+        })
+        .catch(err => {
+          grunt.log.writeln(err);
+          done(err);
+        });
+    });
+    grunt.task.run('connect:https:keepalive');
+  });
 };
