@@ -22,7 +22,8 @@
     "grunt-preen": "^1.0.0",
     "grunt-saucelabs": "^8.3.3",
     "jquery": "^2.2.3",
-    "mocha": "^2.4.5"
+    "mocha": "^2.4.5",
+    "mocha-headless-chrome": "^2.0.0"
   },
   "scripts": {
     "test": "grunt test",
