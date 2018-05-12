@@ -199,6 +199,12 @@ In order to run the automated tests, you must sign up for a [SauceLabs](https://
 SAUCE_USERNAME="your-usrname" SAUCE_ACCESS_KEY="your-access-key" grunt test
 ```
 
+There is also a task to run tests against headless chrome locally: `grunt localTest`.
+
+For information on how to configure options, please see:
+
+[mocha-headless-chrome](https://www.npmjs.com/package/mocha-headless-chrome)
+
 ## License
 
 Copyright 2015-2018 Open Whisper Systems
