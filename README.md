@@ -184,7 +184,7 @@ sessionCipher.decryptWhisperMessage(ciphertext).then(function(plaintext) {
 
 ## Building
 
-To compile curve25519 from C souce files in `/native`, install
+To compile curve25519 from C source files in `/native`, install
 [emscripten](https://kripken.github.io/emscripten-site/docs/getting_started/downloads.html).
 
 ```
