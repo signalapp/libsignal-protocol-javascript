@@ -7,7 +7,7 @@ SessionBuilder.prototype = {
   processPreKey: function(device) {
     return Internal.SessionLock.queueJobForNumber(this.remoteAddress.toString(), function() {
       return this.storage.isTrustedIdentity(
-          this.remoteAddress.getName(), device.identityKey, this.storage.Direction.SENDING
+          this.remoteAddress.toString(), device.identityKey, this.storage.Direction.SENDING
       ).then(function(trusted) {
         if (!trusted) {
           throw new Error('Identity key changed');
@@ -60,7 +60,7 @@ SessionBuilder.prototype = {
   processV3: function(record, message) {
     var preKeyPair, signedPreKeyPair, session;
     return this.storage.isTrustedIdentity(
-        this.remoteAddress.getName(), message.identityKey.toArrayBuffer(), this.storage.Direction.RECEIVING
+        this.remoteAddress.toString(), message.identityKey.toArrayBuffer(), this.storage.Direction.RECEIVING
     ).then(function(trusted) {
         if (!trusted) {
             var e = new Error('Unknown identity key');
