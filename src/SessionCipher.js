@@ -347,7 +347,7 @@ SessionCipher.prototype = {
               }
               session[util.toString(ephemeralPublicKey)] = {
                   messageKeys: {},
-                  chainKey: { counter: -1, key: masterKey[1] },
+                  chainKey: { counter: 0, key: masterKey[1] },
                   chainType: sending ? Internal.ChainType.SENDING : Internal.ChainType.RECEIVING
               };
               ratchet.rootKey = masterKey[0];
