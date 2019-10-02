@@ -106,7 +106,7 @@ KeyHelper.generateSignedPreKey(identityKeyPair, keyId).then(function(signedPreKe
 
 A libsignal client needs to implement a storage interface that will manage
 loading and storing of identity, prekeys, signed prekeys, and session state.
-See `test/InMemorySignalProtocolStore.js` for an example.
+See [`test/InMemorySignalProtocolStore.js`](./test/InMemorySignalProtocolStore.js) for an example.
 
 Once this is implemented, building a session is fairly straightforward:
 
@@ -146,7 +146,7 @@ promise.catch(function onerror(error) {
 ### Encrypting
 
 Once you have a session established with an address, you can encrypt messages
-using SessionCipher.
+using [`SessionCipher`](./src/SessionCipher.js).
 
 ```js
 var plaintext = "Hello world";
