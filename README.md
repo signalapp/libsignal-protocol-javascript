@@ -1,3 +1,5 @@
+**Deprecation Warning**: It is recommended that the TypeScript interface of [libsignal-client](https://github.com/signalapp/libsignal-client) be used for all new applications. This library is no longer used by us or maintained.
+
 # libsignal-protocol-javascript
 
 [![Build Status](https://travis-ci.org/signalapp/libsignal-protocol-javascript.svg?branch=master)](https://travis-ci.org/signalapp/libsignal-protocol-javascript)
