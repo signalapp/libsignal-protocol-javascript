@@ -77,7 +77,7 @@ SessionCipher.prototype = {
                   result.set(new Uint8Array(mac, 0, 8), encodedMsg.byteLength + 1);
 
                   return this.storage.isTrustedIdentity(
-                      this.remoteAddress.getName(), util.toArrayBuffer(session.indexInfo.remoteIdentityKey), this.storage.Direction.SENDING
+                      this.remoteAddress.toString(), util.toArrayBuffer(session.indexInfo.remoteIdentityKey), this.storage.Direction.SENDING
                   ).then(function(trusted) {
                       if (!trusted) {
                           throw new Error('Identity key changed');
@@ -159,7 +159,7 @@ SessionCipher.prototype = {
                     }
 
                     return this.storage.isTrustedIdentity(
-                        this.remoteAddress.getName(), util.toArrayBuffer(result.session.indexInfo.remoteIdentityKey), this.storage.Direction.RECEIVING
+                        this.remoteAddress.toString(), util.toArrayBuffer(result.session.indexInfo.remoteIdentityKey), this.storage.Direction.RECEIVING
                     ).then(function(trusted) {
                         if (!trusted) {
                             throw new Error('Identity key changed');
